@@ -14,7 +14,8 @@ from scisaurus.runtime.contracts import preserves_literals
 from scisaurus.runtime.time_policy import validate_time_policy
 
 FORMATS = {"paragraph", "list_item", "code", "json"}
-_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+IDENTIFIER_PATTERN = r"[a-z][a-z0-9_-]{0,63}"
+_ID = re.compile(IDENTIFIER_PATTERN + r"\Z")
 
 
 def identifier(value):

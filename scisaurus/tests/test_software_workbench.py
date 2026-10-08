@@ -500,10 +500,16 @@ class SoftwareWorkbenchTests(unittest.TestCase):
     def test_controller_reviewer_contract_failure_keeps_response_ownership(self):
         self._controller_assessment(failure_mode="reviewer_contract")
 
+    def test_controller_producer_format_recovery_reuses_discovery_and_repairs_output(self):
+        self._controller_assessment(failure_mode="producer_contract", recover=True)
+
+    def test_controller_reviewer_format_recovery_keeps_valid_producer(self):
+        self._controller_assessment(failure_mode="reviewer_contract", recover=True)
+
     def test_controller_scientific_hold_is_not_a_response_contract_failure(self):
         self._controller_assessment(failure_mode="scientific_hold")
 
-    def _controller_assessment(self, *, with_quota=True, failure_mode=None):
+    def _controller_assessment(self, *, with_quota=True, failure_mode=None, recover=False):
         from scisaurus.tests.test_composer import ComposerWorkflowTests
         from scisaurus.runtime.composer import ComposerRunner
         root = Path(self.directory.name)
@@ -617,6 +623,16 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                     self.assertEqual(classify_failure("experiment", error, error.stage_result), "experiment_failure")
                     self.assertFalse(hasattr(error, "repair_gate"))
                     self.assertEqual(reviewer_inputs, [])
+                if recover:
+                    original_failure = failure_mode
+                    failure_mode = None
+                    before = client.return_value.complete.call_count
+                    repaired = runner._assess_scientific_software(stage, {}, topic)
+                    self.assertEqual(repaired["status"], "accepted")
+                    expected_calls = 2 if original_failure == "producer_contract" else 1
+                    self.assertEqual(client.return_value.complete.call_count - before, expected_calls)
+                    self.assertEqual(repaired["dispatch_usage"]["model_calls"], expected_calls)
+                    self.assertGreater(retained["ledger"]["assignment_attempt_number"], 0)
                 return
             receipt=runner._assess_scientific_software(stage, {}, topic)
             self.assertEqual(receipt["status"], "accepted")

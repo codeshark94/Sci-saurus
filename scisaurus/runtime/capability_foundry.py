@@ -29,7 +29,7 @@ import unicodedata
 from dataclasses import asdict
 from pathlib import Path
 
-from scisaurus.runtime.measurement_contract import ModelDefinitionError, model_definition_contract
+from scisaurus.runtime.measurement_contract import ModelDefinitionError, model_definition_contract, verified_decisions
 from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.core.schema import canonical_bytes, json_object as parse_complete_json_object
@@ -607,10 +607,20 @@ def _author_requested_candidate(requests, candidate):
     return False
 
 
-def _author_response_format_failure_signature(envelope, finish_reason, route_index=0):
+def _author_response_format_failure_signature(envelope, finish_reason, route_index=0, *, text=None):
     """Deduplicate malformed responses per route, not across independent models."""
     failure = ("invalid_json" if envelope is None
                else f"{finish_reason}:invalid_envelope")
+    if envelope is None and isinstance(text, str):
+        if not text.strip():
+            failure = "empty_response"
+        elif finish_reason == "length" and _author_json_prefix_state(text) == "incomplete":
+            failure = "incomplete_json"
+        else:
+            try:
+                json.loads(text)
+            except json.JSONDecodeError as exc:
+                failure = "invalid_json:" + exc.msg
     return f"author_response_format:{failure}:route={route_index}"
 
 
@@ -2059,6 +2069,13 @@ def program_review_evidence(candidate, document, verdict):
         "raw_observations_complete": True,
         "reported_metrics": deepcopy_config(document["metrics"]),
         "independent_validation": deepcopy_config(verdict),
+        "decision_assessments": verified_decisions(candidate["experiment_intent"], verdict),
+        "claim_consistency_contract": (
+            "Compare the current implementation, estimand, independently recalculated values, "
+            "decision_assessments and result statements. A declared threshold is a rule, not an "
+            "observed effect. Check reference and aggregation definitions, units and invariances "
+            "of each contrast. Record unsupported inference without forcing a positive outcome."
+        ),
     }
 
 
@@ -2373,6 +2390,21 @@ class CapabilityFoundry:
         runtime = self._runtime()
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
+        if resume_work_ref is not None and work_cache is not None:
+            if not resume_work_ref.startswith(f"artifact:{work_cache.namespace}/"):
+                raise ValidationError("foundry format resume references a foreign work namespace")
+            manifest = work_cache.store.get(resume_work_ref)
+            body = work_cache.store.read_body(manifest["body_hash"])
+            if hashlib.sha256(body).hexdigest() != manifest["body_hash"]:
+                raise ValidationError("foundry resume work body differs from its immutable digest")
+            original_assignment = json.loads(body).get("assignment")
+            # Interface descriptions can evolve while an already dispatched
+            # response retains its exact scientific assignment and receipt.
+            identity_fields = ("capability_brief", "configured_input", "required_intent_fields", "execution_environment")
+            if (isinstance(original_assignment, dict)
+                    and all(canonical_bytes(original_assignment.get(field)) == canonical_bytes(base_prompt.get(field))
+                            for field in identity_fields)):
+                base_prompt = deepcopy_config(original_assignment)
         key = None
         state = {"status": "pending", "attempts": 0, "usage": {}, "requests": [],
                  "author_request_signatures": [],
@@ -2422,11 +2454,12 @@ class CapabilityFoundry:
                     original_input = original.get("configured_input", original.get("output_contract", {}).get("test_input"))
                     prior_required = original.get("required_intent_fields") or {}
                     required = base_prompt.get("required_intent_fields") or {}
-                    if (_repair_scientific_input({"capability_brief": original.get("capability_brief")})
-                            != _repair_scientific_input({"capability_brief": brief})
-                            or any(required.get(name) != value for name, value in prior_required.items())
-                            or _repair_scientific_input(original_input)
-                            != _repair_scientific_input(configured_input)
+                    if (canonical_bytes(_repair_scientific_input({"capability_brief": original.get("capability_brief")}))
+                            != canonical_bytes(_repair_scientific_input({"capability_brief": brief}))
+                            or any(canonical_bytes(required.get(name)) != canonical_bytes(value)
+                                   for name, value in prior_required.items())
+                            or canonical_bytes(_repair_scientific_input(original_input))
+                            != canonical_bytes(_repair_scientific_input(configured_input))
                             or not (prior.get("feedback") or prior.get("status") == "succeeded")):
                         return None
                     return requests, candidate
@@ -2446,7 +2479,7 @@ class CapabilityFoundry:
                 for prior in prior_entries:
                     prior = work_cache.recovery_entry(prior)
                     work_cache.inherited_usage(prior)
-                    if prior.get("assignment") == base_prompt:
+                    if canonical_bytes(prior.get("assignment")) == canonical_bytes(base_prompt):
                         response = prior.get("last_response")
                         requests = prior.get("requests", [])
                         author_requests = [request for request in requests
@@ -2684,6 +2717,36 @@ class CapabilityFoundry:
         def author_generation_profile(*, repair=False, empty_output=False):
             baseline = (author_route_configs[author_route_index] if author_route_configs else
                         {"reasoning_effort": author_baseline_effort})
+            assignment_digest = hashlib.sha256(canonical_bytes(base_prompt)).hexdigest()
+            recovery = state.get("artifact_generation_recovery")
+            if recovery is None:
+                for request in state.get("requests", []):
+                    metadata = request.get("response_metadata") or {}
+                    try:
+                        request_assignment = json.loads(request.get("prompt", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if (not isinstance(request_assignment, dict)
+                            or any(canonical_bytes(request_assignment.get(field)) != canonical_bytes(base_prompt.get(field))
+                                   for field in ("capability_brief", "configured_input", "required_intent_fields"))):
+                        continue
+                    if (request.get("role") == author_role
+                            and request.get("status") == "succeeded"
+                            and request.get("finish_reason") == "length"
+                            and request.get("response_sha256") == hashlib.sha256(b"").hexdigest()
+                            and metadata.get("answer_bytes") == 0
+                            and _author_request_signature_from_record(request) is not None
+                            and metadata.get("reasoning_effort") in {"low", "medium", "high", "xhigh"}):
+                        recovery = {"assignment_sha256": assignment_digest,
+                                    "response_sha256": request["response_sha256"],
+                                    "request_signature": request.get("request_signature"),
+                                    "reasoning_effort": "none"}
+                        state["artifact_generation_recovery"] = recovery
+                        break
+            if isinstance(recovery, dict):
+                if recovery.get("assignment_sha256") != assignment_digest:
+                    raise ValidationError("artifact generation recovery belongs to another assignment")
+                empty_output = True
             return _artifact_generation_config(baseline, repair=repair, empty_output=empty_output)
 
         def save(phase):
@@ -2954,6 +3017,7 @@ class CapabilityFoundry:
             else:
                 state["format_repair"] = {
                     "previous_error": str(reason)[:1200],
+                    "model_definition_contract": model_definition_contract(),
                     "instructions": _author_format_repair_instructions(
                         reason, has_candidate=has_repair_base),
                 }
@@ -3092,6 +3156,15 @@ class CapabilityFoundry:
                 return result
 
             continuation = state.get("author_response_continuation")
+            result_digest = hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+            if isinstance(continuation, dict) and not (
+                    continuation.get("partial_response_sha256") == result_digest
+                    and continuation.get("attempt") == attempt_number
+                    and continuation.get("route_index") == author_route_index):
+                state.setdefault("retired_author_response_continuations", []).append(
+                    deepcopy_config(continuation))
+                state.pop("author_response_continuation", None)
+                continuation = None
             if (isinstance(continuation, dict)
                     and continuation.get("status") == "format_repair_required"):
                 return result
@@ -4593,6 +4666,10 @@ class CapabilityFoundry:
                             continuation.get("error")
                             if isinstance(continuation, dict)
                             and continuation.get("status") == "format_repair_required"
+                            and continuation.get("partial_response_sha256")
+                                == hashlib.sha256(result.text.encode("utf-8")).hexdigest()
+                            and continuation.get("route_index") == author_route_index
+                            and continuation.get("attempt") == attempt + 1
                             else None
                         )
                         diagnostic = {
@@ -4651,7 +4728,7 @@ class CapabilityFoundry:
             if result.finish_reason != "stop" and attempt_value is None:
                 failures = state.setdefault("validation_errors", [])
                 failure_signature = _author_response_format_failure_signature(
-                    attempt_value, result.finish_reason, author_route_index)
+                    attempt_value, result.finish_reason, author_route_index, text=result.text)
                 failure_signatures = state.setdefault("failure_signatures", [])
                 repeated = _is_repeated_repair_failure(
                     last_error, failures, failure_signatures, failure_signature)

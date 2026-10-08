@@ -5,7 +5,7 @@ import operator
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.model_work import ModelWorkBlocked
-from scisaurus.runtime.scores import exact, identifier
+from scisaurus.runtime.scores import IDENTIFIER_PATTERN, exact, identifier
 
 
 
@@ -25,12 +25,12 @@ COMPARATORS = {"<": operator.lt, "<=": operator.le, ">": operator.gt,
 
 def model_definition_contract():
     return {
-        "equations": [{"id": "equation_id", "expression": "equation or algorithm",
+        "equations": [{"id": f"equation_id matching {IDENTIFIER_PATTERN}", "expression": "equation or algorithm",
                        "status": "source_bound | design_assumption | estimated",
                        "source_ref": "exact declared source ref or null"}],
-        "variables": [{"id": "variable_id", "unit": "physical or dimensionless unit",
+        "variables": [{"id": f"variable_id matching {IDENTIFIER_PATTERN}", "unit": "physical or dimensionless unit",
                        "reference_scale": "reference system and conversion"}],
-        "parameters": [{"id": "parameter_id", "value": "finite non-boolean number",
+        "parameters": [{"id": f"parameter_id matching {IDENTIFIER_PATTERN}", "value": "finite non-boolean number",
                         "unit": "unit", "status": "source_bound | design_assumption | estimated",
                         "source_ref": "exact declared source ref or null", "reason": "basis and applicability"}],
         "source_refs": ["exact captured scientific source ref; no annotations; source_bound rows require a ref from this list"],
@@ -144,6 +144,22 @@ def validate_model_definition(intent, *, source_refs=None, required=False):
         raise ValidationError("model definition requires distinct recorded source references")
     if source_refs is not None and not set(refs).issubset(set(source_refs)):
         raise ModelDefinitionError("model definition refers to unacquired sources")
+    identity_errors = []
+    for collection in ("equations", "variables", "parameters"):
+        rows = definition[collection]
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or "id" not in row:
+                continue
+            try:
+                identifier(row["id"])
+            except ValidationError:
+                identity_errors.append(
+                    f"/model_definition/{collection}/{index}/id={row['id']!r} "
+                    f"must match {IDENTIFIER_PATTERN}")
+    if identity_errors:
+        raise ValidationError("; ".join(identity_errors))
     for collection, fields in (
             ("equations", {"id", "expression", "status", "source_ref"}),
             ("variables", {"id", "unit", "reference_scale"}),

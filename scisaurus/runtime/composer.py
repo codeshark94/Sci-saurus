@@ -97,7 +97,7 @@ SCHEMA_VERSION = "composer-workflow-1"
 RUN_SCHEMA_VERSION = "composer-run-1"
 ARGUMENT_RESPONSE_CONTRACT_REVISION = "prose-without-character-ceilings-1"
 EXPERIMENT_AUTHOR_RESPONSE_CONTRACT_REVISION = (
-    "experiment-development-foundry-validated-format-constraints-30")
+    "experiment-development-foundry-response-owned-codegen-31")
 STAGE_KINDS = frozenset({"topic_discovery", "survey", "experiment", "interpretation", "argument", "paper"})
 RESEARCH_REQUEST_EXECUTION_METADATA_KEYS = frozenset({
     "continuation_cycle", "prior_capability_repair_attempts",
@@ -13107,7 +13107,10 @@ class ComposerRunner:
 
     def _assess_scientific_software(self, stage, descriptor, topic_result, *, computation_scope=None):
         """Admit software fitness and executed upstream computations before authoring."""
-        from scisaurus.runtime.software_workbench import REVISION, SELECTION_CONTRACT_REVISION, SoftwareWorkbench, selection_contract
+        from scisaurus.runtime.software_workbench import (
+            REVISION, SELECTION_CONTRACT_REVISION, SoftwareWorkbench, selection_contract,
+            software_computation_identity, software_assessment_prompt, validate_selection,
+        )
         from scisaurus.runtime.software_discovery import accepted_survey_sources, retain_sources
         by_id = {item["id"]:item for item in self.workflow["stages"]}
         pending, dependencies = list(stage.get("depends_on",[])), set()
@@ -13128,7 +13131,7 @@ class ComposerRunner:
                     "source_challenge": deepcopy(topic_result.get("source_challenge")),
                     "evidence_catalog": evidence_catalog,
                     "evidence_availability": [{key:value for key,value in bundle.items() if key != "sources"} for bundle in source_bundles],
-                    "computation_scope": deepcopy(computation_scope or {})}
+                    "computation_scope": software_computation_identity(computation_scope or {})}
         identity["study_evidence_contract"] = study_evidence_contract()
         digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         logical = f"command/scientific-software-assessments/{digest}"
@@ -13148,6 +13151,7 @@ class ComposerRunner:
             return {**retained, "artifact_ref": previous["artifact_ref"], "dispatch_usage": {}}
         request = {"schema_version": "scientific-software-assessment-request-1", **identity,
                    "source_ref_catalog": [], "scientific_scope": "operational reproduction and scientific fitness for the admitted question; experiment admission remains separate"}
+        request["computation_scope"] = deepcopy(computation_scope or {})
         def collect(value):
             if isinstance(value, dict):
                 for item in value.values():
@@ -13159,11 +13163,68 @@ class ComposerRunner:
                 request["source_ref_catalog"].append(value)
         collect(topic_result)
         collect(identity["computation_scope"])
-        collect(self.context)
         request["source_ref_catalog"] = sorted(set(request["source_ref_catalog"]))
         request["source_ref_catalog"] = sorted(set([*request["source_ref_catalog"],
                                                     *[row["source_ref"] for row in evidence_catalog]]))
         request_record = self._publish(logical + "/request", "note", request, "command.composer")
+        response_repair = None
+        retained_producer = None
+        failed = self.store.head(logical + "/failure")
+        if failed:
+            _, _, prior = self._read_verified_artifact_json(failed["artifact_ref"])
+            if prior.get("identity") != identity or prior.get("status") != "blocked":
+                raise ValidationError("software response recovery lost its scientific assignment")
+            _, _, old_request = self._read_verified_artifact_json(prior["evidence"]["request_ref"])
+            if (prior["evidence"].get("request") != old_request
+                    or any(old_request.get(key) != value for key, value in identity.items()
+                           if key != "computation_scope")
+                    or software_computation_identity(old_request.get("computation_scope", {})) != identity["computation_scope"]):
+                raise ValidationError("software response recovery has inconsistent request evidence")
+            _, _, execution = self._read_verified_artifact_json(prior["producer_execution_ref"])
+            report = execution.get("report", {})
+            if (execution.get("project_id") != self.workflow["project_id"]
+                    or execution.get("input_ref", {}).get("kind") != "scientific_software_assessment"
+                    or execution.get("input_ref", {}).get("stage_id") != stage["id"]
+                    or execution.get("input_ref", {}).get("digest") != digest):
+                raise ValidationError("software response recovery belongs to another assignment")
+            failure = report.get("failure", {})
+            if report.get("status") == "failed" and failure.get("kind") == "output_contract":
+                if isinstance(report.get("partial_response"), str) and report["partial_response"].strip():
+                    from scisaurus.runtime.specialists import retained_software_response_failure_identity
+                    response_repair = {
+                        "execution_ref": prior["producer_execution_ref"],
+                        "previous_text": report["partial_response"], "error": report["error"],
+                        "failure_identity": retained_software_response_failure_identity(report),
+                        "receipt_refs": [row["receipt_ref"] for row in report.get("software_tool_results", [])],
+                    }
+            elif report.get("status") == "succeeded" and report.get("response", {}).get("decision") == "pass":
+                verifier_ref = prior.get("verifier_execution_ref")
+                if verifier_ref:
+                    _, _, verifier_execution = self._read_verified_artifact_json(verifier_ref)
+                    verifier_report = verifier_execution.get("report", {})
+                    if (verifier_execution.get("chief_result", {}).get("software_assessment") != prior["evidence"]
+                            or verifier_execution.get("project_id") != execution.get("project_id")
+                            or verifier_execution.get("stage_id") != execution.get("stage_id")
+                            or verifier_execution.get("attempt_number") != execution.get("attempt_number")):
+                        raise ValidationError("software reviewer recovery lost its producer evidence")
+                    if (verifier_report.get("status") == "failed"
+                            and verifier_report.get("failure", {}).get("kind") == "output_contract"):
+                        workbench = SoftwareWorkbench(self.root / "scientific-software", deadline=time.monotonic() + self._stage_remaining(stage),
+                                                      evidence_refs=[row["source_ref"] for row in evidence_catalog])
+                        tools = deepcopy(report.get("software_tool_results", []))
+                        for row in tools:
+                            if workbench._receipt(row["receipt_ref"], require_success=False) != {
+                                    key: value for key, value in row.items() if key not in {"receipt_ref", "reused"}}:
+                                raise ValidationError("software reviewer recovery has inconsistent tool receipts")
+                        tools.append(workbench.execute({"operation": "check_environment", "arguments": {}}))
+                        original_response = report["response"].get("raw", report["response"])
+                        if (not isinstance(original_response, dict)
+                                or original_response.get("software_selection") != prior.get("selection")):
+                            raise ValidationError("software reviewer recovery lost its validated producer response")
+                        validate_selection(original_response, workbench, tools)
+                        retained_producer = {**deepcopy(report), "software_tool_results": tools,
+                                             "usage": {}, "reused_prior_usage": deepcopy(report.get("usage", {})),
+                                             "reused_from_artifact_ref": prior["producer_execution_ref"]}
         panel_id = self._capability_repair_panel_stage_id(stage["id"], digest, self.continuation_cycles, 1, purpose="software")
         attempt = self._next_capability_repair_assignment_attempt(panel_id)
         evidence_stage = {**deepcopy(stage), "id": panel_id, "_model_budget_owner_stage_id": stage["id"],
@@ -13187,10 +13248,18 @@ class ComposerRunner:
         producer = next(item for item in assignment["assignments"] if item.get("assignment_phase") == "specialist")
         producer = {**deepcopy(producer), "_response_contract": "software_selection", "_prompt": json.dumps({
             "assignment": {key: producer.get(key) for key in ("assigned_role", "stage_id", "task_id")},
-            "software_assessment_request": request, "output_contract": selection_contract()}, ensure_ascii=False, sort_keys=True)}
+            "software_assessment_request": software_assessment_prompt(request),
+            "request_ref": request_record["artifact_ref"],
+            "output_contract": selection_contract()}, ensure_ascii=False, sort_keys=True)}
+        if response_repair:
+            producer["_software_receipt_refs"] = response_repair["receipt_refs"]
+            producer["_response_format_recovery"] = {key: value for key, value in response_repair.items() if key != "receipt_refs"}
         stage_result = {"software_assessment_request": request, "repair_verification_scope": "scientific_software_fitness"}
-        bundle = self._run_specialist_pool(evidence_stage, {**deepcopy(assignment), "assignments": [producer]}, descriptor,
-            stage_result=stage_result, cache_input_digest=hashlib.sha256(producer["_prompt"].encode()).hexdigest())
+        if retained_producer is None:
+            bundle = self._run_specialist_pool(evidence_stage, {**deepcopy(assignment), "assignments": [producer]}, descriptor,
+                stage_result=stage_result, cache_input_digest=hashlib.sha256(canonical_bytes(producer)).hexdigest())
+        else:
+            bundle = {"reports": [retained_producer], "by_role": {"methodologist": retained_producer}, "usage": {}, "model_enabled": True}
         bundle = self._publish_specialist_reports(evidence_stage, assignment, bundle)
         produced = bundle.get("by_role", {}).get("methodologist", {})
         response = produced.get("response", {})
@@ -21191,7 +21260,10 @@ class ComposerRunner:
                 assignment = {**assignment, "_prompt": prompt}
             key = cache.key(scope=f"specialist:{assignment['stage_id']}:{verifier}",
                 role=assignment.get("assigned_role"), system=specialist_system(assignment, verifier=verifier),
-                prompt=prompt, model=dispatcher.model_config)
+                prompt=({"prompt": prompt, "response_format_recovery": assignment["_response_format_recovery"],
+                         "software_receipt_refs": assignment.get("_software_receipt_refs", [])}
+                        if assignment.get("_response_format_recovery") is not None else prompt),
+                model=dispatcher.model_config)
             keys[assignment["role_id"]] = key
             retained = cache.get(key)
             retained_report = retained.get("report") if isinstance(retained, dict) else None

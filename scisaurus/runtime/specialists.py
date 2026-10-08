@@ -19,7 +19,7 @@ import threading
 import time
 
 from scisaurus.core.errors import ValidationError
-from scisaurus.core.schema import canonical_bytes
+from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.core.source_spans import SPAN_EVIDENCE_FIELDS
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.execution_policy import enforce_model_cost_limits
@@ -2123,6 +2123,24 @@ def _verifier_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
         max_input_tokens=max_input_tokens, previous_text=previous_text)
 
 
+def software_response_failure_identity(error, *, parsed=None):
+    """Use one identity for live exceptions and serialized contract failures."""
+    if parsed is None:
+        return "invalid_json_object"
+    return error.removeprefix("ValidationError: ") if isinstance(error, str) else str(error)
+
+
+def retained_software_response_failure_identity(report):
+    retained = report.get("response_format_failure_identity")
+    if isinstance(retained, str) and retained:
+        return retained
+    try:
+        parsed = json_object(report.get("partial_response", ""), "model output", model_envelope=True)
+    except ValidationError:
+        parsed = None
+    return software_response_failure_identity(report.get("error", ""), parsed=parsed)
+
+
 def _specialist_repair_prompt(prompt, error, previous_text, *, max_input_tokens,
                               response_contract=None, output_role="current_specialist"):
     """Add one bounded JSON-only repair for an invalid specialist response."""
@@ -2633,9 +2651,17 @@ class SpecialistDispatcher:
                 from scisaurus.runtime.software_workbench import selection_reference_contract
                 envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
                 prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+        response_recovery = assignment.pop("_response_format_recovery", None)
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
         quota["max_input_tokens"] = max_input_tokens
+        if response_recovery is not None:
+            if (response_contract != "software_selection" or software_tools is None
+                    or not isinstance(response_recovery, dict)
+                    or set(response_recovery) not in ({"execution_ref", "previous_text", "error"},
+                                                     {"execution_ref", "previous_text", "error", "failure_identity"})
+                    or any(not isinstance(value, str) or not value.strip() for value in response_recovery.values())):
+                raise ValidationError("software response recovery requires exact failed output and execution evidence")
         # Every network dispatch consumes one slot from the assignment's call
         # quota, including provider failover and response repair.
         max_call_attempts = quota.get("max_calls")
@@ -2666,9 +2692,14 @@ class SpecialistDispatcher:
         retry_history = []
         request_inputs = []
         failed_primary_routes = set()
-        previous_text = None
+        previous_text = response_recovery["previous_text"] if response_recovery else None
         continue_previous_output = False
-        last_validation_error = None
+        last_validation_error = response_recovery["error"] if response_recovery else None
+        if response_recovery:
+            validation_retries = 1
+            identity = response_recovery.get("failure_identity") or retained_software_response_failure_identity({
+                "partial_response": previous_text, "error": last_validation_error})
+            repaired_software_contract_errors.add(identity)
         last_model_failure = None
         report = None
         while report is None:
@@ -3034,7 +3065,7 @@ class SpecialistDispatcher:
                 if request_input is not None and not response_received:
                     request_input.update(request_attempts=0, outcome_known=True)
                 retry_available = not enforce_costs or max_call_attempts is None or call_attempts < max_call_attempts
-                software_error_identity = str(exc) if parsed is not None else "invalid_json_object"
+                software_error_identity = software_response_failure_identity(exc, parsed=parsed)
                 can_repair_schema = (software_error_identity not in repaired_software_contract_errors
                                      if software_tools is not None else not schema_repair_used)
                 if (response_received and retry_available
@@ -3080,6 +3111,7 @@ class SpecialistDispatcher:
                     "provider_pool": route["pool"] if route else None,
                     "failure": {"kind": "output_contract", "outcome_known": True},
                     "error": f"{type(exc).__name__}: {exc}",
+                    **({"response_format_failure_identity": software_error_identity} if software_tools is not None else {}),
                     "partial_response": previous_text if previous_text else None,
                     "elapsed_seconds": time.monotonic() - started,
                     "usage": deepcopy(accumulated_usage),

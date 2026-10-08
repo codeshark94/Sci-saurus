@@ -759,6 +759,38 @@ def _matches_expected(output, expected):
     return equal(output, expected["value"])
 
 
+def software_computation_identity(scope):
+    """Separate scientific work requirements from orchestration ownership."""
+    if not isinstance(scope, dict):
+        raise ValidationError("software computation scope must be an object")
+    projected = deepcopy(scope)
+    if "work_orders" not in projected:
+        return projected
+    orders = projected["work_orders"]
+    if not isinstance(orders, list) or any(not isinstance(row, dict) for row in orders):
+        raise ValidationError("software computation work orders must be objects")
+    ownership = {"id", "owner", "failure_dossier_ref", "failure_input_sha256", "attempt_lineage",
+                 "target_stage_id", "target_stage_kind", "source_stage_id", "repair_priority",
+                 "topic_cycle", "recovery_mode"}
+    projected["work_orders"] = [
+        {key: deepcopy(value) for key, value in row.items() if key not in ownership}
+        for row in orders if row.get("kind") != "recovery"
+    ]
+    return projected
+
+
+def software_assessment_prompt(request):
+    """Expose current source identities; retain acquisition lineage in the store."""
+    projected = deepcopy(request)
+    projected["computation_scope"] = software_computation_identity(request.get("computation_scope", {}))
+    fields = {"source_ref", "work_id", "title", "doi", "url", "representation", "identity_verified", "text_chars"}
+    projected["evidence_catalog"] = [
+        {key: deepcopy(value) for key, value in row.items() if key in fields}
+        for row in request.get("evidence_catalog", [])
+    ]
+    return projected
+
+
 def selection_contract():
     from scisaurus.runtime.measurement_contract import model_definition_contract
     return {"decision": "pass | hold", "summary": "...", "findings": [], "evidence_gaps": [],
@@ -838,8 +870,11 @@ def validate_selection(response, workbench, results):
                     raise ValidationError("/software_selection/model_definition/source_refs contains identifiers absent from "
                                           "/software_selection/scientific_source_refs: " + json.dumps(unselected)
                                           + "; every model ref must be an exact selected acquired identifier")
-        validate_model_definition({"model_definition": selection.get("model_definition")},
-                                  source_refs=selection["scientific_source_refs"], required=response["decision"] == "pass")
+        try:
+            validate_model_definition({"model_definition": selection.get("model_definition")},
+                                      source_refs=selection["scientific_source_refs"], required=response["decision"] == "pass")
+        except ValidationError as exc:
+            raise ValidationError(str(exc).replace("/model_definition/", "/software_selection/model_definition/")) from exc
 
     if selection["strategy"] == "unavailable" and response["decision"] != "hold":
         raise ValidationError("unavailable scientific software cannot admit implementation")
