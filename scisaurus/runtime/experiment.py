@@ -852,6 +852,104 @@ def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding
     return value
 
 
+def completed_experiment_result_proof(project_dir):
+    """Verify an immutable completed producer before resuming its outer review."""
+    import sqlite3
+    from contextlib import closing
+    from types import SimpleNamespace
+
+    project = Path(project_dir).resolve()
+    with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+        records = {}
+
+        def read(ref, *, binary=False):
+            record = store.get(ref)
+            raw = store.read_body(record["body_hash"])
+            if sha256_hex(raw) != record["body_hash"]:
+                raise ValidationError("completed producer artifact hash mismatch")
+            records[ref] = record["body_hash"]
+            return raw if binary else json.loads(raw)
+
+        run_ref = store.head("command/results/final")["artifact_ref"]
+        config_ref = store.head("inputs/run-config")["artifact_ref"]
+        run, config = read(run_ref), read(config_ref)
+        if (run.get("status") != "completed" or run.get("error") or run.get("failure")
+                or run.get("blockers") or run.get("project_id") != config.get("project_id")
+                or run.get("study_id") != config.get("experiment", {}).get("id")):
+            return None
+        run_path = project / "output/run.json"
+        if run_path.read_bytes() != canonical_bytes(run):
+            return None
+        raw_path = project / "output/raw-results.json"
+        raw = raw_path.read_bytes()
+        candidate = json.loads(raw)
+        digest = sha256_hex(raw)
+        if digest != run.get("raw_results_sha256") or canonical_bytes(candidate) != raw:
+            return None
+        experiment, orders = config["experiment"], config.get("work_orders", [])
+        validate_program_output(candidate, experiment, orders)
+        deterministic = read(run["deterministic_validation_ref"])
+        validated = validate_deterministic_validation(
+            {key: value for key, value in deterministic.items() if key != "execution_ref"},
+            experiment, digest)
+        bind_deterministic_validation(validated, candidate, experiment)
+        if validated["decision"] != "accepted":
+            return None
+        refs = run.get("model_review_refs", [])
+        if len(refs) != len(experiment["reviewers"]) or len(set(refs)) != len(refs):
+            return None
+        finding_ids = {row["id"] for row in candidate["findings"]}
+        outcomes = []
+        reviews = []
+        for reviewer, ref in zip(experiment["reviewers"], refs):
+            value = read(ref)
+            value = validate_model_review({key: item for key, item in value.items() if key != "execution_ref"},
+                reviewer["id"], finding_ids, orders, candidate, deterministic_validation=validated)
+            if value["decision"] not in {"accepted", "accepted_with_limitations"}:
+                return None
+            outcomes.append({"reviewer_id": reviewer["id"], "decision": value["decision"]})
+            reviews.append(value)
+        assessment = read(run["assessment_ref"])
+        evidence_refs = [*run["execution_refs"], run["deterministic_validation_ref"], *refs,
+            *[store.head("methods/experiment-assets/" + asset["id"])["artifact_ref"]
+              for asset in candidate["assets"]]]
+        validate_assessment({key: value for key, value in assessment.items()
+                             if key not in {"execution_ref", "decision_basis"}},
+            experiment["id"], evidence_refs, outcomes, finding_ids, candidate["limitations"])
+        if assessment.get("decision") not in {"accepted", "accepted_with_limitations"}:
+            return None
+        for ref in assessment.get("evidence_refs", []):
+            read(ref, binary=True)
+        package_ref = run["incumbent_ref"]
+        package = read(package_ref)
+        package_path = Path(run["results_package"]).resolve()
+        package_path.relative_to(project)
+        if json.loads(package_path.read_bytes()) != package:
+            return None
+        files = {str(run_path): sha256_hex(run_path.read_bytes()),
+                 str(raw_path): digest, str(package_path): sha256_hex(package_path.read_bytes())}
+        for asset in package.get("assets", []):
+            asset_path = (package_path.parent / asset["path"]).resolve()
+            asset_path.relative_to(project)
+            if sha256_hex(asset_path.read_bytes()) != asset["sha256"]:
+                return None
+            files[str(asset_path)] = asset["sha256"]
+        return {"schema_version": "completed-experiment-result-1", "project_dir": str(project),
+                "research_question": run["research_question"], "candidate_sha256": digest,
+                "run_ref": run_ref, "config_ref": config_ref, "artifact_hashes": records,
+                "file_hashes": files, "review_outcomes": outcomes, "result": run,
+                "configured_experiment": config["experiment"], "work_orders": orders,
+                "review_evidence": {"candidate_sha256": digest,
+                    "observation_count": len(candidate["observations"]),
+                    "metrics": candidate["metrics"], "findings": candidate["findings"],
+                    "limitations": candidate["limitations"],
+                    "deterministic_validation": deterministic,
+                    "independent_reviews": reviews, "assessment": assessment,
+                    "evidence_scope": "Complete observations were reviewed by the producer's independent reviewers. This outer-stage evidence carries their current verdicts and result claims, not another raw-row recalculation."}}
+
+
 def review_context_capacity_proof(project_dir):
     """Prove a pre-dispatch context stop now fits without changing result evidence."""
     import sqlite3

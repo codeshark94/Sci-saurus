@@ -18184,6 +18184,27 @@ class ComposerWorkflowTests(unittest.TestCase):
                 finally:
                     runner.close()
 
+    def test_historical_dossier_identity_does_not_materialize_repair_observations(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            self.addCleanup(runner.close)
+            _, _, subject, _, _ = self._repair_subject_fixture(runner)
+            ref = subject["failure_dossier_ref"]
+            identity = runner._failure_dossier_evidence(ref, expected_stage_id="experiment",
+                expected_attempt_number=1, include_execution_evidence=False)
+            self.assertTrue(identity["available"])
+            self.assertEqual(identity["artifact_ref"], ref)
+            self.assertFalse(identity["execution_evidence_materialized"])
+            self.assertNotIn("foundry_execution_evidence", identity)
+            full = runner._failure_dossier_evidence(ref, expected_stage_id="experiment",
+                expected_attempt_number=1)
+            self.assertTrue(full["available"])
+            self.assertIn("source_files", full)
+            self.assertIn("foundry_execution_evidence", full)
+            wrong = runner._failure_dossier_evidence(ref, expected_stage_id="experiment",
+                expected_attempt_number=2, include_execution_evidence=False)
+            self.assertFalse(wrong["available"])
+
     def test_legacy_plan_subject_requires_owned_completed_hold_receipt(self):
         for verdict, conflict in (("hold", None), ("accept", None), ("hold", "source"),
                                   ("hold", "test_input"), ("hold", "runtime"), ("hold", "cache"), ("hold", "execution_identity")):

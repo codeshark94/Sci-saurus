@@ -14804,23 +14804,13 @@ class ComposerRunner:
         result["generated_capability"] = existing
         return result
 
-    def _apply_topic_to_experiment_config(self, stage, config, *, model_call_budget=None):
-        """Select the admitted generated program or a pinned catalog capability.
-
-        A foundry-backed topic becomes actionable only after its generated
-        program and independent validator pass the complete admission gate.
-        Legacy workflows may still select an explicitly configured template.
-        In both cases, the current run supplies the accepted literature gate
-        and project-local paths; model output never becomes a command directly.
-        """
+    def _experiment_pilot_survey(self, stage):
+        """Resolve the current survey admission shared by production and result reuse."""
         by_id = {item["id"]: item for item in self.workflow["stages"]}
         ancestor_ids = self._stage_ancestor_ids(stage)
         topic_match = self._topic_context_for_stage(stage, ancestor_ids=ancestor_ids)
         if topic_match is None:
-            return config
-        current = config.get("experiment")
-        if not isinstance(current, dict):
-            raise ValidationError("experiment stage config must contain an experiment object")
+            return None
         topic_stage_id, topic_context = topic_match
         pilot_survey = next((self.context[ancestor_id] for ancestor_id in ancestor_ids
             if self._allows_provisional_progress()
@@ -14852,6 +14842,26 @@ class ComposerRunner:
                         pilot_survey = survey_context
             if not eligible_surveys:
                 raise ValidationError(EXPERIMENT_SURVEY_ADMISSION_ERROR)
+        return pilot_survey
+
+    def _apply_topic_to_experiment_config(self, stage, config, *, model_call_budget=None):
+        """Select the admitted generated program or a pinned catalog capability.
+
+        A foundry-backed topic becomes actionable only after its generated
+        program and independent validator pass the complete admission gate.
+        Legacy workflows may still select an explicitly configured template.
+        In both cases, the current run supplies the accepted literature gate
+        and project-local paths; model output never becomes a command directly.
+        """
+        ancestor_ids = self._stage_ancestor_ids(stage)
+        topic_match = self._topic_context_for_stage(stage, ancestor_ids=ancestor_ids)
+        if topic_match is None:
+            return config
+        current = config.get("experiment")
+        if not isinstance(current, dict):
+            raise ValidationError("experiment stage config must contain an experiment object")
+        _, topic_context = topic_match
+        pilot_survey = self._experiment_pilot_survey(stage)
         selected = topic_context["topic"]
         generated = topic_context.get("generated_capability")
         continuation_requests = self._requests_for_stage(stage)
@@ -21318,6 +21328,9 @@ class ComposerRunner:
                         failure_recovery.get("attempt_number")
                         if isinstance(failure_recovery, dict) else None
                     ),
+                    include_execution_evidence=not (
+                        has_observed_results and result_status == "completed"
+                        and not result.get("error") and not result.get("failure")),
                 ),
                 "failure_input_sha256": (
                     prior_stage_context.get("failure_input_sha256")
@@ -21539,6 +21552,16 @@ class ComposerRunner:
         }
         packet.update(self._specialist_experiment_projection(
             stage, descriptor, stage_result=stage_result))
+        if (stage.get("kind") == "experiment" and isinstance(stage_result, dict)
+                and stage_result.get("status") == "completed"
+                and stage_result.get("deterministic_validation_ref")
+                and stage_result.get("model_review_refs") and stage_result.get("assessment_ref")):
+            from scisaurus.runtime.experiment import completed_experiment_result_proof
+            proof = completed_experiment_result_proof(stage_result["project_dir"])
+            if proof is None:
+                raise ValidationError("completed experiment evidence failed its immutable result proof")
+            packet["completed_producer_evidence"] = {**proof["review_evidence"],
+                "artifact_hashes": proof["artifact_hashes"], "file_hashes": proof["file_hashes"]}
         if (isinstance(stage_result, dict)
                 and stage_result.get("_repair_panel") is True
                 and isinstance(stage_result.get("capability_repair_packet"), dict)):
@@ -22465,6 +22488,8 @@ class ComposerRunner:
     def _run_stage(self, stage, *, attempt_number=1, specialist_reports=None,
                    stage_assignment=None):
         """Reuse completed production when only an outer reviewer failed."""
+        if isinstance(stage.get("_completed_experiment_handoff_ref"), str):
+            return self._reuse_completed_experiment_handoff(stage)
         descriptor = json.loads(Path(stage["config_path"]).read_text())
         files = self._stage_input_files(stage, descriptor)
         packet = {
@@ -22937,7 +22962,8 @@ class ComposerRunner:
         return next(iter(unique.values()), None)
 
     def _failure_dossier_evidence(self, artifact_ref, *, expected_stage_id=None,
-                                  expected_attempt_number=None, _visited=None):
+                                  expected_attempt_number=None, _visited=None,
+                                  include_execution_evidence=True):
         """Resolve a failed attempt's immutable evidence for bounded review.
 
         A reference alone is not review evidence: specialist workers cannot
@@ -23006,6 +23032,17 @@ class ComposerRunner:
                 "authoritative_attempt_number": authoritative_attempt_number,
             }
         expected_attempt_number = authoritative_attempt_number
+
+        if not include_execution_evidence:
+            return {
+                "artifact_ref": artifact_ref, "body_sha256": dossier_body_hash,
+                "available": True, "stage_id": dossier_stage_id,
+                "attempt_number": dossier_attempt_number,
+                "failure_class": dossier.get("failure_class"),
+                "error": dossier.get("error"),
+                "evidence_scope": "historical_failure_identity_only",
+                "execution_evidence_materialized": False,
+            }
 
         foundry = dossier.get("foundry_work_snapshot")
         foundry = foundry if isinstance(foundry, dict) else {}
@@ -26052,10 +26089,10 @@ class ComposerRunner:
             return True
         return False
 
-    def _resume_experiment_review_context_capacity(self, stage, record, completed):
-        """Retry an owned review-only stop after lossless transport preflight succeeds."""
+    def _owned_experiment_resource_stop(self, stage, record):
+        """Resolve the current failed resource stop without borrowing older evidence."""
         if stage.get("kind") != "experiment" or record.get("failure_class") != "resource_fence":
-            return False
+            return None
         attempts = record.get("attempts", [])
         latest = attempts[-1] if isinstance(attempts, list) and attempts else {}
         number = latest.get("attempt_number")
@@ -26066,15 +26103,15 @@ class ComposerRunner:
                        for key in ("attempt_number", "attempt_id", "project_dir"))
                 or not isinstance(latest.get("project_dir"), str)
                 or not isinstance(latest.get("attempt_id"), str)):
-            return False
+            return None
         identity = self._current_topic_identity()
         if (not isinstance(identity, dict) or any(latest.get(key) != identity[key]
                                                 for key in ("topic_id", "topic_cycle"))):
-            return False
+            return None
         try:
             attempt = self.tasks.get_attempt(latest["attempt_id"])
         except NotFoundError:
-            return False
+            return None
         payload = attempt.get("payload", {})
         if (attempt.get("state") != "failed" or attempt.get("task_id") != record.get("task_id")
                 or payload.get("stage_id") != stage["id"]
@@ -26083,12 +26120,23 @@ class ComposerRunner:
                 or not self._request_context_matches_current_topic(stage["id"], self.context.get(stage["id"], {}))
                 or any(key in owner and owner[key] != identity[key]
                        for owner in (record, payload) for key in ("topic_id", "topic_cycle"))):
-            return False
+            return None
         dossier = self._failure_dossier_evidence(latest.get("failure_dossier_ref"),
-            expected_stage_id=stage["id"], expected_attempt_number=number)
+            expected_stage_id=stage["id"], expected_attempt_number=number,
+            include_execution_evidence=False)
         if (not isinstance(dossier, dict) or dossier.get("available") is not True
-                or dossier.get("failure_class") != "resource_fence"
-                or "no configured provider route fits the model context budget:" not in str(dossier.get("error"))):
+                or dossier.get("failure_class") != "resource_fence"):
+            return None
+        return latest, dossier
+
+    def _resume_experiment_review_context_capacity(self, stage, record, completed):
+        """Retry an owned review-only stop after lossless transport preflight succeeds."""
+        owner = self._owned_experiment_resource_stop(stage, record)
+        if owner is None:
+            return False
+        latest, dossier = owner
+        number = latest["attempt_number"]
+        if "no configured provider route fits the model context budget:" not in str(dossier.get("error")):
             return False
         from scisaurus.runtime.experiment import review_context_capacity_proof
         try:
@@ -26117,6 +26165,127 @@ class ComposerRunner:
             "stage_id": stage["id"], "attempt_number": number, "proof_ref": receipt["artifact_ref"]})
         return True
 
+    def _resume_completed_experiment_handoff(self, stage, record, completed):
+        owner = self._owned_experiment_resource_stop(stage, record)
+        if owner is None:
+            return False
+        latest, dossier = owner
+        if not str(dossier.get("error", "")).startswith(
+                "specialist input projection cannot preserve its declared fields within quota"):
+            return False
+        from scisaurus.runtime.experiment import completed_experiment_result_proof
+        try:
+            manifest, dossier_sha, original = self._read_verified_artifact_json(latest["failure_dossier_ref"])
+            if (manifest.get("author") != "command.composer"
+                    or original.get("project_dir") != latest["project_dir"]):
+                return False
+            source_project = latest["project_dir"]
+            if isinstance(record.get("completed_experiment_handoff_ref"), str):
+                retained = self._reuse_completed_experiment_handoff({**stage,
+                    "_completed_experiment_handoff_ref": record["completed_experiment_handoff_ref"]})
+                source_project = retained["project_dir"]
+            proof = completed_experiment_result_proof(source_project)
+            observed = original.get("observed_result", {})
+            if (not isinstance(proof, dict)
+                    or observed.get("output_path_sha256") != proof["file_hashes"].get(
+                        str(Path(source_project).resolve() / "output/run.json"))
+                    or observed.get("output_path_snapshot") != proof["result"]):
+                return False
+            result = {**deepcopy(proof["result"]), "stage_id": stage["id"], "kind": "experiment",
+                "project_dir": proof["project_dir"], "output_path": str(Path(proof["project_dir"]) / "output/run.json")}
+            topic = self._topic_context_for_stage(stage)[1]["topic"]
+            if proof["research_question"] != topic.get("research_question"):
+                return False
+            descriptor = json.loads(Path(stage["config_path"]).read_text())
+            if not self._completed_experiment_matches_current_contract(stage, descriptor, proof):
+                return False
+            packet = self._specialist_stage_packet(stage, descriptor, stage_result=result)
+            plan_ref = record.get("assignment_plan_ref")
+            _, _, plan = self._read_verified_artifact_json(plan_ref)
+            if (plan.get("stage_id") != stage["id"]
+                    or plan.get("attempt_number") != latest["attempt_number"]):
+                return False
+            # Every admitted peer must fit before reopening a completed producer.
+            preflight_roles = []
+            for row in plan.get("assignments", []):
+                if row.get("appointment") != "specialist":
+                    continue
+                _, _, assignment = self._read_verified_artifact_json(row["artifact_ref"])
+                if (assignment.get("stage_id") != stage["id"]
+                        or assignment.get("attempt_number") != latest["attempt_number"]
+                        or assignment.get("assignment_id") != row.get("assignment_id")):
+                    return False
+                build_specialist_prompt(assignment, packet)
+                preflight_roles.append(assignment["role_id"])
+            if not preflight_roles:
+                return False
+            proof.update(stage_id=stage["id"], attempt_number=latest["attempt_number"],
+                attempt_id=latest["attempt_id"], failure_dossier_ref=latest["failure_dossier_ref"],
+                dossier_sha256=dossier_sha, topic_identity=self._current_topic_identity(),
+                stage_input_sha256=hashlib.sha256(canonical_bytes(self._stage_input_files(stage, descriptor))).hexdigest(),
+                source_result=result, preflight_roles=preflight_roles)
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error, NotFoundError, ValidationError, StateError):
+            return False
+        receipt = self._publish("command/completed-experiment-handoffs/" + hashlib.sha256(canonical_bytes(proof)).hexdigest(),
+            "note", proof, "command.composer", subjects=[latest["failure_dossier_ref"], plan_ref])
+        record.update(status="retrying", recovery_admitted=True,
+            completed_experiment_handoff_ref=receipt["artifact_ref"])
+        completed.discard(stage["id"])
+        self.status = "running"
+        self.department_activity.append({"action": "resume_completed_experiment_handoff",
+            "stage_id": stage["id"], "attempt_number": latest["attempt_number"], "proof_ref": receipt["artifact_ref"]})
+        return True
+
+    def _completed_experiment_matches_current_contract(self, stage, descriptor, proof):
+        """Require the same admitted program, full input, scientific intent and work orders."""
+        from scisaurus.runtime.capability_registry import _verify_entry
+        match = self._topic_context_for_stage(stage)
+        generated = match[1].get("generated_capability", {}) if match else {}
+        descriptor_path = Path(generated.get("descriptor_path", "")).resolve()
+        if not descriptor_path.is_file():
+            return False
+        root = descriptor_path.parents[3]
+        index = json.loads((root / "capabilities/index.json").read_text())
+        entries = [entry for entry in index.get("capabilities", [])
+                   if Path(entry.get("path", "")).resolve() == descriptor_path
+                   and entry.get("id") == generated.get("capability_id")]
+        if len(entries) != 1:
+            return False
+        _verify_entry(root, entries[0])
+        expected = json.loads(descriptor_path.read_text())
+        expected["experiment"]["literature_gate"] = deepcopy(descriptor.get("experiment", {}).get("literature_gate"))
+        if self._experiment_pilot_survey(stage) is not None:
+            expected["experiment"]["study_type"] = "exploratory"
+            expected["experiment"]["literature_gate"]["required_state"] = "insufficient_evidence"
+        expected = self._apply_bindings(expected, stage.get("bindings", []))
+        for branch in ("execution", "validation"):
+            expected["experiment"][branch]["client"]["cwd"] = proof["project_dir"]
+        return (canonical_bytes(expected["experiment"]) == canonical_bytes(proof.get("configured_experiment"))
+                and canonical_bytes(project_executable_work_orders(self._requests_for_stage(stage)))
+                    == canonical_bytes(proof.get("work_orders")))
+
+    def _reuse_completed_experiment_handoff(self, stage):
+        ref = stage["_completed_experiment_handoff_ref"]
+        manifest, _, proof = self._read_verified_artifact_json(ref)
+        descriptor = json.loads(Path(stage["config_path"]).read_text())
+        from scisaurus.runtime.experiment import completed_experiment_result_proof
+        current = completed_experiment_result_proof(proof["project_dir"])
+        if (manifest.get("author") != "command.composer"
+                or proof.get("stage_id") != stage["id"]
+                or proof.get("topic_identity") != self._current_topic_identity()
+                or proof.get("stage_input_sha256") != hashlib.sha256(canonical_bytes(
+                    self._stage_input_files(stage, descriptor))).hexdigest()
+                or current is None
+                or not self._completed_experiment_matches_current_contract(stage, descriptor, current)
+                or any(current.get(key) != proof.get(key) for key in current)):
+            raise StateError("completed experiment handoff no longer matches its owned production")
+        result = deepcopy(proof["source_result"])
+        result.update(reused_from=ref, source_usage=deepcopy(result.get("usage", {})), usage={})
+        for name in ("foundry_usage", "repair_panel_usage"):
+            if name in result:
+                result[name] = {}
+        return result
+
     def _reopen_blocked_checkpoint(self, completed, by_id):
         """Turn a recoverable stop checkpoint into one fresh work cycle.
 
@@ -26134,6 +26303,8 @@ class ComposerRunner:
             if not isinstance(record, dict) or record.get("status") != "blocked":
                 continue
             if self._resume_proven_dispatch_release(stage, record, completed):
+                return True
+            if self._resume_completed_experiment_handoff(stage, record, completed):
                 return True
             if self._resume_experiment_review_context_capacity(stage, record, completed):
                 return True
@@ -29419,6 +29590,8 @@ class ComposerRunner:
                                 last_error = exc
                                 break
                         attempt_stage = self._attempt_stage(stage, attempt_number)
+                        if isinstance(prior_record.get("completed_experiment_handoff_ref"), str):
+                            attempt_stage["_completed_experiment_handoff_ref"] = prior_record["completed_experiment_handoff_ref"]
                         if retained_topic_result is not None:
                             attempt_stage["_resume_topic_result"] = deepcopy(
                                 retained_topic_result)
@@ -29450,6 +29623,8 @@ class ComposerRunner:
                             "attempt_deadline_at_epoch": attempt_stage["attempt_deadline_at_epoch"],
                             "project_dir": attempt_stage["project_dir"],
                             "attempts": deepcopy(attempt_history),
+                            **({"completed_experiment_handoff_ref": prior_record["completed_experiment_handoff_ref"]}
+                               if isinstance(prior_record.get("completed_experiment_handoff_ref"), str) else {}),
                             **({"completed_mapping": deepcopy(prior_record["completed_mapping"])}
                                if isinstance(prior_record.get("completed_mapping"), dict) else {}),
                             **({"topic_id": topic_lineage["topic_id"],

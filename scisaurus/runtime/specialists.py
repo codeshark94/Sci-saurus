@@ -407,7 +407,7 @@ def _safe_value(value, *, depth=0):
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract"}:
+                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract", "completed_producer_evidence"}:
                 output[key] = _preserve_response_value(item)
                 continue
             output[key] = _safe_value(item, depth=depth + 1)
@@ -454,7 +454,7 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
                             "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
-                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract"}:
+                            "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract", "completed_producer_evidence"}:
                 output[key] = _preserve_response_value(item)
                 continue
             if index >= max_keys:
@@ -1256,6 +1256,8 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
     if "work_orders" in stage_packet:
         body["work_orders"] = _preserve_response_value(stage_packet["work_orders"])
         body["work_orders_sha256"] = hashlib.sha256(canonical_bytes(body["work_orders"])).hexdigest()
+    if "completed_producer_evidence" in stage_packet:
+        body["completed_producer_evidence"] = _preserve_response_value(stage_packet["completed_producer_evidence"])
     if stage_packet.get("repair_verification_scope") == "scientific_software_fitness":
         if not isinstance(body["chief_result"].get("software_assessment"), dict):
             raise ValidationError("scientific software reviewer has no current assessment evidence")
@@ -1481,7 +1483,7 @@ def build_specialist_prompt(assignment, stage_packet):
         # defeated role isolation and routinely exceeded 12k specialist caps.
         "shared_stage_context": {
             key: stage_packet.get(key)
-            for key in ("objective", "stage_id", "stage_kind", "work_orders", "stage_acceptance_contract")
+            for key in ("objective", "stage_id", "stage_kind", "work_orders", "stage_acceptance_contract", "completed_producer_evidence")
             if key in stage_packet
         },
         "output_contract": {

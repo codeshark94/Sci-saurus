@@ -33,7 +33,11 @@ class _SpecialistHandler(BaseHTTPRequestHandler):
             server.active += 1
             server.peak = max(server.peak, server.active)
             server.requests += 1
-        time.sleep(0.04)
+            request_number = server.requests
+        if hasattr(server, "request_barrier") and request_number <= server.request_barrier.parties:
+            server.request_barrier.wait(timeout=5)
+        else:
+            time.sleep(0.04)
         body = json.dumps({
             "model": "fake-specialist",
             "choices": [{"message": {"content": json.dumps({
@@ -513,6 +517,27 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertIn("ranked findings naming supplied evidence and its consequence",
                       contract["findings"][0])
         self.assertIn("falsifiable completion check", contract["requested_actions"][0])
+
+    def test_completed_producer_evidence_reaches_each_peer_and_verifier_losslessly(self):
+        evidence = {"candidate_sha256": "candidate", "observation_count": 12474,
+            "metrics": [{"id": str(i), "value": i} for i in range(20)],
+            "limitations": ["bounded assumption " + str(i) for i in range(24)],
+            "assessment": {"decision": "accepted_with_limitations", "rationale": "x" * 9000},
+            "evidence_scope": "current reviewed producer result"}
+        packet = {"objective": "bounded", "completed_producer_evidence": evidence}
+        assignment = {"stage_id": "experiment", "stage_kind": "experiment",
+            "role_id": "methodologist", "input_projection": [],
+            "quota": {"max_input_tokens": 20000}}
+        peer = json.loads(build_specialist_prompt(assignment, packet))
+        self.assertEqual(peer["shared_stage_context"]["completed_producer_evidence"], evidence)
+        verifier = json.loads(build_verifier_prompt({"id": "experiment", "kind": "experiment"},
+            packet, [], {"status": "completed"}, max_input_tokens=20000))
+        self.assertEqual(verifier["completed_producer_evidence"], evidence)
+        with self.assertRaises(ValidationError):
+            build_specialist_prompt({**assignment, "quota": {"max_input_tokens": 100}}, packet)
+        with self.assertRaises(ValidationError):
+            build_verifier_prompt({"id": "experiment", "kind": "experiment"}, packet, [],
+                {"status": "completed"}, max_input_tokens=100)
 
     def test_length_limited_review_continues_the_same_response_until_third_call(self):
         model = {
@@ -1444,6 +1469,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
 
     def test_provider_pool_capacity_is_real_and_reports_are_role_scoped(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), _SpecialistHandler)
+        server.request_barrier = threading.Barrier(3)
         server.lock = threading.Lock()
         server.active = server.peak = server.requests = 0
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1486,7 +1512,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
             self.assertEqual(len(results), 4)
             self.assertTrue(all(item["status"] == "succeeded" for item in results))
             self.assertEqual(server.requests, 4)
-            self.assertEqual(server.peak, 4)
+            self.assertEqual(server.peak, 3)
             self.assertEqual(sum(item["provider_pool"] == "primary" for item in results), 1)
             self.assertEqual(sum(item["provider_pool"] == "ollama" for item in results), 3)
             self.assertEqual({item["role_id"] for item in results}, {"role-a", "role-b", "role-c", "role-d"})

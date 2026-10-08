@@ -1324,6 +1324,30 @@ class ExperimentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "unavailable or changed"):
             validate_results_package(json.loads(package_path.read_text()), base_dir=package_path.parent)
 
+    def test_completed_producer_proof_binds_all_reviews_raw_and_assets(self):
+        from scisaurus.runtime.experiment import completed_experiment_result_proof
+        project = self.root / "completed-handoff"
+        runner = ExperimentRunner(project, self.config())
+        runner.worker_target = fixture_worker
+        result = runner.run()
+        self.assertEqual(result["status"], "completed")
+        proof = completed_experiment_result_proof(project)
+        self.assertEqual(proof["result"]["raw_results_sha256"], result["raw_results_sha256"])
+        self.assertEqual(proof["result"]["assessment_ref"], result["assessment_ref"])
+        self.assertEqual(len(proof["review_outcomes"]), 2)
+        self.assertEqual(proof["review_evidence"]["candidate_sha256"], result["raw_results_sha256"])
+        self.assertEqual(len(proof["review_evidence"]["independent_reviews"]), 2)
+        self.assertEqual(proof["review_evidence"]["assessment"]["decision"], "accepted_with_limitations")
+        self.assertTrue(proof["file_hashes"])
+        raw = project / "output/raw-results.json"
+        original = raw.read_bytes()
+        raw.write_bytes(original + b" ")
+        self.assertIsNone(completed_experiment_result_proof(project))
+        raw.write_bytes(original)
+        figure = Path(result["results_package"]).parent / "figure.png"
+        figure.write_bytes(figure.read_bytes() + b"changed")
+        self.assertIsNone(completed_experiment_result_proof(project))
+
 
 if __name__ == "__main__":
     unittest.main()

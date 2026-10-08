@@ -181,6 +181,67 @@ class PhysicalAttemptUsageTests(unittest.TestCase):
 
 
 class ReviewContextRecoveryOwnershipTests(unittest.TestCase):
+    def test_completed_handoff_preflights_peers_and_reuses_producer_without_usage(self):
+        import json
+        from unittest.mock import Mock
+        from scisaurus.runtime.composer import ComposerRunner
+        with tempfile.TemporaryDirectory() as directory:
+            directory = str(Path(directory).resolve())
+            config = Path(directory) / "config.json"
+            config.write_text("{}")
+            runner = object.__new__(ComposerRunner)
+            runner.department_activity = []
+            runner._current_topic_identity = Mock(return_value={"topic_id": "chosen", "topic_cycle": 0})
+            runner._topic_context_for_stage = Mock(return_value=("topic", {"topic": {"research_question": "fixed"}}))
+            runner._stage_input_files = Mock(return_value={"input": "hash"})
+            runner._specialist_stage_packet = Mock(return_value={"research_question": "fixed"})
+            runner._completed_experiment_matches_current_contract = Mock(return_value=True)
+            result = {"status": "completed", "research_question": "fixed", "usage": {"model_calls": 3}}
+            current = {"schema_version": "completed-experiment-result-1", "project_dir": directory,
+                "research_question": "fixed", "result": result, "artifact_hashes": {"artifact:run@1": "hash"},
+                "file_hashes": {str(Path(directory) / "output/run.json"): "run-hash"}}
+            latest = {"attempt_number": 4, "attempt_id": "owned", "project_dir": directory,
+                      "failure_dossier_ref": "artifact:failure@1"}
+            dossier = {"error": "specialist input projection cannot preserve its declared fields within quota (too large)"}
+            runner._owned_experiment_resource_stop = Mock(return_value=(latest, dossier))
+            original = {"project_dir": directory, "observed_result": {
+                "output_path_sha256": "run-hash", "output_path_snapshot": result}}
+            assignment = {"stage_id": "experiment", "attempt_number": 4, "assignment_id": "peer",
+                "role_id": "methodologist", "assignment_phase": "specialist",
+                "input_projection": ["research_question"], "quota": {"max_input_tokens": 10000}}
+            plan = {"stage_id": "experiment", "attempt_number": 4,
+                "assignments": [{"appointment": "specialist", "assignment_id": "peer", "artifact_ref": "artifact:peer@1"}]}
+            bodies = {"artifact:failure@1": original, "artifact:plan@1": plan, "artifact:peer@1": assignment}
+            def read(ref):
+                return {"author": "command.composer"}, "body-hash", deepcopy(bodies[ref])
+            runner._read_verified_artifact_json = Mock(side_effect=read)
+            def publish(logical, kind, body, author, **kwargs):
+                bodies["artifact:handoff@1"] = deepcopy(body)
+                return {"artifact_ref": "artifact:handoff@1"}
+            runner._publish = Mock(side_effect=publish)
+            record = {"assignment_plan_ref": "artifact:plan@1"}
+            stage = {"id": "experiment", "kind": "experiment", "config_path": str(config)}
+            with patch("scisaurus.runtime.experiment.completed_experiment_result_proof", side_effect=lambda p: deepcopy(current)):
+                self.assertTrue(runner._resume_completed_experiment_handoff(stage, record, set()))
+                reused = runner._reuse_completed_experiment_handoff({**stage,
+                    "_completed_experiment_handoff_ref": record["completed_experiment_handoff_ref"]})
+                self.assertEqual(reused["usage"], {})
+                self.assertEqual(reused["source_usage"], {"model_calls": 3})
+                for field in ("output_path_sha256", "output_path_snapshot"):
+                    saved = original["observed_result"][field]
+                    original["observed_result"][field] = "changed"
+                    self.assertFalse(runner._resume_completed_experiment_handoff(stage, record, set()))
+                    original["observed_result"][field] = saved
+                assignment["attempt_number"] = 3
+                self.assertFalse(runner._resume_completed_experiment_handoff(stage, record, set()))
+                assignment["attempt_number"] = 4
+                assignment["quota"]["max_input_tokens"] = 1
+                self.assertFalse(runner._resume_completed_experiment_handoff(stage, record, set()))
+                runner._current_topic_identity.return_value = {"topic_id": "changed", "topic_cycle": 0}
+                with self.assertRaisesRegex(Exception, "no longer matches"):
+                    runner._reuse_completed_experiment_handoff({**stage,
+                        "_completed_experiment_handoff_ref": record["completed_experiment_handoff_ref"]})
+
     def test_only_current_failed_owner_with_proven_capacity_resumes(self):
         from unittest.mock import Mock
         from scisaurus.runtime.composer import ComposerRunner
