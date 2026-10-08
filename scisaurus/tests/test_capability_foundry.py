@@ -2968,7 +2968,11 @@ class CapabilityFoundryTests(unittest.TestCase):
             document = validate_program_output(json.loads(
                 cache.store.read_body(execution["stdout_sha256"])),
                 result["candidate"]["experiment_intent"])
-            self.assertEqual(evidence["raw_observations"], document["observations"])
+            table = evidence["raw_observations"]
+            decoded = [dict(zip(table["schemas"][table.get("schema_ids", [0] * table["row_count"])[i]], row))
+                       for i, row in enumerate(table["rows"])]
+            self.assertEqual(decoded, document["observations"])
+            self.assertEqual(table["observations_sha256"], hashlib.sha256(canonical_bytes(decoded)).hexdigest())
             self.assertTrue(evidence["raw_observations_complete"])
             self.assertEqual(evidence["reported_metrics"], document["metrics"])
             self.assertEqual(evidence["configured_input"], {"probe": True})

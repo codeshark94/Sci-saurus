@@ -21,6 +21,7 @@ import urllib.parse
 import uuid
 
 from scisaurus.runtime.execution_policy import enforce_model_cost_limits
+from scisaurus.runtime.model_dispatch import ModelSlotTimeout, model_dispatch_slot
 from scisaurus.core.errors import QuotaExceededError, ValidationError
 from scisaurus.core.schema import json_object
 
@@ -1806,6 +1807,17 @@ class ModelClient:
     def complete(self, *, system: str, prompt: str, images=None,
                  continuation_text: str | None = None,
                  dispatch_budget: dict | None = None) -> ModelResult:
+        deadline = time.monotonic() + self.timeout_seconds
+        try:
+            with model_dispatch_slot(deadline=deadline):
+                return self._complete(system=system, prompt=prompt, images=images,
+                    continuation_text=continuation_text, dispatch_budget=dispatch_budget,
+                    deadline=deadline)
+        except ModelSlotTimeout as exc:
+            raise ModelCallError(str(exc), outcome_known=True, attempts=0) from exc
+
+    def _complete(self, *, system, prompt, images, continuation_text, dispatch_budget,
+                  deadline):
         from scisaurus.runtime.run_control import ensure_run_allowed, dispatch_permission, RunPausedError
         ensure_run_allowed()
         request_model = self.model
@@ -1924,7 +1936,6 @@ class ModelClient:
         if not request_path.startswith("/"):
             request_path = "/" + request_path
         started = time.monotonic()
-        deadline = started + self.timeout_seconds
         # Account-wide backpressure belongs to the scheduler, which can retain
         # siblings and wait without submitting the same prompt again.
         retryable_statuses = {408, 425, 500, 502, 503, 504}

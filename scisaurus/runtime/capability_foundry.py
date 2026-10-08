@@ -68,6 +68,26 @@ from scisaurus.runtime.research_quality import (
 from scisaurus.runtime.study_evidence import evidence_source_refs, study_evidence_contract, validate_evidence_plan
 
 
+def review_observation_table(observations):
+    """Encode every observation without repeating column names or losing missing keys."""
+    schemas, schema_ids, rows = [], [], []
+    for observation in observations:
+        fields = sorted(observation)
+        if fields not in schemas:
+            schemas.append(fields)
+        schema_ids.append(schemas.index(fields))
+        rows.append([observation[field] for field in fields])
+    table = {"encoding": "observation-table-1", "complete": True,
+             "row_count": len(rows), "schemas": schemas, "rows": rows,
+             "observations_sha256": hashlib.sha256(canonical_bytes(observations)).hexdigest(),
+             "decoding": "For row i, zip schemas[schema_ids[i]] with rows[i] to reconstruct the exact observation object. "
+                         "When schema_ids is absent use schema 0 for every row. Row order and all values are preserved; "
+                         "fields absent from a schema are missing, not null."}
+    if len(schemas) > 1:
+        table["schema_ids"] = schema_ids
+    return table
+
+
 def _sandbox_status_text(returncode):
     if type(returncode) is not int or returncode >= 0:
         return str(returncode)
@@ -3313,6 +3333,14 @@ class CapabilityFoundry:
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
 
+        def record_error_usage(request, error, *, calls):
+            usage = deepcopy_config(getattr(error, "usage", {}))
+            usage["model_calls"] = calls
+            request["usage"] = usage
+            for dimension, amount in usage.items():
+                state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
+                    1 if dimension == "model_calls" else 0)
+
         def record_batch_failure(request, error, *, retained=None):
             request.update(status="result_unknown", error=str(error), usage=deepcopy_config(error.usage),
                            batch_receipt=error.receipt)
@@ -3341,11 +3369,8 @@ class CapabilityFoundry:
                 retry_after_seconds=error.retry_after_seconds,
                 provider_error_kind=error.provider_error_kind,
                 error=str(error)[:1200],
-                usage={"model_calls": 1 if dispatched else 0},
             )
-            if not dispatched:
-                state["usage"]["model_calls"] = max(
-                    0, state["usage"].get("model_calls", 0) - 1)
+            record_error_usage(request, error, calls=error.attempts)
             if request_signature is not None:
                 state["author_request_signatures"] = [
                     signature for signature in state.get("author_request_signatures", [])
@@ -3372,13 +3397,17 @@ class CapabilityFoundry:
                                      request_signature=None, attempt_before=None):
             from scisaurus.runtime.run_control import RunPausedError
             if isinstance(error, RunPausedError):
-                request.update(status="operator_paused_not_dispatched", error=str(error), usage={"model_calls": 0})
-                state["usage"]["model_calls"] = max(0, state["usage"].get("model_calls", 0) - 1)
+                attempts = getattr(error, "attempts", 0)
+                dispatched = attempts > 0
+                request.update(status="result_unknown" if dispatched else "operator_paused_not_dispatched",
+                               error=str(error), request_attempts=attempts)
+                record_error_usage(request, error, calls=attempts)
                 if isinstance(retry_state, dict):
-                    retry_state["status"] = "response_received" if retry_state.get("response") else "pending"
+                    retry_state["status"] = ("result_unknown" if dispatched else
+                        "response_received" if retry_state.get("response") else "pending")
                 if attempt_before is not None:
                     state["attempts"] = attempt_before
-                state["status"] = retry_status
+                state["status"] = "calling" if dispatched else retry_status
                 save("operator_pause_before_dispatch")
                 return True
             if not isinstance(error, ModelContextBudgetError):
@@ -4067,6 +4096,8 @@ class CapabilityFoundry:
             identity = hashlib.sha256(canonical_bytes(candidate)).hexdigest()
             reviews = state.setdefault("scientific_reviews", {})
             execution_evidence = program_review_evidence(candidate, document, verdict)
+            execution_evidence["raw_observations"] = review_observation_table(
+                execution_evidence["raw_observations"])
             topic = {}
             try:
                 topic = json.loads(brief).get("topic", {}) if isinstance(brief, str) else brief.get("topic", {})
@@ -4250,7 +4281,7 @@ class CapabilityFoundry:
             request = {"role": "review.methods", "candidate_sha256": identity,
                        "route_identity": retained.get("current_route"),
                        "review_attempt": review_attempt + 1,
-                       "status": "started", "prompt": json.dumps(prompt, ensure_ascii=False, sort_keys=True),
+                       "status": "started", "prompt": json.dumps(prompt, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
                        "usage": {"model_calls": 1}}
             state["requests"].append(request)
             state["usage"]["model_calls"] = state["usage"].get("model_calls", 0) + 1

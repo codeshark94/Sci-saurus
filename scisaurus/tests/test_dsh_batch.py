@@ -123,6 +123,23 @@ class BatchTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_deadline_includes_preparation_before_dispatch(self):
+        from scisaurus.runtime.dsh_batch import sandbox_profile
+        def slow_profile(*args, **kwargs):
+            profile = sandbox_profile(*args, **kwargs)
+            time.sleep(0.1)
+            return profile
+        with patch("scisaurus.runtime.dsh_batch.sandbox_profile", side_effect=slow_profile), \
+                patch("scisaurus.runtime.dsh_batch.start_process") as launch:
+            with self.assertRaises(TimeoutError):
+                self.run_job(self.config(seconds=0.05))
+        launch.assert_not_called()
+        receipts = list((self.root / "jobs").glob("*/receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        state = json.loads(receipts[0].read_text())
+        self.assertEqual(state["status"], "not_dispatched")
+        self.assertEqual(state["usage"]["model_calls"], 0)
+
     def test_managed_pause_reaps_runtime(self):
         control = self.root / "control"
         control.mkdir()

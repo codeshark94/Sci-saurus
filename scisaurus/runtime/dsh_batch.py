@@ -17,6 +17,7 @@ import uuid
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.runtime.model_work import ModelWorkBlocked
+from scisaurus.runtime.model_dispatch import model_dispatch_slot
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.program_sandbox import SANDBOX_EXEC, sandbox_profile
 from scisaurus.runtime.run_control import ensure_run_allowed, start_process
@@ -139,6 +140,15 @@ class DshBatchRunner:
         self.runtime_read_roots = [str(Path(p).resolve()) for p in runtime_read_roots]
 
     def run(self, task, *, inputs, seed_files=None, outputs, deadline=None):
+        deadline = min(deadline if deadline is not None else math.inf,
+                       time.monotonic() + self.config["timeout_seconds"])
+        # One DSH session has sequential model steps. Keep its slot until the
+        # process tree is reaped, including periods spent editing and executing.
+        with model_dispatch_slot(deadline=deadline) as slot:
+            return self._run(task, inputs=inputs, seed_files=seed_files,
+                             outputs=outputs, deadline=deadline, dispatch_slot=slot)
+
+    def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot):
         ensure_run_allowed()
         config = validate_batch_config(self.config)
         verify_batch_runtime(config)
@@ -204,9 +214,12 @@ class DshBatchRunner:
         # processes and signal members of its own inherited Seatbelt domain.
         profile += "\n(allow process-info*)\n(allow signal (target same-sandbox))\n"
         try:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("DSH batch reached its execution deadline before dispatch")
             process = start_process([SANDBOX_EXEC, "-p", profile, *config["command"]],
                 cwd=work, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True)
+                stderr=subprocess.PIPE, start_new_session=True,
+                pass_fds=(dispatch_slot.fileno(),))
         except BaseException as exc:
             state.update(status="not_dispatched", error=f"{type(exc).__name__}: {exc}")
             save()
@@ -223,6 +236,9 @@ class DshBatchRunner:
         calls_seen = set()
         step_usage = {}
         def send(identity, method, params):
+            ensure_run_allowed()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("DSH batch reached its execution deadline")
             process.stdin.write(canonical_bytes({"jsonrpc": "2.0", "id": identity,
                                                 "method": method, "params": params}) + b"\n")
             process.stdin.flush()
@@ -277,7 +293,7 @@ class DshBatchRunner:
             with journal.open("ab", buffering=0) as log, (job / "stderr.log").open("ab", buffering=0) as errors:
                 while not done:
                     ensure_run_allowed()
-                    if time.monotonic() - start >= remaining:
+                    if time.monotonic() >= deadline:
                         raise TimeoutError("DSH batch reached its execution deadline")
                     if not selector.get_map():
                         raise RuntimeError("DSH transport ended before the owned session became idle")

@@ -1872,6 +1872,87 @@ class ComposerRunner:
             changed = True
         return changed
 
+    def _prove_foundry_dispatch_release(self, totals, current_heads):
+        """Bind a reservation release to the exact frontier already charged."""
+        from scisaurus.runtime.foundry_usage import dispatch_release_count
+
+        checkpoints = self.control._conn.execute(
+            "SELECT artifact_ref,created_at FROM artifacts WHERE artifact_type='progress_checkpoint' "
+            "ORDER BY created_at DESC,version DESC").fetchall()
+        for checkpoint in checkpoints:
+            manifest, _, snapshot = self._read_verified_artifact_json(checkpoint["artifact_ref"])
+            if (manifest.get("author") != "command.composer"
+                    or snapshot.get("workflow_id") != self.workflow["id"]
+                    or snapshot.get("foundry_usage") != self.foundry_usage):
+                continue
+            frontier = self.control._conn.execute(
+                "SELECT a.logical_id,a.artifact_ref FROM artifacts a JOIN "
+                "(SELECT logical_id,MAX(version) version FROM artifacts "
+                "WHERE logical_id LIKE 'command/foundry-work/%' AND created_at<=? GROUP BY logical_id) h "
+                "ON a.logical_id=h.logical_id AND a.version=h.version", (checkpoint["created_at"],)).fetchall()
+            previous = {}
+            charged = {}
+            for row in frontier:
+                owner, _, body = self._read_verified_artifact_json(row["artifact_ref"])
+                if owner.get("author") != "command.controller":
+                    raise ValidationError("dispatch release has an unowned accounting frontier")
+                inherited = self._foundry_inherited_usage(row["logical_id"], body)
+                previous[row["logical_id"]] = (row["artifact_ref"], body)
+                for key, amount in body.get("usage", {}).items():
+                    if key in self.usage:
+                        charged[key] = charged.get(key, 0) + amount - inherited.get(key, 0)
+            if any(charged.get(k, 0) != self.foundry_usage.get(k, 0)
+                   for k in set(charged) | set(self.foundry_usage)):
+                continue
+            releases = []
+            for logical_id, (ref, body) in current_heads.items():
+                current_owner, current_hash, verified_body = self._read_verified_artifact_json(ref)
+                if (current_owner.get("author") != "command.controller" or verified_body != body
+                        or current_owner.get("artifact_id") != logical_id):
+                    raise ValidationError("dispatch release has an unowned current receipt")
+                prior_ref, prior = previous.get(logical_id, (None, {}))
+                inherited = self._foundry_inherited_usage(logical_id, body)
+                old_inherited = self._foundry_inherited_usage(logical_id, prior)
+                if any(body.get("usage", {}).get(k, 0) - inherited.get(k, 0)
+                       < prior.get("usage", {}).get(k, 0) - old_inherited.get(k, 0)
+                       for k in self.usage):
+                    if inherited != old_inherited or body.get("usage_inheritance") != prior.get("usage_inheritance"):
+                        raise ValidationError("dispatch release changes inherited usage")
+                    count = dispatch_release_count(prior, body)
+                    prior_owner, prior_hash, _ = self._read_verified_artifact_json(prior_ref)
+                    changed_indices = [i for i, (a, b) in enumerate(zip(prior["requests"], body["requests"])) if a != b]
+                    history = self.control._conn.execute(
+                        "SELECT artifact_ref FROM artifacts WHERE logical_id=? AND version>? AND version<? ORDER BY version",
+                        (logical_id, prior_owner["version"], current_owner["version"])).fetchall()
+                    for historical in history:
+                        historical_owner, _, historical_body = self._read_verified_artifact_json(historical["artifact_ref"])
+                        if historical_owner.get("author") != "command.controller":
+                            raise ValidationError("dispatch release history has an unowned receipt")
+                        for index in changed_indices:
+                            historical_requests = historical_body.get("requests", [])
+                            if (index >= len(historical_requests)
+                                    or historical_requests[index] not in (prior["requests"][index], body["requests"][index])):
+                                raise ValidationError("dispatch release history contains another dispatch outcome")
+                    releases.append({"before_ref": prior_ref, "before_sha256": prior_hash,
+                                     "after_ref": ref, "after_sha256": current_hash, "model_calls": count,
+                                     "intermediate_refs": [row["artifact_ref"] for row in history]})
+            decrement = self.foundry_usage.get("model_calls", 0) - totals.get("model_calls", 0)
+            if (decrement <= 0 or decrement > sum(row["model_calls"] for row in releases)
+                    or any(totals.get(k, 0) < self.foundry_usage.get(k, 0)
+                           for k in self.usage if k != "model_calls")
+                    or self.usage.get("model_calls", 0) < decrement):
+                raise ValidationError("foundry usage decrease has no exact dispatch release")
+            proof = {"schema_version": "foundry-dispatch-release-1",
+                     "checkpoint_ref": checkpoint["artifact_ref"], "releases": releases,
+                     "before_usage": deepcopy(self.foundry_usage), "after_usage": deepcopy(totals),
+                     "released_model_calls": decrement}
+            digest = hashlib.sha256(canonical_bytes(proof)).hexdigest()
+            logical = "command/foundry-dispatch-releases/" + digest
+            if self.store.head(logical) is None:
+                self._publish(logical, "note", proof, "command.composer")
+            return
+        raise ValidationError("foundry usage ledger regressed without a paid zero-dispatch proof")
+
     def _sync_foundry_usage(self):
         """Reconcile durable per-request charges with the last usage checkpoint."""
         totals = {}
@@ -1880,6 +1961,7 @@ class ComposerRunner:
             "(SELECT logical_id,MAX(version) version FROM artifacts "
             "WHERE logical_id LIKE 'command/foundry-work/%' GROUP BY logical_id) h "
             "ON a.logical_id=h.logical_id AND a.version=h.version")
+        current_heads = {}
         for row in list(rows):
             body = json.loads(self.store.read_body(row["body_hash"]))
             try:
@@ -1895,14 +1977,15 @@ class ComposerRunner:
                 body = reconcile_inherited_request_outcomes(body, record, source, target_ref=row["artifact_ref"])
                 self._publish(row["logical_id"], "note", body, "command.controller")
                 inherited = self._foundry_inherited_usage(row["logical_id"], body)
+            current_heads[row["logical_id"]] = (self.store.head(row["logical_id"])["artifact_ref"], body)
             for key, amount in body.get("usage", {}).items():
                 if key in self.usage and type(amount) in (int, float) and math.isfinite(amount) and amount >= 0:
                     totals[key] = totals.get(key, 0) + amount - inherited.get(key, 0)
+        if any(totals.get(k, 0) < self.foundry_usage.get(k, 0) for k in self.usage):
+            self._prove_foundry_dispatch_release(totals, current_heads)
         incremental_usage = {}
         for key, total in totals.items():
             delta = total - self.foundry_usage.get(key, 0)
-            if delta < 0:
-                raise ValidationError("foundry usage ledger regressed below its recorded checkpoint")
             incremental_usage[key] = delta
         self._settle_pending_stage_usage(
             additional_usage=incremental_usage, settle_pending=False, foundry_totals=totals)
@@ -25769,6 +25852,55 @@ class ComposerRunner:
                 "action": "reconcile_model_budget_work_orders", "request_ids": sorted(retired), "model_calls": 0})
         return sorted(retired)
 
+    def _resume_proven_dispatch_release(self, stage, record, completed):
+        """Resume the same stage only after its accounting failure was proven repaired."""
+        if record.get("failure_class") != "operational_recovery":
+            return False
+        attempts = record.get("attempts", [])
+        latest = attempts[-1] if attempts else {}
+        number = latest.get("attempt_number") or record.get("attempt_number")
+        attempt_id = latest.get("attempt_id") or record.get("attempt_id")
+        project_dir = latest.get("project_dir") or record.get("project_dir")
+        if (not isinstance(attempt_id, str) or not isinstance(project_dir, str)
+                or record.get("attempt_id") not in (None, attempt_id)
+                or record.get("project_dir") not in (None, project_dir)
+                or record.get("attempt_number") not in (None, number)):
+            return False
+        evidence = self._failure_dossier_evidence(
+            latest.get("failure_dossier_ref") or record.get("failure_dossier_ref"),
+            expected_stage_id=stage["id"], expected_attempt_number=number)
+        if (not isinstance(evidence, dict) or evidence.get("available") is not True
+                or evidence.get("failure_class") != "operational_recovery"
+                or evidence.get("error") != "foundry usage ledger regressed below its recorded checkpoint"):
+            return False
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/foundry-dispatch-releases/%' "
+            "ORDER BY created_at DESC").fetchall()
+        for row in rows:
+            owner, _, proof = self._read_verified_artifact_json(row["artifact_ref"])
+            if (owner.get("author") != "command.composer"
+                    or proof.get("schema_version") != "foundry-dispatch-release-1"
+                    or proof.get("after_usage") != self.foundry_usage):
+                continue
+            checkpoint_owner, _, snapshot = self._read_verified_artifact_json(proof["checkpoint_ref"])
+            paid_stage = snapshot.get("stages", {}).get(stage["id"], {})
+            if (checkpoint_owner.get("author") != "command.composer"
+                    or snapshot.get("workflow_id") != self.workflow["id"]
+                    or snapshot.get("foundry_usage") != proof.get("before_usage")
+                    or paid_stage.get("attempt_id") != attempt_id
+                    or paid_stage.get("project_dir") != project_dir
+                    or paid_stage.get("attempt_number") != number):
+                continue
+            record.update(status="retrying", recovery_admitted=True,
+                          operational_recovery_ref=row["artifact_ref"])
+            completed.discard(stage["id"])
+            self.status = "running"
+            self.department_activity.append({"action": "resume_proven_dispatch_release",
+                "stage_id": stage["id"], "attempt_number": number,
+                "proof_ref": row["artifact_ref"]})
+            return True
+        return False
+
     def _reopen_blocked_checkpoint(self, completed, by_id):
         """Turn a recoverable stop checkpoint into one fresh work cycle.
 
@@ -25784,6 +25916,10 @@ class ComposerRunner:
             stage_id = stage.get("id")
             record = self.stage_records.get(stage_id, {})
             if not isinstance(record, dict) or record.get("status") != "blocked":
+                continue
+            if self._resume_proven_dispatch_release(stage, record, completed):
+                return True
+            if record.get("failure_class") == "operational_recovery":
                 continue
             error_text = str(record.get("error") or "")
             lowered = error_text.casefold()

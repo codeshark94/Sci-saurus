@@ -50,6 +50,18 @@ the current complete raw output and commissions scientific reviews. Scientific f
 generate a new work order with current evidence; transport failures stop at the
 retained receipt instead of entering a JSON continuation or model-fallback loop.
 
+Scientific reviews receive every observation as an ordered, lossless row table.
+The projection declares its column schemas, missing-field semantics, row count
+and canonical observations digest. Candidate and execution digests continue to
+identify the original output. Review cache identity includes the projection;
+changing its representation does not admit a scientific result.
+
+Unobserved dispatch reservations remain conservatively charged. A proven local
+rejection can release its reservation only through controller-owned immutable
+request history and the matching paid Composer checkpoint. Observed or unknown
+dispatch outcomes cannot be refunded. Provider retries retain their physical
+attempt counts even when followed by a rate limit or pause.
+
 The first admission adapter exports a self-contained executor. DSH may use
 multiple files and install dependencies while developing, but their presence in
 the work directory does not make them admitted runtime dependencies. Published
@@ -61,6 +73,16 @@ completions with the DeepSeek thinking dialect. A different provider's reasoning
 wire contract must be explicitly configured and verified before deployment.
 
 ## Lifecycle and limitations
+
+All Sci-whale model clients and DSH batches share three host-wide dispatch
+slots across threads and processes. A single-session DSH batch holds one slot
+until its process tree has been reaped, including tool execution between model
+steps. This conservatively reserves capacity without admitting more than three
+concurrent workers. Waiting does not consume a model call and remains subject
+to pause and the original deadline. DSH inherits its slot descriptor, retaining
+the reservation if its controller exits before the child. Kernel locks release
+when the last owning descriptor closes; keep
+`~/.local/state/sci-whale/model-slots` intact while workers run.
 
 The batch inherits the active Sci-whale run generation. Pause or generation
 replacement stops the owned runtime and descendants; the batch deadline is the
