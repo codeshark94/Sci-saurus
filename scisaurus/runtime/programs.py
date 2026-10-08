@@ -15,14 +15,28 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import tempfile
 import time
 
 from scisaurus.core.schema import canonical_bytes, now_iso, sha256_hex
 from scisaurus.runtime.retrieval import SAFE_PROCESS_ENV
 
 
-ADAPTER_VERSION = "2"
+ADAPTER_VERSION = "3"
 PROTOCOL_VERSION = "json-stdin-object-v1"
+
+_SOURCE_BOOTSTRAP = (
+    "import os,sys,types; snapshot,original=sys.argv[1:]; "
+    "source=open(snapshot,'rb').read(); sys.argv=[original]; "
+    "sys.path[0]=os.path.dirname(original); "
+    "main=types.ModuleType('__main__'); main.__file__=original; "
+    "main.__package__=None; main.__spec__=None; main.__cached__=None; "
+    "sys.modules['__main__']=main; exec(compile(source,original,'exec'),main.__dict__)")
+
+
+def source_snapshot_command(command, snapshot_path):
+    """Execute frozen bytes while preserving the original script's Python namespace."""
+    return [command[0], "-c", _SOURCE_BOOTSTRAP, str(snapshot_path), command[1]]
 
 
 def _capture(body, media_type):
@@ -66,7 +80,8 @@ def _parse_object(body):
     return json_object(value)
 
 
-def command_identity(command, cwd, env):
+def command_identity(command, cwd, env, *, source_paths=()):
+    """Bind the executable and any explicitly declared source payloads to exact bytes."""
     executable = Path(command[0])
     digest = hashlib.sha256()
     with executable.open("rb") as stream:
@@ -75,6 +90,11 @@ def command_identity(command, cwd, env):
     details = {"command": command, "cwd": cwd, "env": env,
                "executable": {"path": str(executable), "resolved_path": str(executable.resolve()),
                               "sha256": digest.hexdigest()}}
+    if source_paths:
+        details["source_files"] = [
+            {"path": str(path), "resolved_path": str(Path(path).resolve()),
+             "capture": _capture(Path(path).read_bytes(), "text/plain")}
+            for path in source_paths]
     return {"sha256": sha256_hex(canonical_bytes(details)), "details": details}
 
 
@@ -125,7 +145,8 @@ class LocalProgramClient:
         ensure_run_allowed()
         document = json_object(input)
         stdin = canonical_bytes(document)
-        identity = command_identity(self.command, self.cwd, self.env)
+        identity = command_identity(self.command, self.cwd, self.env,
+            source_paths=self.command[1:] if self.sandbox_required else ())
         result = {"outcome": "program_error", "document": None, "text": "", "sources": [], "gaps": [],
                   "input": document, "input_capture": _capture(stdin, "application/json"),
                   "input_sha256": sha256_hex(stdin),
@@ -233,10 +254,19 @@ class LocalProgramClient:
         """Execute model-authored code under the same boundary used at admission."""
         from scisaurus.runtime.program_sandbox import run_sandboxed
 
-        sandbox = run_sandboxed(
-            self.command, workspace=Path(self.cwd), input_bytes=stdin,
-            timeout_seconds=self.timeout, max_bytes=self.max_bytes, env=self.env,
-        )
+        source = result["metadata"]["command_identity"]["details"]["source_files"][0]
+        # The sandbox can write only its workspace, so the private source stays read-only.
+        with tempfile.TemporaryDirectory(prefix="scisaurus-program-source-") as directory:
+            snapshot = Path(directory) / "source.py"
+            snapshot.write_bytes(base64.b64decode(source["capture"]["body"], validate=True))
+            snapshot.chmod(0o444)
+            command = source_snapshot_command(self.command, snapshot)
+            result["metadata"].update(source_dispatch_mode="private_read_only_snapshot",
+                                      source_snapshot_path=str(snapshot), dispatched_command=command)
+            sandbox = run_sandboxed(
+                command, workspace=Path(self.cwd), input_bytes=stdin,
+                timeout_seconds=self.timeout, max_bytes=self.max_bytes, env=self.env,
+            )
         stdout, stderr = sandbox.stdout, sandbox.stderr
         result["metadata"].update(
             sandbox_mode=sandbox.mode,

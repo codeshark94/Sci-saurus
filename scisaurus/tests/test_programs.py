@@ -62,6 +62,82 @@ class TestLocalPrograms(unittest.TestCase):
         self.assertEqual(result["document"], {})
         self.assertEqual(result["text"], "{}")
 
+    def test_required_sandbox_captures_and_verifies_exact_dispatched_source(self):
+        from copy import deepcopy
+        from scisaurus.runtime.operation_adapters import _inspect_program
+        from scisaurus.runtime.program_sandbox import sandbox_status
+        if sandbox_status()["mode"] != "sandbox-exec":
+            self.skipTest("required sandbox is unavailable")
+        original = self.script.read_bytes()
+        result = self.run_program(input={"sample": 1}, sandbox_required=True)
+        self.assertEqual(result["outcome"], "ok", result)
+        snapshot = result["metadata"]["command_identity"]["details"]["source_files"][0]
+        self.assertEqual(base64.b64decode(snapshot["capture"]["body"]), original)
+        self.assertEqual(snapshot["capture"]["sha256"], sha256_hex(original))
+        profile = {"client": {**self.options, "sandbox_required": True, "own_process_group": False}}
+        checks, _ = _inspect_program(profile, result, {"input": {"sample": 1}})
+        self.assertTrue(all(row["outcome"] == "passed" for row in checks), checks)
+        changed = deepcopy(result)
+        changed["metadata"]["command_identity"]["details"]["source_files"][0]["capture"]["body"] = ""
+        checks, _ = _inspect_program(profile, changed, {"input": {"sample": 1}})
+        self.assertIn({"check_id": "program-execution", "outcome": "failed"},
+            [{"check_id": row["check_id"], "outcome": row["outcome"]} for row in checks])
+        self.script.write_bytes(original + b"# changed after execution\n")
+        checks, _ = _inspect_program(profile, result, {"input": {"sample": 1}})
+        self.assertEqual(next(row["outcome"] for row in checks
+            if row["check_id"] == "program-execution"), "failed")
+        self.assertEqual(base64.b64decode(snapshot["capture"]["body"]), original)
+        self.script.unlink()
+        checks, _ = _inspect_program(profile, result, {"input": {"sample": 1}})
+        self.assertEqual(next(row["outcome"] for row in checks
+            if row["check_id"] == "program-execution"), "failed")
+
+    def test_required_sandbox_executes_snapshot_during_source_and_symlink_replacement(self):
+        from scisaurus.runtime.operation_adapters import _inspect_program
+        from scisaurus.runtime.program_sandbox import run_sandboxed, sandbox_status
+        if sandbox_status()["mode"] != "sandbox-exec":
+            self.skipTest("required sandbox is unavailable")
+        original = b"import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'executed':'original','file':__file__,'argv':sys.argv}))\n"
+        replacement = self.root / "replacement.py"
+        replacement.write_text("import json,sys\njson.load(sys.stdin)\nprint(json.dumps({'executed':'replacement'}))\n")
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink):
+                self.script.write_bytes(original)
+                def swap_during_dispatch(command, **kwargs):
+                    if symlink:
+                        self.script.unlink()
+                        self.script.symlink_to(replacement)
+                    else:
+                        self.script.write_bytes(replacement.read_bytes())
+                    try:
+                        return run_sandboxed(command, **kwargs)
+                    finally:
+                        if self.script.is_symlink():
+                            self.script.unlink()
+                        self.script.write_bytes(original)
+                with patch("scisaurus.runtime.program_sandbox.run_sandboxed", side_effect=swap_during_dispatch):
+                    result = self.run_program(sandbox_required=True)
+                self.assertEqual(result["outcome"], "ok", result)
+                self.assertEqual(result["document"], {"executed": "original", "file": str(self.script),
+                    "argv": [str(self.script)]})
+                self.assertFalse(Path(result["metadata"]["source_snapshot_path"]).exists())
+                profile = {"client": {**self.options, "sandbox_required": True, "own_process_group": False}}
+                checks, _ = _inspect_program(profile, result, {"input": {}})
+                self.assertTrue(all(row["outcome"] == "passed" for row in checks), checks)
+
+    def test_required_sandbox_preserves_main_module_pickling_and_sibling_import(self):
+        from scisaurus.runtime.program_sandbox import sandbox_status
+        if sandbox_status()["mode"] != "sandbox-exec":
+            self.skipTest("required sandbox is unavailable")
+        (self.root / "sibling.py").write_text("value = 7\n")
+        source = ("import json,sys,pickle,os,sibling\njson.load(sys.stdin)\nmarker=42\n"
+            "def f(): return marker+sibling.value\n"
+            "import __main__\nprint(json.dumps({'marker':__main__.marker,"
+            "'unpickled':pickle.loads(pickle.dumps(f))(),'cwd':os.getcwd(),'file':__file__}))\n")
+        result = self.run_program(source, sandbox_required=True)
+        self.assertEqual(result["outcome"], "ok", result)
+        self.assertEqual(result["document"], {"marker": 42, "unpickled": 49,
+            "cwd": str(self.root), "file": str(self.script)})
     def test_nonzero_exit_is_failure_even_with_valid_stdout(self):
         result = self.run_program("import sys\nsys.stdin.read()\nprint('{\"valid\":true}')\nsys.exit(7)\n")
         self.assertEqual(result["outcome"], "program_error")

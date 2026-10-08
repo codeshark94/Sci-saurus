@@ -898,15 +898,25 @@ def _inspect_program(profile, result, params, *, representative=True):
         valid_output = False
     check("usable-output", valid_output, "Stdout contains one JSON object and its exact canonical citation text")
     client = profile["client"]
-    identity = programs.command_identity(client["command"], client["cwd"], client["env"])
-    check("program-execution", type(metadata.get("process_returncode")) is int
+    try:
+        identity = programs.command_identity(client["command"], client["cwd"], client["env"],
+            source_paths=client["command"][1:] if client.get("sandbox_required") else ())
+    except OSError:
+        identity = None
+    check("program-execution", identity is not None and type(metadata.get("process_returncode")) is int
           and metadata["process_returncode"] == 0 and metadata.get("command") == client["command"]
           and metadata.get("cwd") == client["cwd"] and metadata.get("command_identity") == identity
           and metadata.get("own_process_group") == client["own_process_group"]
           and metadata.get("sandbox_required") == client.get("sandbox_required", False)
           and (not client.get("sandbox_required")
-               or metadata.get("sandbox_mode") == "sandbox-exec"),
-          "A zero exit status is bound to the configured command, executable, environment and working directory")
+               or (metadata.get("sandbox_mode") == "sandbox-exec"
+                   and metadata.get("source_dispatch_mode") == "private_read_only_snapshot"
+                   and isinstance(metadata.get("source_snapshot_path"), str)
+                   and Path(metadata["source_snapshot_path"]).is_absolute()
+                   and not Path(metadata["source_snapshot_path"]).is_relative_to(Path(client["cwd"]))
+                   and metadata.get("dispatched_command") == programs.source_snapshot_command(
+                       client["command"], metadata["source_snapshot_path"]))),
+          "A zero exit status is bound to the configured command, executable, environment and working directory; required-sandbox code is bound to its exact captured source bytes")
     schema_identity = {"protocol_version": metadata.get("protocol_version")}
     check("program-protocol", schema_identity["protocol_version"] == programs.PROTOCOL_VERSION
           and metadata.get("adapter_version") == programs.ADAPTER_VERSION,
