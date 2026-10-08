@@ -1180,6 +1180,7 @@ class ComposerRunner:
                 self._checkpoint("resume:refresh_current_topic_lineage", force=True)
             self._continuation_budget_baseline = max(
                 0, int(self.continuation_cycles or 0))
+            self._restore_retained_response_recovery_orders()
             self._reconcile_superseded_response_recovery_orders()
             self.active_research_requests = self._scope_active_research_requests(
                 self.active_research_requests)
@@ -5832,6 +5833,7 @@ class ComposerRunner:
         # A continuation is new scientific work.  Check the immutable mission
         # wall before publishing its decision or activating any work order.
         self._remaining()
+        self._restore_retained_response_recovery_orders()
         self._reconcile_superseded_response_recovery_orders()
         previous_cycle = self.continuation_cycles
         requests = self._continuation_requests()
@@ -7410,6 +7412,168 @@ class ComposerRunner:
                 return identity["topic_cycle"] == 0
         return True
 
+    def _unresolved_response_owner(self, request, context):
+        """Identify a retained response across a pre-dispatch wrapper failure.
+
+        Stage-input hashes describe dispatch envelopes. An envelope failure
+        does not replace the response owner unless it consumed new evidence.
+        Both envelopes and their immutable dossiers remain independently bound.
+        """
+        if (request.get("kind") != "recovery"
+                or request.get("recovery_mode") != "format_repair_then_rerun"
+                or not self._research_request_was_admitted(request)):
+            return None
+        stage_id = request.get("target_stage_id")
+        if not isinstance(stage_id, str) or request.get("source_stage_id") != stage_id:
+            return None
+        identity = self._current_topic_identity()
+        if identity is not None and any(request.get(key) != identity[key]
+                                        for key in ("topic_id", "topic_cycle")):
+            return None
+        recovery = context.get("failure_recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        current_ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+        prior_ref = request.get("failure_dossier_ref")
+        if not isinstance(prior_ref, str) or not isinstance(current_ref, str) or prior_ref == current_ref:
+            return None
+        try:
+            dossiers = []
+            for ref in (prior_ref, current_ref):
+                manifest, _, dossier = self._read_verified_artifact_json(ref)
+                evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage_id)
+                if (manifest.get("author") != "command.composer"
+                        or dossier.get("schema_version") != "composer-failure-recovery-1"
+                        or not isinstance(evidence, dict) or evidence.get("available") is not True):
+                    return None
+                dossiers.append(dossier)
+            prior, current = dossiers
+            if (prior.get("failure_class") != "model_contract"
+                    or prior.get("input_sha256") != request.get("failure_input_sha256")
+                    or type(prior.get("attempt_number")) is not int
+                    or type(current.get("attempt_number")) is not int
+                    or prior["attempt_number"] >= current["attempt_number"]
+                    or self._methods_panel_response_failure(current)
+                    or current.get("model_diagnostics") != {}
+                    or current.get("program_snapshot") != []):
+                return None
+            observed = current.get("observed_result")
+            usage = observed.get("usage") if isinstance(observed, dict) else None
+            if (not isinstance(observed, dict) or observed.get("status") != "blocked"
+                    or not set(observed) <= {"status", "kind", "stage_id", "error", "usage"}
+                    or not isinstance(usage, dict) or not usage
+                    or any(type(value) not in (int, float) or value != 0 for value in usage.values())):
+                return None
+            snapshot = prior.get("foundry_work_snapshot")
+            if (not isinstance(snapshot, dict)
+                    or canonical_bytes(snapshot) != canonical_bytes(current.get("foundry_work_snapshot"))
+                    or snapshot.get("cache_body_verified") is not True
+                    or snapshot.get("last_attempt") is not None
+                    or snapshot.get("cache_ref") != request.get("foundry_work_ref")):
+                return None
+            ref = snapshot.get("cache_ref")
+            if not isinstance(ref, str) or not ref.startswith("artifact:command/foundry-work/"):
+                return None
+            _, body_hash, work = self._read_verified_artifact_json(ref)
+            namespace, logical_name, _ = parse_ref(ref)
+            head = self.store.head(namespace + "/" + logical_name)
+            response = work.get("last_response")
+            if (snapshot.get("cache_body_sha256") != body_hash
+                    or not isinstance(head, dict) or head.get("body_hash") != body_hash
+                    or work.get("status") != "blocked"
+                    or work.get("last_failure_class") != "model_contract"
+                    or work.get("last_failure_gate") not in {None, "author_response_format"}
+                    or work.get("last_attempt") is not None
+                    or not isinstance(response, dict) or not isinstance(response.get("text"), str)
+                    or not response["text"]):
+                return None
+            return {"prior_failure_dossier_ref": prior_ref,
+                    "current_failure_dossier_ref": current_ref,
+                    "current_input_sha256": current.get("input_sha256"),
+                    "foundry_work_ref": ref, "foundry_body_sha256": body_hash,
+                    "response_sha256": hashlib.sha256(response["text"].encode()).hexdigest()}
+        except (NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError):
+            return None
+
+    def _restore_retained_response_recovery_orders(self):
+        """Restore only admitted orders retired without a new response owner."""
+        restored = []
+        active_ids = {item.get("id") for item in self.active_research_requests if isinstance(item, dict)}
+        for activity in list(self.department_activity):
+            if (not isinstance(activity, dict)
+                    or activity.get("action") != "retire_superseded_response_recovery_orders"
+                    or not isinstance(activity.get("work_orders"), list)):
+                continue
+            for retired in activity.get("work_orders", []):
+                if not isinstance(retired, dict):
+                    continue
+                stage_id = retired.get("stage_id")
+                context = self.context.get(stage_id, {})
+                record = self.stage_records.get(stage_id, {})
+                if (not isinstance(context, dict) or record.get("status") not in {"blocked", "retrying"}
+                        or retired.get("request_id") in active_ids
+                        or not isinstance(context.get("research_requests", []), list)
+                        or not self._request_context_matches_current_topic(stage_id, context)):
+                    continue
+                admitted = [item for decision in self.feedback if isinstance(decision, dict)
+                            and decision.get("action") == "continue_research"
+                            and isinstance(decision.get("research_requests"), list)
+                            for item in decision["research_requests"] if isinstance(item, dict)
+                            and item.get("id") == retired.get("request_id")
+                            and item.get("failure_dossier_ref") == retired.get("prior_failure_dossier_ref")]
+                owners = {item.get("owner") for item in admitted if isinstance(item.get("owner"), str)}
+                if len(owners) != 1:
+                    continue
+                department = next(iter(owners)).split(".", 1)[0]
+                logical = "command/departments/" + department + "/work-orders/" + str(retired.get("request_id"))
+                head = self.store.head(logical)
+                if not isinstance(head, dict):
+                    continue
+                try:
+                    manifest, _, order = self._read_verified_artifact_json(head["artifact_ref"])
+                    if (manifest.get("author") != "command.composer" or order.get("state") != "stale"
+                            or not isinstance(order.get("source_note_ref"), str)):
+                        continue
+                    manifest, _, note = self._read_verified_artifact_json(order["source_note_ref"])
+                    if manifest.get("author") != "command.composer":
+                        continue
+                    feedback = note.get("feedback")
+                    candidates = (feedback.get("research_requests") if isinstance(feedback, dict)
+                                  and feedback.get("action") == "continue_research" else None)
+                    if not isinstance(candidates, list):
+                        continue
+                    candidates = [item for item in candidates if isinstance(item, dict)
+                                  and item.get("id") == retired.get("request_id")
+                                  and item.get("failure_dossier_ref") == retired.get("prior_failure_dossier_ref")]
+                    if len(candidates) != 1:
+                        continue
+                    request = deepcopy(candidates[0])
+                    if any(order.get(key) != request.get(key) for key in (
+                            "id", "kind", "owner", "objective", "why", "success_condition",
+                            "evidence_needed", "target_stage_id", "target_stage_kind",
+                            "repair_priority")):
+                        continue
+                    owner = self._unresolved_response_owner(request, context)
+                    if owner is None or owner["current_failure_dossier_ref"] != retired.get("current_failure_dossier_ref"):
+                        continue
+                    generation = order.get("recovery_generation", 0)
+                    if type(generation) is not int or generation < 0:
+                        continue
+                    request["recovery_generation"] = generation + 1
+                    request["source_note_ref"] = order["source_note_ref"]
+                    self.departments.activate_work_orders([request])
+                    self.active_research_requests.append(request)
+                    context.setdefault("research_requests", []).append(deepcopy(request))
+                    self.continuation_pending_stage_ids.add(stage_id)
+                    restored.append({"request_id": request["id"], "stage_id": stage_id,
+                                     "recovery_generation": request["recovery_generation"], **owner})
+                    active_ids.add(request["id"])
+                except (NotFoundError, KeyError, OSError, TypeError, ValueError, ValidationError):
+                    continue
+        if restored:
+            self.department_activity.append({"cycle": self.continuation_cycles,
+                "action": "restore_retained_response_recovery_orders", "work_orders": restored})
+        return restored
+
     def _reconcile_superseded_response_recovery_orders(self):
         """Retire verified response repairs superseded by a newer owned failure."""
         retired = {}
@@ -7422,6 +7586,8 @@ class ComposerRunner:
             stage_id = request.get("target_stage_id")
             context = self.context.get(stage_id, {})
             if not isinstance(stage_id, str) or not isinstance(context, dict):
+                continue
+            if self._unresolved_response_owner(request, context) is not None:
                 continue
             recovery = context.get("failure_recovery")
             recovery = recovery if isinstance(recovery, dict) else {}
@@ -8171,6 +8337,9 @@ class ComposerRunner:
     def _recovery_input_matches(self, stage, request, context, current_input):
         declared = request.get("failure_input_sha256")
         if declared == current_input:
+            return True
+        owner = self._unresolved_response_owner(request, context)
+        if owner is not None and owner["current_input_sha256"] == current_input:
             return True
         if (request.get("kind") != "recovery"
                 or request.get("recovery_mode") != "format_repair_then_rerun"

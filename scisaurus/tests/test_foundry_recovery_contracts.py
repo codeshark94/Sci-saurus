@@ -17,6 +17,131 @@ from scisaurus.tests.test_capability_foundry import StubClient, MINI_VALIDATOR, 
 
 
 class FoundryRecoveryContractTests(unittest.TestCase):
+    def _response_owner_fixture(self, runner):
+        stage = runner.workflow['stages'][1]
+        work = {'status': 'blocked', 'last_failure_class': 'model_contract',
+                'last_failure_gate': 'author_response_format', 'last_attempt': None,
+                'last_response': {'text': '{"executor":'}, 'attempts': 4,
+                'usage': {'model_calls': 4}}
+        published = runner._publish('command/foundry-work/retained', 'decision_note', work, 'command.foundry')
+        snapshot = {'cache_ref': published['artifact_ref'], 'cache_body_sha256': published['body_hash'],
+                    'cache_body_verified': True, 'last_attempt': None}
+        dossiers = []
+        for number, digest, failure_class in ((8, 'a' * 64, 'model_contract'),
+                                               (11, 'b' * 64, 'experiment_contract')):
+            dossier = {'schema_version': 'composer-failure-recovery-1', 'stage_id': stage['id'],
+                       'attempt_number': number, 'input_sha256': digest, 'failure_class': failure_class,
+                       'foundry_work_snapshot': deepcopy(snapshot), 'model_diagnostics': {},
+                       'program_snapshot': [], 'observed_result': {'status': 'blocked',
+                                                                  'usage': {'model_calls': 0}}}
+            ref = runner._publish(f'command/composer/failure-recovery/{stage["id"]}/{number}',
+                                  'decision_note', dossier, 'command.composer')['artifact_ref']
+            dossiers.append((ref, dossier))
+        request = {'id': 'retained-response', 'kind': 'recovery', 'owner': 'methods.validation',
+                   'objective': 'Repair the retained response.', 'why': 'The response failed its contract.',
+                   'success_condition': 'A valid response under the same assignment.',
+                   'evidence_needed': 'The exact failed response.', 'target_stage_id': stage['id'],
+                   'target_stage_kind': stage['kind'], 'source_stage_id': stage['id'],
+                   'recovery_mode': 'format_repair_then_rerun', 'failure_dossier_ref': dossiers[0][0],
+                   'failure_input_sha256': 'a' * 64, 'foundry_work_ref': published['artifact_ref']}
+        runner.feedback.append({'action': 'continue_research', 'research_requests': [deepcopy(request)]})
+        runner.context[stage['id']] = {'status': 'research_expansion_required',
+            'failure_dossier_ref': dossiers[1][0], 'failure_input_sha256': 'b' * 64,
+            'research_requests': [deepcopy(request)]}
+        runner.stage_records[stage['id']] = {'status': 'retrying', 'attempts': [
+            {'attempt_number': number, 'failure_dossier_ref': ref}
+            for number, (ref, _) in zip((8, 11), dossiers)]}
+        return stage, request, dossiers, work
+
+    def test_response_owner_survives_only_unexecuted_same_response_wrappers(self):
+        cases = ('same', 'current_native', 'new_program', 'new_usage', 'unknown_usage',
+                 'new_diagnostics', 'changed_snapshot', 'changed_head', 'wrong_input', 'unadmitted',
+                 'new_observations', 'new_execution_refs', 'new_derived_results')
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+                try:
+                    stage, request, dossiers, work = self._response_owner_fixture(runner)
+                    current = deepcopy(dossiers[1][1])
+                    if case == 'current_native': current['repair_subject'] = {'source': 'native'}
+                    if case == 'new_program': current['program_snapshot'] = [{'source_sha256': 'c' * 64}]
+                    if case == 'new_usage': current['observed_result']['usage']['model_calls'] = 1
+                    if case == 'unknown_usage': current['observed_result']['usage'] = {}
+                    if case == 'new_diagnostics': current['model_diagnostics'] = {'repair_feedback': {}}
+                    if case == 'new_observations': current['observed_result']['raw_results'] = {'observed_samples': [2, 4]}
+                    if case == 'new_execution_refs': current['observed_result']['execution_refs'] = ['artifact:experiment/results@1']
+                    if case == 'new_derived_results': current['observed_result']['derived_results'] = {'measurement_count': 2}
+                    if case == 'changed_snapshot': current['foundry_work_snapshot']['cache_body_sha256'] = 'd' * 64
+                    if case == 'changed_head': runner._publish('command/foundry-work/retained', 'decision_note',
+                                                             {**work, 'attempts': 5}, 'command.foundry')
+                    if case == 'wrong_input': request['failure_input_sha256'] = 'e' * 64
+                    if case == 'unadmitted': runner.feedback = []
+                    if current != dossiers[1][1]:
+                        new_ref = runner._publish(f'command/composer/failure-recovery/{stage["id"]}/11',
+                                                  'decision_note', current, 'command.composer')['artifact_ref']
+                        runner.context[stage['id']]['failure_dossier_ref'] = new_ref
+                        runner.stage_records[stage['id']]['attempts'][1]['failure_dossier_ref'] = new_ref
+                    context = runner.context[stage['id']]
+                    self.assertEqual(runner._unresolved_response_owner(request, context) is not None, case == 'same')
+                    self.assertEqual(runner._recovery_input_matches(stage, request, context, 'b' * 64), case == 'same')
+                    self.assertFalse(runner._recovery_input_matches(stage, request, context, 'f' * 64))
+                    runner.active_research_requests = [request]
+                    retired = runner._reconcile_superseded_response_recovery_orders()
+                    self.assertEqual(bool(retired), case not in {'same', 'wrong_input', 'unadmitted', 'current_native'})
+                finally:
+                    runner.close()
+
+    def test_restore_retired_response_order_preserves_terminal_generation_and_inputs(self):
+        for case in ('restore', 'running', 'completed', 'unadmitted', 'foreign_retirement', 'changed_head',
+                     'invalid_container', 'changed_order', 'foreign_order_author'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(composer_fixtures.ComposerWorkflowTests()._workflow(Path(path)))
+                try:
+                    stage, request, dossiers, work = self._response_owner_fixture(runner)
+                    note = runner._publish('command/departments/methods/inbox/response', 'decision_note',
+                        {'feedback': runner.feedback[-1]}, 'command.composer')['artifact_ref']
+                    proposal = {key: request[key] for key in ('id', 'kind', 'owner', 'objective', 'why',
+                                                             'success_condition', 'evidence_needed')}
+                    proposal['schema_version'] = 'department-work-order-1'
+                    task = runner.departments.propose(proposal, source_stage_id='workflow',
+                                                       note_ref=note, controller_metadata=request)
+                    runner.departments.retire_superseded_work_orders(set(), reason='newer failure owner')
+                    runner.active_research_requests = []
+                    runner.context[stage['id']]['research_requests'] = []
+                    runner.department_activity.append({'action': 'retire_superseded_response_recovery_orders',
+                        'work_orders': [{'request_id': request['id'], 'stage_id': stage['id'],
+                            'prior_failure_dossier_ref': dossiers[0][0],
+                            'current_failure_dossier_ref': 'artifact:foreign@1' if case == 'foreign_retirement' else dossiers[1][0]}]})
+                    if case in {'running', 'completed'}: runner.stage_records[stage['id']]['status'] = case
+                    if case == 'unadmitted': runner.feedback = []
+                    if case == 'changed_head': runner._publish('command/foundry-work/retained', 'decision_note',
+                                                             {**work, 'attempts': 5}, 'command.foundry')
+                    if case == 'invalid_container': runner.context[stage['id']]['research_requests'] = None
+                    if case in {'changed_order', 'foreign_order_author'}:
+                        logical = 'command/departments/methods/work-orders/' + request['id']
+                        _, _, body = runner._read_verified_artifact_json(runner.store.head(logical)['artifact_ref'])
+                        if case == 'changed_order': body['objective'] = 'A different admitted scope.'
+                        runner._publish(logical, 'decision_note', body,
+                                        'foreign' if case == 'foreign_order_author' else 'command.composer')
+                    before = deepcopy(runner.stage_records)
+                    restored = runner._restore_retained_response_recovery_orders()
+                    self.assertEqual(bool(restored), case == 'restore')
+                    self.assertEqual(runner.stage_records, before)
+                    self.assertEqual(runner.departments.tasks.get(task['task_id'])['state'], 'stale')
+                    if restored:
+                        fresh = runner.active_research_requests[0]
+                        self.assertEqual({key: value for key, value in fresh.items()
+                                          if key not in {'recovery_generation', 'source_note_ref'}}, request)
+                        self.assertEqual(fresh['recovery_generation'], 1)
+                        head = runner.store.head('command/departments/methods/work-orders/' + request['id'])
+                        _, _, body = runner._read_verified_artifact_json(head['artifact_ref'])
+                        self.assertEqual(body['source_note_ref'], note)
+                        self.assertEqual(runner.context[stage['id']]['failure_input_sha256'], 'b' * 64)
+                        self.assertEqual(runner._restore_retained_response_recovery_orders(), [])
+                        self.assertEqual(len(runner.active_research_requests), 1)
+                finally:
+                    runner.close()
+
     def test_settled_empty_panel_invoice_does_not_reserve_the_panel_again(self):
         from scisaurus.core.errors import ValidationError
         with tempfile.TemporaryDirectory() as path:

@@ -1299,6 +1299,7 @@ class DepartmentRuntime:
             proposal["schema_version"] = WORK_ORDER_SCHEMA_VERSION
             result = self.propose(
                 proposal, source_stage_id=request.get("source_stage_id"),
+                note_ref=request.get("source_note_ref"),
                 controller_metadata=request,
             )
             task = self.tasks.get(result["task_id"])
@@ -1313,6 +1314,7 @@ class DepartmentRuntime:
                 request["recovery_generation"] = generation
                 result = self.propose(
                     proposal, source_stage_id=request.get("source_stage_id"),
+                    note_ref=request.get("source_note_ref"),
                     controller_metadata=request,
                 )
                 task = self.tasks.get(result["task_id"])
