@@ -178,3 +178,56 @@ class PhysicalAttemptUsageTests(unittest.TestCase):
                 self.assertEqual(state["usage"], {"model_calls": 2, "input_tokens": 40, "output_tokens": 5})
                 self.assertEqual(state["requests"][-1]["status"],
                                  "result_unknown" if kind == "pause" else "provider_rate_limited")
+
+
+class ReviewContextRecoveryOwnershipTests(unittest.TestCase):
+    def test_only_current_failed_owner_with_proven_capacity_resumes(self):
+        from unittest.mock import Mock
+        from scisaurus.runtime.composer import ComposerRunner
+        runner = object.__new__(ComposerRunner)
+        runner.context = {"topic": {"topic": {"id": "chosen", "research_question": "fixed"}}}
+        runner.department_activity = []
+        runner.tasks = Mock()
+        owned_attempt = {"state": "failed", "task_id": "stage-task", "payload": {
+            "stage_id": "experiment", "attempt_number": 4, "project_dir": "/owned"}}
+        runner.tasks.get_attempt.return_value = deepcopy(owned_attempt)
+        runner._request_context_matches_current_topic = Mock(return_value=True)
+        runner._topic_context_for_stage = Mock(return_value=("topic", runner.context["topic"]))
+        runner._read_verified_artifact_json = Mock(return_value=(
+            {"author": "command.composer"}, "digest", {"project_dir": "/owned"}))
+        runner._current_topic_identity = Mock(return_value={"topic_id": "chosen", "topic_cycle": 0})
+        runner._failure_dossier_evidence = Mock(return_value={"available": True, "failure_class": "resource_fence",
+            "error": "no configured provider route fits the model context budget: too large"})
+        runner._publish = Mock(return_value={"artifact_ref": "artifact:proof@1"})
+        latest = {"attempt_number": 4, "attempt_id": "owned", "project_dir": "/owned", "state": "failed",
+                  "failure_class": "resource_fence", "topic_id": "chosen", "topic_cycle": 0,
+                  "failure_dossier_ref": "artifact:failure@1"}
+        record = {"status": "blocked", "failure_class": "resource_fence", "attempt_count": 4,
+                  "task_id": "stage-task", "attempts": [latest]}
+        stage = {"id": "experiment", "kind": "experiment"}
+        with patch("scisaurus.runtime.experiment.review_context_capacity_proof",
+                   return_value={"research_question": "fixed", "project_dir": "/owned", "schema_version": "experiment-review-context-capacity-1"}) as proof:
+            completed = {"experiment"}
+            self.assertTrue(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), completed))
+            self.assertFalse(completed)
+            for changes in ({"attempt_count": 5}, {"attempt_id": "other"}, {"failure_class": "model_contract"}):
+                invalid = deepcopy(record); invalid.update(changes)
+                self.assertFalse(runner._resume_experiment_review_context_capacity(stage, invalid, set()))
+            invalid = deepcopy(record); invalid["attempts"][0]["topic_id"] = "old"
+            self.assertFalse(runner._resume_experiment_review_context_capacity(stage, invalid, set()))
+            runner.tasks.get_attempt.return_value = {"state": "result_unknown"}
+            self.assertFalse(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), set()))
+            runner.tasks.get_attempt.return_value = deepcopy(owned_attempt)
+            for key, value in (("stage_id", "other"), ("attempt_number", 3), ("project_dir", "/other"),
+                               ("topic_id", "stale"), ("topic_cycle", 2)):
+                runner.tasks.get_attempt.return_value = deepcopy(owned_attempt)
+                runner.tasks.get_attempt.return_value["payload"][key] = value
+                self.assertFalse(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), set()))
+            runner.tasks.get_attempt.return_value = deepcopy(owned_attempt)
+            runner._read_verified_artifact_json.return_value = ({"author": "command.composer"}, "digest", {"project_dir": "/other"})
+            self.assertFalse(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), set()))
+            runner._read_verified_artifact_json.return_value = ({"author": "command.composer"}, "digest", {"project_dir": "/owned"})
+            proof.return_value = None
+            self.assertFalse(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), set()))
+            proof.return_value = {"research_question": "changed"}
+            self.assertFalse(runner._resume_experiment_review_context_capacity(stage, deepcopy(record), set()))

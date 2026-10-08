@@ -36,6 +36,9 @@ def fixture_worker(kind, params, channel):
         from scisaurus.runtime.evidence import scientific_input_recovery_contract
         if assignment.get("scientific_input_recovery") != scientific_input_recovery_contract():
             raise AssertionError("experiment reviewers require the scientific input recovery contract")
+        table = assignment["program_output_summary"]["observations"]
+        if table.get("encoding") != "observation-table-1" or table.get("complete") is not True:
+            raise AssertionError("review transport must preserve every observation")
         findings = assignment["program_output_summary"]["findings"]
         if assignment["required_finding_ids"] != sorted(item["id"] for item in findings):
             raise AssertionError("review prompt did not enumerate exact required finding IDs")
@@ -346,6 +349,78 @@ class ExperimentTests(unittest.TestCase):
             result = runner.run()
         self.assertEqual(result["status"], "paused")
         self.assertEqual(result["failure"], {"kind": "process_interrupted"})
+
+    def test_review_transport_is_lossless_and_keeps_original_result_pointers(self):
+        from copy import deepcopy
+        runner = object.__new__(ExperimentRunner)
+        runner.experiment = self.config()["experiment"]
+        runner.work_orders = []
+        candidate = {key: [] for key in ("procedures", "observations", "metrics", "findings", "limitations", "assets")}
+        candidate.update(schema_version="experiment-program-output-1", study_id="fixture_study", revision=1)
+        candidate["observations"] = [{"x": None, "run": 1}, {"run": 2, "x": True},
+                                     {"run": 3, "large": 9007199254740993}, {}]
+        original = deepcopy(candidate)
+        assignment = runner._review_assignment({"id": "methods"}, candidate, {}, ["artifact:fixture@1"])
+        table = assignment["program_output_summary"]["observations"]
+        decoded = [dict(zip(table["schemas"][table["schema_ids"][i]], row))
+                   for i, row in enumerate(table["rows"])]
+        self.assertEqual(decoded, original["observations"])
+        self.assertEqual(candidate, original)
+        self.assertEqual(table["observations_sha256"], hashlib.sha256(
+            json.dumps(decoded, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+        self.assertIn("/observations/<original-row-index>", assignment["instructions"])
+        self.assertEqual(assignment["evidence_refs"], ["artifact:fixture@1"])
+
+    def test_capacity_proof_rejects_dispatched_unknown_and_changed_evidence(self):
+        import subprocess
+        from scisaurus.core.schema import canonical_bytes
+        from scisaurus.runtime.experiment import review_context_capacity_proof
+        project = self.root / "capacity-proof"
+        control = ControlStore(project)
+        self.addCleanup(control.close)
+        store = ArtifactStore(control)
+        store.init_project()
+        config = self.config()
+        candidate = json.loads(subprocess.check_output([sys.executable, str(self.executor)],
+            input=json.dumps({"experiment": config["experiment"]}).encode(), cwd=self.root))
+        candidate_raw = canonical_bytes(candidate)
+        digest = hashlib.sha256(candidate_raw).hexdigest()
+        def publish(logical_id, value):
+            return store.publish_artifact(logical_id=logical_id, artifact_type="note", author="command.controller",
+                                          body=canonical_bytes(value), media_type="application/json")
+        publish("inputs/run-config", config)
+        validation = {"schema_version": "experiment-validation-1", "study_id": "fixture_study",
+            "candidate_sha256": digest, "decision": "accepted",
+            "checks": [{"id": "rows", "outcome": "passed", "evidence": "One row recalculated."}], "limitations": [],
+            "metric_recalculations": [{"metric_id": "accuracy", "matches": True,
+                "reported_value": 0.75, "recalculated_value": 0.75, "tolerance": 0}]}
+        vr = publish("methods/experiment-deterministic-validation", validation)
+        final = {"status": "blocked", "project_id": config["project_id"], "study_id": "fixture_study",
+                 "model_review_refs": [], "execution_refs": [], "raw_results_sha256": digest,
+                 "deterministic_validation_ref": vr["artifact_ref"]}
+        publish("command/results/final", final)
+        (project / "output").mkdir()
+        (project / "output/raw-results.json").write_bytes(candidate_raw)
+        failure = {"dispatch_started": False, "outcome_known": True,
+                   "error": "no configured provider route fits the model context budget: model context budget exceeded"}
+        for index, reviewer in enumerate(config["experiment"]["reviewers"]):
+            publish(f"command/failures/experiment-{reviewer['id']}-{index}", failure)
+        self.assertEqual(review_context_capacity_proof(project)["candidate_sha256"], digest)
+        for changes in ({"dispatch_started": True}, {"outcome_known": False}, {"error": "HTTP 429"}):
+            publish("command/failures/experiment-methods-0", {**failure, **changes})
+            self.assertIsNone(review_context_capacity_proof(project))
+        publish("command/failures/experiment-methods-0", failure)
+        publish("command/results/final", {**final, "model_review_refs": ["artifact:paid-review@1"]})
+        self.assertIsNone(review_context_capacity_proof(project))
+        publish("command/results/final", final)
+        from copy import deepcopy
+        too_small = deepcopy(config)
+        too_small["model"]["max_input_tokens"] = 1
+        publish("inputs/run-config", too_small)
+        self.assertIsNone(review_context_capacity_proof(project))
+        publish("inputs/run-config", config)
+        (project / "output/raw-results.json").write_bytes(candidate_raw + b" ")
+        self.assertIsNone(review_context_capacity_proof(project))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="scisaurus-experiment-test-")

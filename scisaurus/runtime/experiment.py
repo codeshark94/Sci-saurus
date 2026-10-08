@@ -32,6 +32,7 @@ from scisaurus.runtime.experiment_config import (
 )
 from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.operations import OperationsCell
+from scisaurus.runtime.review_evidence import review_observation_table
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_quality import (
     build_research_design,
@@ -851,6 +852,99 @@ def validate_assessment(value, study_id, evidence_refs, review_outcomes, finding
     return value
 
 
+def review_context_capacity_proof(project_dir):
+    """Prove a pre-dispatch context stop now fits without changing result evidence."""
+    import sqlite3
+    from contextlib import closing
+    from types import SimpleNamespace
+    from scisaurus.runtime.execution import SYSTEM
+    from scisaurus.runtime.models import model_context_budget, model_route_candidates
+
+    project = Path(project_dir).resolve()
+    database = project / "state/control.sqlite"
+    if not database.is_file():
+        return None
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        store = ArtifactStore(SimpleNamespace(dir=str(project), _conn=connection))
+
+        def read(logical_id):
+            manifest = store.head(logical_id)
+            raw = store.read_body(manifest["body_hash"])
+            if sha256_hex(raw) != manifest["body_hash"]:
+                raise ValidationError("review recovery artifact hash mismatch")
+            return manifest, json.loads(raw)
+
+        run_record, run = read("command/results/final")
+        config_record, config = read("inputs/run-config")
+        validation_record, deterministic = read("methods/experiment-deterministic-validation")
+        if (run.get("status") != "blocked" or run.get("model_review_refs")
+                or run.get("project_id") != config.get("project_id")
+                or run.get("study_id") != config.get("experiment", {}).get("id")
+                or run.get("deterministic_validation_ref") != validation_record["artifact_ref"]
+                or deterministic.get("decision") != "accepted"):
+            return None
+        raw = (project / "output/raw-results.json").read_bytes()
+        candidate = json.loads(raw)
+        digest = sha256_hex(canonical_bytes(candidate))
+        if (sha256_hex(raw) != run.get("raw_results_sha256") or digest != sha256_hex(raw)
+                or deterministic.get("candidate_sha256") != digest):
+            return None
+        runner = object.__new__(ExperimentRunner)
+        runner.experiment = config["experiment"]
+        runner.work_orders = config.get("work_orders", [])
+        validate_program_output(candidate, runner.experiment, runner.work_orders)
+        validated = validate_deterministic_validation(
+            {key: value for key, value in deterministic.items() if key != "execution_ref"},
+            runner.experiment, digest)
+        bind_deterministic_validation(validated, candidate, runner.experiment)
+        image_count = len([asset for asset in candidate["assets"]
+                           if asset["media_type"] in {"image/png", "image/jpeg"}][:16])
+        failures = []
+        for row in connection.execute(
+                "SELECT logical_id FROM artifacts WHERE logical_id LIKE 'command/failures/experiment-%'"):
+            manifest, failure = read(row["logical_id"])
+            if (failure.get("dispatch_started") is not False or failure.get("outcome_known") is not True
+                    or not str(failure.get("error", "")).startswith(
+                        "no configured provider route fits the model context budget:")
+                    or "model context budget exceeded" not in failure["error"]):
+                return None
+            failures.append(manifest["artifact_ref"])
+        if not failures:
+            return None
+        evidence_refs = [*run["execution_refs"], validation_record["artifact_ref"],
+                         *[row["artifact_ref"] for row in connection.execute(
+                             "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'methods/experiment-assets/%' ORDER BY rowid")]]
+        budgets = []
+        for reviewer in runner.experiment["reviewers"]:
+            name = reviewer["id"]
+            if not any(ref.startswith(f"artifact:command/failures/experiment-{name}-") for ref in failures):
+                return None
+            assignment = runner._review_assignment(reviewer, candidate, deterministic, evidence_refs)
+            table = assignment["program_output_summary"]["observations"]
+            schema_ids = table.get("schema_ids", [0] * table["row_count"])
+            decoded = [dict(zip(table["schemas"][schema_ids[i]], row))
+                       for i, row in enumerate(table["rows"])]
+            if canonical_bytes(decoded) != canonical_bytes(candidate["observations"]):
+                raise ValidationError("review recovery transport changed observations")
+            prompt = json.dumps(assignment, ensure_ascii=False)
+            routes = model_route_candidates(config["model"], role=f"methods.experiment-reviewer.{name}")
+            choices = [model_context_budget(route, system=SYSTEM, prompt=prompt, image_count=image_count)
+                       for route in routes]
+            if not choices or not any(item["fits"] for item in choices):
+                return None
+            budgets.append({"reviewer_id": name, "assignment_sha256": sha256_hex(canonical_bytes(assignment)),
+                            "routes": choices})
+        return {"schema_version": "experiment-review-context-capacity-1",
+                "project_dir": str(project), "run_ref": run_record["artifact_ref"],
+                "run_sha256": run_record["body_hash"], "config_ref": config_record["artifact_ref"],
+                "config_sha256": config_record["body_hash"], "candidate_sha256": digest,
+                "validation_ref": validation_record["artifact_ref"],
+                "failure_refs": failures, "row_count": len(candidate["observations"]),
+                "research_question": runner.experiment["research_question"],
+                "observation_encoding": "observation-table-1", "budgets": budgets}
+
+
 class ExperimentRunner(ExecutionRuntime):
     def __init__(self, project_dir, config, *, on_progress=None):
         config = validate_experiment_config(config)
@@ -1048,10 +1142,12 @@ class ExperimentRunner(ExecutionRuntime):
         summary = {key: candidate[key] for key in (
             "schema_version", "study_id", "revision", "procedures", "observations",
             "metrics", "findings", "limitations", "assets")}
+        summary["observations"] = review_observation_table(candidate["observations"])
         if "analysis" in candidate:
             summary["analysis"] = candidate["analysis"]
         required_checks = REVIEW_CHECKS | ({"work_order_resolution"} if self.work_orders else set())
         instructions = (
+            "The observations field is a complete lossless observation-table-1 transport: decode its schemas and rows to recover every original observation. Cite /observations/<original-row-index>/... in the decoded original result, never transport schemas or rows. "
             "Inspect the summarized output and every attached figure. Return only the complete JSON object with reviewer_id, decision, checks, finding_assessments, limitations; no preamble, markdown, or chain-of-thought. "
             "Copy reviewer.id as reviewer_id. Execute each required check exactly once as {check_id,outcome,evidence}; outcomes are passed, failed, or insufficient_evidence. "
             "Assess every ID in required_finding_ids exactly once as {finding_id,outcome,rationale}; outcomes are supported, overstated, or insufficient_evidence. Do not invent suffixes, placeholders, or summary IDs. "

@@ -26052,6 +26052,71 @@ class ComposerRunner:
             return True
         return False
 
+    def _resume_experiment_review_context_capacity(self, stage, record, completed):
+        """Retry an owned review-only stop after lossless transport preflight succeeds."""
+        if stage.get("kind") != "experiment" or record.get("failure_class") != "resource_fence":
+            return False
+        attempts = record.get("attempts", [])
+        latest = attempts[-1] if isinstance(attempts, list) and attempts else {}
+        number = latest.get("attempt_number")
+        if (type(number) is not int or number != record.get("attempt_count")
+                or latest.get("state") != "failed"
+                or latest.get("failure_class") != "resource_fence"
+                or any(record.get(key) not in (None, latest.get(key))
+                       for key in ("attempt_number", "attempt_id", "project_dir"))
+                or not isinstance(latest.get("project_dir"), str)
+                or not isinstance(latest.get("attempt_id"), str)):
+            return False
+        identity = self._current_topic_identity()
+        if (not isinstance(identity, dict) or any(latest.get(key) != identity[key]
+                                                for key in ("topic_id", "topic_cycle"))):
+            return False
+        try:
+            attempt = self.tasks.get_attempt(latest["attempt_id"])
+        except NotFoundError:
+            return False
+        payload = attempt.get("payload", {})
+        if (attempt.get("state") != "failed" or attempt.get("task_id") != record.get("task_id")
+                or payload.get("stage_id") != stage["id"]
+                or payload.get("attempt_number") != number
+                or payload.get("project_dir") != latest["project_dir"]
+                or not self._request_context_matches_current_topic(stage["id"], self.context.get(stage["id"], {}))
+                or any(key in owner and owner[key] != identity[key]
+                       for owner in (record, payload) for key in ("topic_id", "topic_cycle"))):
+            return False
+        dossier = self._failure_dossier_evidence(latest.get("failure_dossier_ref"),
+            expected_stage_id=stage["id"], expected_attempt_number=number)
+        if (not isinstance(dossier, dict) or dossier.get("available") is not True
+                or dossier.get("failure_class") != "resource_fence"
+                or "no configured provider route fits the model context budget:" not in str(dossier.get("error"))):
+            return False
+        from scisaurus.runtime.experiment import review_context_capacity_proof
+        try:
+            manifest, _, original = self._read_verified_artifact_json(latest["failure_dossier_ref"])
+            if (manifest.get("author") != "command.composer"
+                    or original.get("project_dir") != latest["project_dir"]):
+                return False
+            proof = review_context_capacity_proof(latest["project_dir"])
+        except (OSError, KeyError, TypeError, ValueError, sqlite3.Error, NotFoundError, ValidationError):
+            return False
+        topic_match = self._topic_context_for_stage(stage)
+        topic = topic_match[1].get("topic", {}) if isinstance(topic_match, tuple) else {}
+        if (not isinstance(proof, dict) or proof.get("research_question") != topic.get("research_question")
+                or proof.get("project_dir") != str(Path(latest["project_dir"]).resolve())):
+            return False
+        proof.update(stage_id=stage["id"], attempt_number=number,
+                     attempt_id=latest["attempt_id"], failure_dossier_ref=latest["failure_dossier_ref"])
+        digest = hashlib.sha256(canonical_bytes(proof)).hexdigest()
+        receipt = self._publish("command/experiment-review-context-capacity/" + digest,
+                                "note", proof, "command.composer", subjects=[latest["failure_dossier_ref"]])
+        record.update(status="retrying", recovery_admitted=True,
+                      operational_recovery_ref=receipt["artifact_ref"])
+        completed.discard(stage["id"])
+        self.status = "running"
+        self.department_activity.append({"action": "resume_experiment_review_context_capacity",
+            "stage_id": stage["id"], "attempt_number": number, "proof_ref": receipt["artifact_ref"]})
+        return True
+
     def _reopen_blocked_checkpoint(self, completed, by_id):
         """Turn a recoverable stop checkpoint into one fresh work cycle.
 
@@ -26069,6 +26134,8 @@ class ComposerRunner:
             if not isinstance(record, dict) or record.get("status") != "blocked":
                 continue
             if self._resume_proven_dispatch_release(stage, record, completed):
+                return True
+            if self._resume_experiment_review_context_capacity(stage, record, completed):
                 return True
             if record.get("failure_class") == "operational_recovery":
                 continue
