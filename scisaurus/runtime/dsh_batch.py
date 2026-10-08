@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import subprocess
@@ -50,9 +51,9 @@ def validate_batch_config(value):
     if not isinstance(pins, dict) or not pins:
         raise ValidationError("DSH runtime and composition require pinned files")
     for path, digest in pins.items():
-        if (not Path(path).is_absolute() or not Path(path).is_file()
-                or not isinstance(digest, str) or sha256(path) != digest):
-            raise ValidationError(f"DSH pin mismatch: {path}")
+        if (not isinstance(path, str) or not Path(path).is_absolute()
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise ValidationError(f"DSH pin declaration is invalid: {path}")
     if command[0] not in pins:
         raise ValidationError("DSH executable must be pinned")
     for arg in command[1:]:
@@ -74,6 +75,13 @@ def validate_batch_config(value):
     if type(value["max_output_tokens"]) is not int or value["max_output_tokens"] < 1:
         raise ValidationError("DSH output limit must be a positive integer")
     return deepcopy(value)
+
+
+def verify_batch_runtime(config):
+    """Verify deployment content at preflight, never during read-model polling."""
+    for path, digest in config["pinned_files"].items():
+        if not Path(path).is_file() or sha256(path) != digest:
+            raise ValidationError(f"DSH pin mismatch: {path}")
 
 
 def terminate_tree(process):
@@ -133,6 +141,7 @@ class DshBatchRunner:
     def run(self, task, *, inputs, seed_files=None, outputs, deadline=None):
         ensure_run_allowed()
         config = validate_batch_config(self.config)
+        verify_batch_runtime(config)
         if (not isinstance(inputs, dict) or not isinstance(seed_files or {}, dict)
                 or not isinstance(outputs, list) or not outputs or len(set(outputs)) != len(outputs)):
             raise ValidationError("batch requires file mappings and unique nonempty output names")

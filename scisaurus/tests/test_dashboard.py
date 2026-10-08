@@ -1158,6 +1158,55 @@ assert(wrapped.includes('Internal transport'));
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(required - set(ids), set())
 
+    def test_run_poll_preserves_pending_response_and_releases_after_failure(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is unavailable")
+        path = Path(__file__).parents[1] / "dashboard/static/app.js"
+        script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const text = require('node:fs').readFileSync(process.argv[1], 'utf8');
+const source = text.slice(text.indexOf('  let runController = null;'), text.indexOf('  async function fetchProjects()'));
+const requests = [], elements = {};
+const state = {view: 'project', projectRef: 'a', runRequest: 0};
+const context = {state, AbortController, encodeURIComponent, renderRunControls() {},
+  $(id) {return elements[id] ||= {};},
+  fetch(url, options) {return new Promise((resolve, reject) => requests.push({url, options, resolve, reject}));}};
+vm.runInNewContext(source + '\nthis.poll = fetchRun;', context);
+const answer = (index, value) => requests[index].resolve({ok: true, async json() {return value;}});
+(async () => {
+  const first = context.poll();
+  await context.poll();
+  assert.equal(requests.length, 1);
+  answer(0, {status: 'stopped'});
+  await first;
+  assert.equal(state.run.status, 'stopped');
+  const previous = context.poll();
+  state.projectRef = 'b';
+  const current = context.poll();
+  assert.equal(requests[1].options.signal.aborted, true);
+  answer(2, {status: 'ready'});
+  await current;
+  answer(1, {status: 'running'});
+  await previous;
+  assert.equal(state.run.status, 'ready');
+  const pending = context.poll();
+  const forced = context.poll(true);
+  assert.equal(requests[3].options.signal.aborted, true);
+  requests[4].reject(new Error('offline'));
+  await forced;
+  assert.equal(elements['#run-status'].textContent, 'Unavailable');
+  answer(3, {status: 'running'});
+  await pending;
+  const retried = context.poll();
+  answer(5, {status: 'stopped'});
+  await retried;
+  assert.equal(state.run.status, 'stopped');
+})().catch(error => {console.error(error); process.exitCode = 1;});
+"""
+        subprocess.run([node, "-e", script, str(path)], check=True, capture_output=True, text=True)
+
     def test_stage_navigation_and_interface_language(self):
         static = Path(__file__).parents[1] / "dashboard/static"
         html = (static / "index.html").read_text()

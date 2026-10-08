@@ -102,6 +102,14 @@ class BatchTests(unittest.TestCase):
             self.run_job(config)
         self.assertFalse((self.root / "jobs").exists())
 
+    def test_configuration_inspection_never_rehashes_runtime_files(self):
+        config = self.config()
+        with patch("scisaurus.runtime.dsh_batch.sha256", side_effect=AssertionError("runtime I/O")):
+            self.assertEqual(validate_batch_config(config), config)
+        config["pinned_files"][str(self.script)] = "invalid-digest"
+        with self.assertRaisesRegex(ValidationError, "pin declaration"):
+            validate_batch_config(config)
+
     def test_path_traversal_refused(self):
         with self.assertRaises(ValidationError):
             DshBatchRunner(self.config(), root=self.root / "jobs").run(

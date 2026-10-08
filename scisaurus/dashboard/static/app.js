@@ -1037,20 +1037,31 @@
     $("#run-note").textContent = run?.status === "stopping" ? "Waiting for the supervisor to stop its workers and preserve the checkpoint." : "Stopping preserves the checkpoint. Runs continue when this window closes.";
   }
 
-  async function fetchRun() {
+  let runController = null;
+  let runRequestProject = null;
+  async function fetchRun(force = false) {
     if (state.view !== "project") return;
-    const request = ++state.runRequest, project = state.projectRef;
+    const project = state.projectRef;
+    if (runController && runRequestProject === project && !force) return;
+    if (runController) runController.abort();
+    const controller = new AbortController();
+    runController = controller;
+    runRequestProject = project;
+    const request = ++state.runRequest;
     try {
-      const response = await fetch(`/api/run?project=${encodeURIComponent(project || ".")}`, {cache: "no-store"});
+      const response = await fetch(`/api/run?project=${encodeURIComponent(project || ".")}`, {cache: "no-store", signal: controller.signal});
       const value = await response.json();
       if (!response.ok) throw new Error(value.error || `Run status unavailable (${response.status})`);
       if (request !== state.runRequest || project !== state.projectRef) return;
       state.run = value;
       renderRunControls();
     } catch (error) {
+      if (controller.signal.aborted) return;
       if (request !== state.runRequest || project !== state.projectRef) return;
       state.run = null; renderRunControls(); $("#run-status").textContent = "Unavailable";
       $("#run-detail").textContent = error.message;
+    } finally {
+      if (runController === controller) runController = null;
     }
   }
 
@@ -1090,7 +1101,7 @@
       if (action !== "stop") { payload.resume = action === "resume"; payload.settings = {development: state.run?.settings?.development ?? true, stop_after_stage: $("#run-scope").value || null}; }
       const result = await postAction(payload);
       showToast(result.status === "already_running" ? "This mission is already running." : result.status === "stopping" ? "Stop requested. Preserving the checkpoint…" : result.status === "already_stopped" ? "This mission is already stopped." : `Mission ${action === "resume" ? "resumed" : "started"} · PID ${result.pid}`);
-      await Promise.all([fetchProjects(), fetchRun(), fetchSnapshot()]);
+      await Promise.all([fetchProjects(), fetchRun(true), fetchSnapshot()]);
     } catch (error) {
       showToast(error.message);
     } finally {

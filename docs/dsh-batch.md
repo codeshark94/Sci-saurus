@@ -16,6 +16,8 @@ named environment variable. The generated composition declares only one model,
 disables provider retries and subagents, and treats token exhaustion as failure.
 Runtime entry files, compiled workspace libraries, dependency lock and composition
 are hash-pinned. Regenerate the configuration deliberately after upgrading DSH.
+Configuration inspection validates declarations; the explicit check and every
+batch dispatch verify all pinned file contents before creating a job.
 
 Check without agent dispatch:
 

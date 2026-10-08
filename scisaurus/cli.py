@@ -280,9 +280,10 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     if args.cmd == "run-engineering-batch":
-        from scisaurus.runtime.dsh_batch import DshBatchRunner, validate_batch_config
+        from scisaurus.runtime.dsh_batch import DshBatchRunner, validate_batch_config, verify_batch_runtime
         config = validate_batch_config(json.loads(Path(args.config).read_text()))
         if args.check:
+            verify_batch_runtime(config)
             print(json.dumps({"status": "configuration_valid", "model": config["model"],
                               "provider": config["provider"], "model_calls": 0}))
             return 0
