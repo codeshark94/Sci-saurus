@@ -620,7 +620,7 @@ def _author_response_format_failure_signature(envelope, finish_reason, route_ind
             try:
                 json.loads(text)
             except json.JSONDecodeError as exc:
-                failure = "invalid_json:" + exc.msg
+                failure = f"invalid_json:{exc.msg}:line={exc.lineno}:column={exc.colno}:character={exc.pos}"
     return f"author_response_format:{failure}:route={route_index}"
 
 
@@ -660,6 +660,13 @@ def _author_prefix_contract_error(text):
     """Detect immutable root fields that no appended suffix can repair."""
     if not isinstance(text, str) or not text.lstrip().startswith("{"):
         return None
+    if _author_json_prefix_state(text) == "invalid":
+        try:
+            json.loads(text)
+        except json.JSONDecodeError as exc:
+            return (f"program author prefix contains invalid JSON at character {exc.pos}: {exc.msg}; "
+                    "exact suffix continuation cannot repair an interior syntax error")
+        return "program author prefix contains invalid trailing content; exact suffix continuation cannot remove it"
     text = text.lstrip()
     decoder = json.JSONDecoder()
     position = 1
@@ -711,9 +718,116 @@ def _author_json_prefix_state(text):
     try:
         value, end = json.JSONDecoder().raw_decode(partial)
     except json.JSONDecodeError as exc:
-        if (exc.pos >= len(partial)
-                or exc.msg.startswith("Unterminated string starting at")):
+        position = 0
+
+        def character():
+            if position == len(partial):
+                raise EOFError()
+            return partial[position]
+
+        def whitespace():
+            nonlocal position
+            while position < len(partial) and partial[position] in " \t\r\n":
+                position += 1
+
+        def string():
+            nonlocal position
+            if character() != '"':
+                raise ValueError()
+            position += 1
+            while True:
+                value = character()
+                position += 1
+                if value == '"':
+                    return
+                if ord(value) < 32:
+                    raise ValueError()
+                if value != "\\":
+                    continue
+                escaped = character()
+                position += 1
+                if escaped == "u":
+                    for _ in range(4):
+                        if character() not in "0123456789abcdefABCDEF":
+                            raise ValueError()
+                        position += 1
+                elif escaped not in '"\\/bfnrt':
+                    raise ValueError()
+
+        def number():
+            nonlocal position
+            if character() == "-":
+                position += 1
+            if character() == "0":
+                position += 1
+            elif character() in "123456789":
+                while position < len(partial) and partial[position] in "0123456789":
+                    position += 1
+            else:
+                raise ValueError()
+            if position < len(partial) and partial[position] == ".":
+                position += 1
+                if character() not in "0123456789":
+                    raise ValueError()
+                while position < len(partial) and partial[position] in "0123456789":
+                    position += 1
+            if position < len(partial) and partial[position] in "eE":
+                position += 1
+                if character() in "+-":
+                    position += 1
+                if character() not in "0123456789":
+                    raise ValueError()
+                while position < len(partial) and partial[position] in "0123456789":
+                    position += 1
+
+        def value():
+            nonlocal position
+            whitespace()
+            start = character()
+            if start == '"':
+                string()
+            elif start in "{[":
+                object_value = start == "{"
+                closing = "}" if object_value else "]"
+                position += 1
+                whitespace()
+                if character() == closing:
+                    position += 1
+                    return
+                while True:
+                    if object_value:
+                        string()
+                        whitespace()
+                        if character() != ":":
+                            raise ValueError()
+                        position += 1
+                    value()
+                    whitespace()
+                    separator = character()
+                    position += 1
+                    if separator == closing:
+                        return
+                    if separator != ",":
+                        raise ValueError()
+                    whitespace()
+            elif start in "-0123456789":
+                number()
+            else:
+                literal = {"t": "true", "f": "false", "n": "null"}.get(start)
+                if literal is None:
+                    raise ValueError()
+                for expected in literal:
+                    if character() != expected:
+                        raise ValueError()
+                    position += 1
+
+        try:
+            value()
+            whitespace()
+        except EOFError:
             return "incomplete"
+        except (ValueError, RecursionError):
+            return "invalid"
         return "invalid"
     if isinstance(value, dict) and not partial[end:].strip():
         return "complete"
@@ -2558,6 +2672,30 @@ class CapabilityFoundry:
                         response_metadata = response.get("response_metadata") if isinstance(response, dict) else None
                         response_text = response.get("text") if isinstance(response, dict) else None
                         response_digest = hashlib.sha256(response_text.encode()).hexdigest() if isinstance(response_text, str) else None
+                        owned_stopped_format_response = False
+                        if (resume_work_ref is not None
+                                and isinstance(response_text, str) and response_text
+                                and response.get("finish_reason") == "stop"
+                                and prior.get("status") == "blocked"
+                                and prior.get("last_failure_class") == "model_contract"
+                                and prior.get("last_failure_gate") in {None, "author_response_format"}
+                                and prior.get("last_attempt") is None
+                                and last_request.get("status") == "succeeded"
+                                and last_request.get("response_sha256") == response_digest
+                                and last_request.get("response_metadata") == response_metadata
+                                and last_request.get("finish_reason") == response.get("finish_reason")
+                                and last_request.get("usage") == response.get("usage")
+                                and last_request.get("elapsed_seconds") == response.get("elapsed_seconds")
+                                and isinstance(last_request.get("prompt"), str)
+                                and type(last_request.get("max_output_tokens")) is int
+                                and last_request.get("request_signature") in {
+                                    _author_request_signature(model, last_request["max_output_tokens"],
+                                        last_request["prompt"], last_request.get("reasoning_effort"))
+                                    for model in (last_request.get("model"), current_route_model)}):
+                            try:
+                                parse_complete_json_object(response_text)
+                            except ValidationError:
+                                owned_stopped_format_response = True
                         interrupted_suffix = (
                             prior.get("status") == "calling"
                             and continuation_state == "calling"
@@ -2609,6 +2747,7 @@ class CapabilityFoundry:
                                 and (response.get("finish_reason") == "length"
                                      or (response.get("finish_reason") == "stop"
                                          and (prior.get("status") == "response_received"
+                                              or owned_stopped_format_response
                                               or (prior.get("status") == "blocked"
                                                   and prior.get("last_failure_class") == "model_contract"
                                                   and prior.get("last_failure_gate") in {
@@ -3092,6 +3231,13 @@ class CapabilityFoundry:
                     "instructions": _author_format_repair_instructions(
                         reason, has_candidate=has_repair_base),
                 }
+                response = state.get("last_response")
+                if not has_repair_base and isinstance(response, dict) and isinstance(response.get("text"), str):
+                    state["format_repair"]["response_to_repair"] = {
+                        "text": response["text"],
+                        "sha256": hashlib.sha256(response["text"].encode()).hexdigest(),
+                        "finish_reason": response.get("finish_reason"),
+                    }
             save("author_format_repair_ready")
             return switched
 
@@ -3380,6 +3526,8 @@ class CapabilityFoundry:
                         "response_contract": ("Return only the updates object with exact source edits and intent merge patch."
                                               if patch_response else response_assignment["response_contract"]),
                         "output_contract": source_contract,
+                        "executor_output_exact_shapes": response_assignment.get(
+                            "executor_output_exact_shapes", base_prompt.get("executor_output_exact_shapes")),
                         "allowed_top_level_fields": (["updates"] if patch_response else
                                                      sorted(ATTEMPT_FIELDS | LEGACY_TRANSPORT_FIELDS)),
                     }))
@@ -5097,6 +5245,14 @@ class CapabilityFoundry:
                     attempt_value = deepcopy_config(response_base)
                     state["response_base"] = deepcopy_config(response_base)
                 normalized_error = _normalize_program_validation_error(exc)
+                if attempt_value is None:
+                    try:
+                        json.loads(result.text)
+                    except json.JSONDecodeError as parse_error:
+                        normalized_error = ValidationError(
+                            f"program author response must contain valid JSON: {parse_error.msg} "
+                            f"at line {parse_error.lineno}, column {parse_error.colno} "
+                            f"(character {parse_error.pos})")
                 last_error = (ValidationError(
                     f"generated program omitted required field {exc.args[0]!r}")
                     if isinstance(exc, KeyError) and exc.args
@@ -5132,7 +5288,7 @@ class CapabilityFoundry:
                                 candidate_fingerprint) == "model_contract"))
                     else "experiment_capability_repair")
                 state["last_failure_gate"] = (
-                    "author_response_format" if partial_intent_response
+                    "author_response_format" if partial_intent_response or (format_envelope and attempt_value is None)
                     else "author_response_contract" if isinstance(
                         exc, ExperimentIntentContractError)
                     else "analysis_output_contract" if isinstance(exc, AnalysisContractError)
@@ -5150,7 +5306,7 @@ class CapabilityFoundry:
                         f"{author_route_index}")
                 elif format_envelope and attempt_value is None:
                     failure_signature = _author_response_format_failure_signature(
-                        attempt_value, result.finish_reason, author_route_index)
+                        attempt_value, result.finish_reason, author_route_index, text=result.text)
                 elif isinstance(exc, AnalysisContractError):
                     failure_signature = "analysis_output_contract:" + hashlib.sha256(
                         str(exc).encode("utf-8")).hexdigest()
@@ -5160,7 +5316,8 @@ class CapabilityFoundry:
                     failure_signature = "author_response_contract:experiment_intent"
                 failure_signatures = state.setdefault("failure_signatures", [])
                 repeated = _is_repeated_repair_failure(
-                    exc, failures, failure_signatures, failure_signature,
+                    last_error if format_envelope and attempt_value is None else exc,
+                    failures, failure_signatures, failure_signature,
                     seed_replay=seed_replay)
                 if (failure_signature is not None
                         and failure_signature not in failure_signatures):
@@ -5194,7 +5351,7 @@ class CapabilityFoundry:
                 state.update(status="blocked" if repeated or needs_adjudication else "repairing", feedback=feedback,
                     last_attempt=last_attempt,
                     error=f"capability foundry did not admit a program: {feedback}")
-                gate = ("author_response_format" if partial_intent_response
+                gate = ("author_response_format" if partial_intent_response or (format_envelope and attempt_value is None)
                         else "author_response_contract" if isinstance(
                             exc, ExperimentIntentContractError)
                         else "program_output_contract" if isinstance(
