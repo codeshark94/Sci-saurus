@@ -624,11 +624,11 @@ def _author_response_format_failure_signature(envelope, finish_reason, route_ind
     return f"author_response_format:{failure}:route={route_index}"
 
 
-def _author_continuation_prompt(partial_response):
+def _author_continuation_prompt(partial_response, *, response_contract=None):
     """Frame a syntactically valid partial JSON response for exact suffix continuation."""
     prefix_digest = hashlib.sha256(partial_response.encode("utf-8")).hexdigest()
     marker = f"continue-{prefix_digest[:24]}"
-    prompt = json.dumps({
+    value = {
         "assignment": "continue_truncated_experiment_author_json",
         "partial_response": partial_response,
         "partial_response_sha256": prefix_digest,
@@ -646,8 +646,59 @@ def _author_continuation_prompt(partial_response):
             "The controller has disabled structured JSON output for this continuation request.",
             "Stop as soon as the original JSON object is complete; do not add commentary or a second object.",
         ],
-    }, ensure_ascii=False, sort_keys=True)
+    }
+    if response_contract is not None:
+        value["original_response_contract"] = response_contract
+        value["instructions"].append(
+            "Preserve the original response schema. Complete only its declared fields; "
+            "do not invent validation metadata, duplicate keys or extra source fields.")
+    prompt = json.dumps(value, ensure_ascii=False, sort_keys=True)
     return marker, prefix_digest, prompt
+
+
+def _author_prefix_contract_error(text):
+    """Detect immutable root fields that no appended suffix can repair."""
+    if not isinstance(text, str) or not text.lstrip().startswith("{"):
+        return None
+    text = text.lstrip()
+    decoder = json.JSONDecoder()
+    position = 1
+    fields = set()
+    allowed = ATTEMPT_FIELDS | LEGACY_TRANSPORT_FIELDS | {"updates"}
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] == "}":
+            return None
+        try:
+            field, end = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(field, str):
+            return None
+        if field not in allowed:
+            return f"program author prefix contains unsupported top-level field {field!r}; exact suffix continuation cannot remove it"
+        if field in fields:
+            return f"program author prefix contains duplicate top-level field {field!r}; exact suffix continuation cannot remove it"
+        fields.add(field)
+        position = end
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != ":":
+            return None
+        position += 1
+        while position < len(text) and text[position].isspace():
+            position += 1
+        try:
+            _, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            return None
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text) or text[position] != ",":
+            return None
+        position += 1
+    return None
 
 
 def _author_json_prefix_state(text):
@@ -2507,6 +2558,25 @@ class CapabilityFoundry:
                         response_metadata = response.get("response_metadata") if isinstance(response, dict) else None
                         response_text = response.get("text") if isinstance(response, dict) else None
                         response_digest = hashlib.sha256(response_text.encode()).hexdigest() if isinstance(response_text, str) else None
+                        interrupted_suffix = (
+                            prior.get("status") == "calling"
+                            and continuation_state == "calling"
+                            and last_request.get("status") == "started"
+                            and last_request.get("operation") == "continue_truncated_response"
+                            and last_request.get("prefix_sha256") == response_digest
+                            and type(last_request.get("prefix_characters")) is int
+                            and last_request.get("prefix_characters") == len(response_text or "")
+                            and isinstance(prior_continuation, dict)
+                            and prior_continuation.get("partial_response") == response_text
+                            and prior_continuation.get("partial_response_sha256") == response_digest
+                            and prior_continuation.get("request_signature") == last_request.get("request_signature")
+                            and type(last_request.get("attempt")) is int
+                            and last_request.get("attempt") == prior.get("attempts")
+                            and prior_continuation.get("attempt") == last_request.get("attempt")
+                            and prior_continuation.get("route_index") == prior_route_index
+                            and len(author_requests) >= 2
+                            and author_requests[-2].get("status") == "succeeded"
+                            and author_requests[-2].get("operation") == "continue_truncated_response")
                         owned_empty_response = (
                             resume_work_ref is not None
                             and isinstance(response_text, str) and not response_text.strip()
@@ -2545,14 +2615,14 @@ class CapabilityFoundry:
                                                       "independent_validator_contract", "review_response_format"}))))
                                 and isinstance(last_request, dict)
                                 and last_request.get("role", author_role) == author_role
-                                and last_request.get("status") == "succeeded"
+                                and (last_request.get("status") == "succeeded" or interrupted_suffix)
                                 and isinstance(last_request.get("request_signature"), str)
                                 and last_request.get("request_signature")
                                 and _model_route_identity(response.get("model"))
                                     == _model_route_identity(current_route_model)
                                 and _model_route_identity(last_request.get("model"))
                                     == _model_route_identity(current_route_model)
-                                and continuation_state not in {"calling", "result_unknown"}
+                                and (continuation_state not in {"calling", "result_unknown"} or interrupted_suffix)
                                 and type(prior.get("attempts")) is int
                                 and prior.get("attempts", 0) > 0
                         ):
@@ -2589,7 +2659,8 @@ class CapabilityFoundry:
                     # route; the current continuation, sandbox, and admission
                     # gates still decide whether any program is usable.
                     state = resumable_response
-                    state.update(status="blocked" if retained_empty_recovery else
+                    state.update(status="calling" if state.get("status") == "calling" else
+                                 "blocked" if retained_empty_recovery else
                                  "repairing" if empty_profile_recovery else "response_received", assignment=base_prompt)
                     if not isinstance(state.get("author_request_signatures"), list):
                         state["author_request_signatures"] = []
@@ -3165,6 +3236,18 @@ class CapabilityFoundry:
                     deepcopy_config(continuation))
                 state.pop("author_response_continuation", None)
                 continuation = None
+            prefix_contract_error = _author_prefix_contract_error(result.text)
+            if prefix_contract_error is not None:
+                continuation = deepcopy_config(continuation or {})
+                continuation.update(
+                    status="format_repair_required", attempt=attempt_number,
+                    route_index=author_route_index,
+                    partial_response_sha256=result_digest,
+                    partial_characters=len(result.text), error=prefix_contract_error)
+                state["author_response_continuation"] = continuation
+                state.update(status="response_received", error=prefix_contract_error)
+                save("author_response_irreversible_schema_failure")
+                return result
             if (isinstance(continuation, dict)
                     and continuation.get("status") == "format_repair_required"):
                 return result
@@ -3281,8 +3364,25 @@ class CapabilityFoundry:
                     if observed_calls + 3 > model_call_budget:
                         break
 
+                response_assignment = base_prompt
+                for authored_request in reversed(state.get("requests", [])):
+                    if (authored_request.get("role", author_role) == author_role
+                            and authored_request.get("attempt") == attempt_number
+                            and authored_request.get("status") == "succeeded"
+                            and authored_request.get("operation") != "continue_truncated_response"
+                            and isinstance(authored_request.get("prompt"), str)):
+                        response_assignment = json.loads(authored_request["prompt"])
+                        break
+                source_contract = response_assignment["output_contract"]
+                patch_response = isinstance(source_contract, dict) and "updates" in source_contract
                 continuation_marker, current_prefix_digest, prompt = (
-                    _author_continuation_prompt(partial))
+                    _author_continuation_prompt(partial, response_contract={
+                        "response_contract": ("Return only the updates object with exact source edits and intent merge patch."
+                                              if patch_response else response_assignment["response_contract"]),
+                        "output_contract": source_contract,
+                        "allowed_top_level_fields": (["updates"] if patch_response else
+                                                     sorted(ATTEMPT_FIELDS | LEGACY_TRANSPORT_FIELDS)),
+                    }))
                 route_model = (
                     author_route_configs[author_route_index].get("model")
                     if author_route_configs else
@@ -3457,6 +3557,12 @@ class CapabilityFoundry:
                     "length", request_attempts)
                 state.update(status="response_received", last_response=asdict(combined))
                 save("author_response_continuation_received")
+                prefix_contract_error = _author_prefix_contract_error(partial)
+                if prefix_contract_error is not None:
+                    continuation.update(status="format_repair_required", error=prefix_contract_error)
+                    state["error"] = prefix_contract_error
+                    save("author_response_irreversible_schema_failure")
+                    return combined
                 try:
                     parse_complete_json_object(
                         partial, "continued program author response",

@@ -3985,6 +3985,11 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(author.calls, 4)
         self.assertEqual(len(author.output_budgets), author.calls)
         first_repair_prompt = json.loads(author.authoring_prompts[1])
+        continuation_prompt = next(json.loads(value) for value in author.prompts
+                                   if json.loads(value).get("assignment") == "continue_truncated_experiment_author_json")
+        self.assertEqual(continuation_prompt["original_response_contract"]["allowed_top_level_fields"], ["updates"])
+        self.assertEqual(continuation_prompt["original_response_contract"]["output_contract"],
+                         first_repair_prompt["output_contract"])
         self.assertEqual(first_repair_prompt["assignment"], "repair_existing_experiment_candidate")
         self.assertNotIn("capability_brief", first_repair_prompt)
         patch_prompt = json.loads(author.authoring_prompts[-1])

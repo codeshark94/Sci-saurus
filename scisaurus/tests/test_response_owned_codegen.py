@@ -11,7 +11,8 @@ from unittest.mock import patch
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.capability_foundry import (
-    _author_response_format_failure_signature, candidate_prompt, program_review_evidence,
+    _author_response_format_failure_signature, _author_prefix_contract_error,
+    candidate_prompt, program_review_evidence,
 )
 from scisaurus.runtime.measurement_contract import validate_model_definition, model_definition_contract
 from scisaurus.runtime.models import ModelResult
@@ -22,6 +23,100 @@ from scisaurus.tests import test_harness_recovery as measurement_fixtures
 
 
 class ResponseOwnedCodegenTests(unittest.TestCase):
+    def test_interrupted_suffix_retains_known_prefix_and_unknown_dispatch_across_contracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = fixtures.CapabilityFoundryTests()
+            self.addCleanup(helper.doCleanups)
+            foundry, cache = helper._foundry(root), helper._cache(root)
+            complete = json.dumps(helper._payload())
+            prefix = complete[:-80]
+            prompts = []
+
+            class Author:
+                model = "author"
+                max_output_tokens = 24000
+                reasoning_effort = "none"
+                output_format = "json_object"
+
+                def complete(self, *, system, prompt):
+                    prompts.append(json.loads(prompt))
+                    texts = [prefix, complete[len(prefix):len(prefix)+30], complete]
+                    index = len(prompts)-1
+                    return ModelResult(texts[index], self.model, {"model_calls": 1}, 0,
+                                       "length" if index < 2 else "stop")
+
+            class Interruption(RuntimeError):
+                pass
+
+            def stop(phase, state):
+                if phase == "author_response_continuation_calling" and len(state["requests"]) == 3:
+                    raise Interruption()
+
+            author = Author()
+            with self.assertRaises(Interruption):
+                foundry.generate("bounded comparison", client=author, work_cache=cache, on_progress=stop)
+            original = cache.entries()[0]
+            result = foundry.generate("bounded comparison", client=author, work_cache=cache,
+                                      resume_work_ref=original["cache_ref"])
+            self.assertEqual(result["status"], "registered")
+            current = next(row for row in cache.entries() if row["status"] == "succeeded")
+            self.assertEqual(current["requests"][:3], original["requests"])
+            receipt = current["request_outcome_reconciliations"][0]
+            self.assertEqual(receipt["source_ref"], original["cache_ref"])
+            self.assertEqual(receipt["request_index"], 2)
+            self.assertEqual(receipt["status"], "result_unknown")
+            self.assertEqual(len(prompts), 3)
+            self.assertNotIn("partial_response", prompts[-1])
+
+    def test_prefix_schema_guard_preserves_nested_fields_and_source_strings(self):
+        for text in [
+            '{"experiment_intent":{"extra":"allowed inside intent"},"executor_source":"incomplete',
+            '{"executor_source":"metadata \\"extra\\": inside source", "experiment_intent":{',
+            '{"updates":{"executor_source":{"edits":[{"old":"x","new":"y"}]}}}',
+            '{"experiment_intent":{},"executor_source":"x","runtime":{},"test_input":{',
+        ]:
+            with self.subTest(text=text):
+                self.assertIsNone(_author_prefix_contract_error(text))
+        self.assertIn("unsupported top-level field", _author_prefix_contract_error(
+            '{"experiment_intent":{},"executor_source":"x","executor_source_metadata":'))
+        self.assertIn("duplicate top-level field", _author_prefix_contract_error(
+            '{"experiment_intent":{},"executor_source":"x","executor_source":'))
+
+    def test_irreversible_suffix_routes_to_format_repair_without_another_continuation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            helper = fixtures.CapabilityFoundryTests()
+            self.addCleanup(helper.doCleanups)
+            foundry = helper._foundry(root)
+            cache = helper._cache(root)
+            complete = json.dumps(helper._payload())
+            prefix = complete[:-40]
+            responses = [prefix, complete[len(prefix):-1] + ', "executor_source_metadata":', complete]
+            prompts = []
+
+            class Author:
+                model = "author"
+                max_output_tokens = 24000
+                reasoning_effort = "none"
+                output_format = "json_object"
+
+                def complete(self, *, system, prompt):
+                    prompts.append(json.loads(prompt))
+                    i = len(prompts) - 1
+                    return ModelResult(responses[i], self.model, {"model_calls": 1}, 0,
+                                       "length" if i < 2 else "stop")
+
+            result = foundry.generate("bounded comparison", client=Author(), work_cache=cache)
+            self.assertEqual(result["status"], "registered")
+            self.assertEqual(len(prompts), 3)
+            self.assertIn("original_response_contract", prompts[1])
+            self.assertIn("output_contract", prompts[1]["original_response_contract"])
+            self.assertIn("unsupported top-level field", prompts[2]["format_repair"]["previous_error"])
+            state = cache.entries()[0]
+            self.assertEqual(sum(r.get("operation") == "continue_truncated_response"
+                                 for r in state["requests"]), 1)
+
     def test_empty_malformed_and_truncated_responses_have_distinct_failures(self):
         empty = _author_response_format_failure_signature(None, "length", text="")
         extra = _author_response_format_failure_signature(None, "stop", text='{"a":1}}')
