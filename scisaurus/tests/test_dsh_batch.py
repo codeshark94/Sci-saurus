@@ -158,6 +158,40 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(state["process_reaped"])
         self.assertIn("stopped or replaced", state["error"])
 
+    def test_failed_receipt_is_durable_before_transport_cleanup(self):
+        from scisaurus.runtime.dsh_batch import terminate_tree
+        observed = []
+        def inspect_then_cleanup(process):
+            receipt = next((self.root / "jobs").glob("*/receipt.json"))
+            state = json.loads(receipt.read_text())
+            observed.append(state)
+            self.assertEqual(state["status"], "result_unknown")
+            self.assertEqual(state["usage"]["model_calls"], 1)
+            self.assertEqual(state["usage"]["input_tokens"], 21)
+            self.assertNotIn("process_reaped", state)
+            terminate_tree(process)
+        with patch("scisaurus.runtime.dsh_batch.terminate_tree", side_effect=inspect_then_cleanup):
+            with self.assertRaises(DshBatchError):
+                self.run_job(self.config("length"))
+        self.assertEqual(len(observed), 1)
+
+    def test_failed_precleanup_receipt_write_still_reaps_transport(self):
+        from scisaurus.runtime.dsh_batch import terminate_tree
+        replace = Path.replace
+        reaped = []
+        def fail_terminal_receipt(path, target):
+            if path.name == "receipt.tmp" and json.loads(path.read_text()).get("status") == "result_unknown":
+                raise OSError("receipt storage unavailable")
+            return replace(path, target)
+        def cleanup(process):
+            terminate_tree(process)
+            reaped.append(process.poll() is not None)
+        with patch.object(Path, "replace", fail_terminal_receipt), \
+                patch("scisaurus.runtime.dsh_batch.terminate_tree", side_effect=cleanup):
+            with self.assertRaisesRegex(OSError, "receipt storage unavailable"):
+                self.run_job(self.config("length"))
+        self.assertEqual(reaped, [True])
+
     def test_author_repairs_files_and_preserves_full_execution_input(self):
         from scisaurus.runtime.capability_foundry import _source_patch_context
         client = DshAuthorClient(self.config(), root=self.root / "jobs", runtime_python=sys.executable)

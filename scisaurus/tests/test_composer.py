@@ -17215,6 +17215,11 @@ class ComposerWorkflowTests(unittest.TestCase):
                 checked = runner._materialize_topic_capability(result)
             regenerate_existing.assert_not_called()
             self.assertTrue(checked["generated_capability"]["reused"])
+            with patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate") as regenerate_existing:
+                checked = runner._materialize_topic_capability(result, continuation_revision=99)
+            regenerate_existing.assert_not_called()
+            self.assertTrue(checked["generated_capability"]["reused"])
             frozen_intent = {"domain": "marine ecology", "research_question": "Does transport alter patch recovery?"}
             frozen = {"assignment": {"capability_brief": "bounded frozen comparison",
                 "required_intent_fields": deepcopy(frozen_intent),

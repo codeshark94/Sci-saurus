@@ -351,15 +351,21 @@ class DshBatchRunner:
             state.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}", finish_reason=finish)
             raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"]) from exc
         finally:
+            # Transport disposal may outlast the supervisor's grace period.
+            # Persist the known outcome and usage before any blocking cleanup.
             try:
-                terminate_tree(process)
-                state["process_reaped"] = process.poll() is not None
-            finally:
-                selector.close()
-                for stream in (process.stdin, process.stdout, process.stderr):
-                    stream.close()
                 state["elapsed_seconds"] = time.monotonic() - start
                 save()
+            finally:
+                try:
+                    terminate_tree(process)
+                    state["process_reaped"] = process.poll() is not None
+                finally:
+                    selector.close()
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        stream.close()
+                    state["elapsed_seconds"] = time.monotonic() - start
+                    save()
 
 
 class DshAuthorClient:

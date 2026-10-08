@@ -14511,7 +14511,8 @@ class ComposerRunner:
                         or registered_input.get("scientific_software") != self._scientific_software_projection(software_assessment)
                         or registered_input.get("source_data_manifest") != source_data_manifest
                         or registered_input.get("work_orders", []) != executable_work_orders
-                        or (continuation_revision is not None and experiment.get("revision", 0) < continuation_revision)
+                        or (force_regenerate and continuation_revision is not None
+                            and experiment.get("revision", 0) < continuation_revision)
                         or (quality_contract is not None and experiment.get("quality_contract") != quality_contract)
                         or (stage_seconds is not None and experiment.get("stage_seconds") != stage_seconds)):
                     continue

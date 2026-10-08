@@ -41,6 +41,21 @@ class SignalFixtureRunner(_FixtureRunner):
             worker.wait(timeout=5)
 
 
+class CooperativeReceiptFixtureRunner(_FixtureRunner):
+    def __init__(self, workflow, **kwargs):
+        self.root = Path(workflow["project_id"])
+
+    def run(self):
+        from scisaurus.runtime.run_control import check_project_stop
+        (self.root / "ready").write_text("ready")
+        try:
+            while True:
+                check_project_stop(self.root)
+                time.sleep(.01)
+        finally:
+            (self.root / "receipt.json").write_text(json.dumps({"status": "result_unknown", "usage": {"model_calls": 15}}))
+
+
 class InitializingFixtureRunner(_FixtureRunner):
     def __init__(self, workflow, **kwargs):
         time.sleep(0.4)
@@ -202,6 +217,57 @@ class ComposerSupervisorTests(unittest.TestCase):
             for connection in acquired:
                 with self.assertRaises(sqlite3.ProgrammingError):
                     connection.execute("SELECT 1")
+    def test_operator_stop_allows_receipt_cleanup_before_forced_termination(self):
+        child = Mock()
+        alive = {"value": True}
+        child.is_alive.side_effect = lambda: alive["value"]
+        def complete_cleanup(**kwargs):
+            alive["value"] = False
+        child.join.side_effect = complete_cleanup
+        with patch.object(ComposerSupervisor, "_process_tree", return_value={}):
+            ComposerSupervisor._stop_child(child, cooperative=True)
+        child.terminate.assert_not_called()
+        child.kill.assert_not_called()
+        self.assertEqual(child.join.call_count, 2)
+
+    def test_revoked_grant_persists_real_child_receipt_before_stop(self):
+        import multiprocessing
+        from scisaurus.runtime.composer_supervisor import _composer_child_entry
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            (root / "output").mkdir()
+            (root / "output/run-control.json").write_text(json.dumps({"stop_requested": False}))
+            context = multiprocessing.get_context("spawn")
+            parent_pipe, child_pipe = context.Pipe(duplex=False)
+            child = context.Process(target=_composer_child_entry,
+                args=({"project_id": path}, False, child_pipe), kwargs={"runner_type": CooperativeReceiptFixtureRunner})
+            child.start()
+            child_pipe.close()
+            try:
+                deadline = time.monotonic() + 5
+                while not (root / "ready").exists() and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue((root / "ready").exists())
+                (root / "output/run-control.json").write_text(json.dumps({"stop_requested": True}))
+                ComposerSupervisor._stop_child(child, cooperative=True)
+                self.assertFalse(child.is_alive())
+                self.assertEqual(json.loads((root / "receipt.json").read_text())["usage"]["model_calls"], 15)
+            finally:
+                if child.is_alive():
+                    child.kill()
+                    child.join()
+                child.close()
+                parent_pipe.close()
+
+    def test_operator_stop_keeps_forced_cleanup_for_unresponsive_worker(self):
+        child = Mock()
+        child.is_alive.return_value = True
+        with patch.object(ComposerSupervisor, "_process_tree", return_value={}):
+            ComposerSupervisor._stop_child(child, cooperative=True)
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.join.call_count, 3)
+
     def test_inventory_failure_still_terminates_child_and_reports_unverified_descendants(self):
         child = Mock()
         child.is_alive.return_value = True

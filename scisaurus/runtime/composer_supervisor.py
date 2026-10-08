@@ -1015,7 +1015,7 @@ class ComposerSupervisor:
                 if len(fields := line.split(None, 3)) == 4}
 
     @classmethod
-    def _stop_child(cls, child):
+    def _stop_child(cls, child, *, cooperative=False):
         owned = {}
 
         def capture_descendants():
@@ -1032,8 +1032,14 @@ class ComposerSupervisor:
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             inventory_error = exc
         try:
-            child.terminate()
-            child.join(timeout=5.0)
+            # Revoked execution grants are polled by batch workers. Give them
+            # the cleanup window to persist their observed usage and receipts
+            # before falling back to process termination.
+            if cooperative:
+                child.join(timeout=5.0)
+            if child.is_alive():
+                child.terminate()
+                child.join(timeout=5.0)
             if child.is_alive():
                 capture_descendants()
             # Workers create private sessions. Killing only the Composer cannot
@@ -1096,7 +1102,7 @@ class ComposerSupervisor:
         try:
             while child.is_alive():
                 if not self._execution_allowed():
-                    self._stop_child(child)
+                    self._stop_child(child, cooperative=True)
                     self._mark_interrupted_checkpoint()
                     result = {"status": "paused", "stop_reason": "operator_paused"}
                     self._write_state(child_status="paused", action="stop", result=result)
@@ -1179,7 +1185,7 @@ class ComposerSupervisor:
                     break
         except KeyboardInterrupt:
             if child.is_alive():
-                self._stop_child(child)
+                self._stop_child(child, cooperative=not self._execution_allowed())
             self._mark_interrupted_checkpoint()
             self._write_state(child_status="interrupted", action="stop")
             raise
