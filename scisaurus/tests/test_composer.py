@@ -284,6 +284,108 @@ class ComposerWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(StateError, "scientific input"):
                 runner._topic_review_obligation(source)
 
+    def test_runtime_binding_preserves_owned_topic_and_obligation_identity(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner, topic_stage, _ = self._owned_held_topic(root)
+            survey = runner.workflow["stages"][1]
+            original = deepcopy(runner.context["topic"]["topic"])
+            expected = runner._topic_review_obligation(survey)
+            descriptor = root / "generated.json"
+            descriptor.write_text(json.dumps({"capability_id": "generated-program", "experiment": {
+                "domain": original["domain"], "research_question": original["research_question"]}}))
+            context = runner.context["topic"]
+            context["generated_capability"] = {"capability_id": "generated-program", "descriptor_path": str(descriptor)}
+            context["topic"]["experiment_capability_id"] = "generated-program"
+            for candidate in context["candidates"]:
+                if candidate["id"] == original["id"]:
+                    candidate["experiment_capability_id"] = "generated-program"
+            self.assertEqual(runner._topic_review_obligation(survey), expected)
+            self.assertEqual(runner._owned_topic_review(topic_stage)[0]["topic"], original)
+            self.assertIsNotNone(runner._stage_review_revalidation_input(topic_stage))
+            for field in ("research_question", "domain", "id"):
+                saved = context["topic"][field]
+                context["topic"][field] = "changed"
+                with self.assertRaisesRegex(StateError, "scientific input"):
+                    runner._owned_topic_review(topic_stage)
+                context["topic"][field] = saved
+            context["generated_capability"]["capability_id"] = "foreign"
+            with self.assertRaisesRegex(StateError, "scientific input"):
+                runner._owned_topic_review(topic_stage)
+            context["generated_capability"]["capability_id"] = "generated-program"
+            self.assertEqual(len(runner._reconcile_topic_execution_bindings()), 1)
+            self.assertEqual(context["topic"], original)
+            self.assertEqual(runner._reconcile_topic_execution_bindings(), [])
+            self.assertEqual(runner._topic_review_obligation(survey), expected)
+            self.assertTrue(all("experiment_capability_id" not in item for item in context["candidates"]))
+
+    def test_binding_reconciliation_resumes_only_owned_failed_consumer(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            runner, topic_stage, _ = self._owned_held_topic(root)
+            context = runner.context[topic_stage["id"]]
+            descriptor = root / "generated.json"
+            descriptor.write_text(json.dumps({"capability_id": "generated-program", "experiment": {
+                key: context["topic"][key] for key in ("domain", "research_question")}}))
+            context["generated_capability"] = {"capability_id": "generated-program", "descriptor_path": str(descriptor)}
+            context["topic"]["experiment_capability_id"] = "generated-program"
+            runner.tasks.create("failed-consumer", "production", {}, "command.composer")
+            runner.tasks.transition("failed-consumer", "queued", "command.composer")
+            project = str(root / "experiment" / "attempt-4")
+            runner.tasks.start_attempt("failed-consumer", "failed-consumer-attempt", owner="command.composer",
+                lease_ttl_seconds=60, payload={"stage_id": "experiment", "attempt_number": 4, "project_dir": project})
+            runner.tasks.finish_attempt("failed-consumer-attempt", "failed", usage={})
+            error = "StateError: carried topic review changes its owned scientific input"
+            record = {"status": "blocked", "task_id": "wrong-task", "error": error,
+                "attempts": [{"state": "failed", "attempt_id": "failed-consumer-attempt",
+                              "attempt_number": 4, "project_dir": project, "error": error}]}
+            runner.stage_records["experiment"] = record
+            event = runner._reconcile_topic_execution_bindings()[0]
+            self.assertEqual(event["blocked_consumers"], [])
+            self.assertEqual(record["status"], "blocked")
+            context["topic"]["experiment_capability_id"] = "generated-program"
+            record["task_id"] = "failed-consumer"
+            record["attempts"][-1]["topic_id"] = "foreign-topic"
+            event = runner._reconcile_topic_execution_bindings()[0]
+            self.assertEqual(event["blocked_consumers"], [])
+            self.assertEqual(record["status"], "blocked")
+            record["attempts"][-1].pop("topic_id")
+            context["topic"]["experiment_capability_id"] = "generated-program"
+            event = runner._reconcile_topic_execution_bindings()[0]
+            self.assertEqual(record["status"], "retrying")
+            proof = runner.store.get(event["proof_ref"])
+            self.assertEqual(proof["author"], "command.composer")
+            self.assertEqual(json.loads(runner.store.read_body(proof["body_hash"]))["blocked_consumers"][0]["attempt_number"], 4)
+            self.assertEqual(record["attempts"][-1]["state"], "failed")
+
+    def test_response_recovery_uses_latest_owned_attempt_instead_of_stale_context(self):
+        runner = ComposerRunner.__new__(ComposerRunner)
+        context = {"failure_dossier_ref": "old"}
+        runner.stage_records = {"experiment": {"attempt_count": 7,
+            "failure_dossier_ref": "new", "attempts": [{"attempt_number": 7, "failure_dossier_ref": "new"}]}}
+        evidence = {"old": {"available": True, "attempt_number": 5},
+                    "new": {"available": True, "attempt_number": 7}}
+        with patch.object(runner, "_failure_dossier_evidence", side_effect=lambda ref, **kw: evidence[ref]):
+            self.assertEqual(runner._current_response_failure_ref("experiment", context), "new")
+            runner.stage_records["experiment"]["attempts"].append({"attempt_number": 8})
+            self.assertIsNone(runner._current_response_failure_ref("experiment", context))
+            evidence["old"]["attempt_number"] = 8
+            evidence["new"]["attempt_number"] = 8
+            self.assertIsNone(runner._current_response_failure_ref("experiment", context))
+            context["failure_dossier_ref"] = "new"
+            self.assertEqual(runner._current_response_failure_ref("experiment", context), "new")
+            runner.stage_records["experiment"]["attempt_count"] = 9
+            self.assertIsNone(runner._current_response_failure_ref("experiment", context))
+            runner.stage_records["experiment"]["attempt_count"] = 8
+            evidence["new"]["available"] = False
+            self.assertIsNone(runner._current_response_failure_ref("experiment", context))
+
+    def test_authored_catalog_binding_is_part_of_scientific_topic(self):
+        reviewed = {"id": "topic", "experiment_capability_id": "catalog-a"}
+        context = {"topic": {**reviewed, "experiment_capability_id": "catalog-b"},
+                   "generated_capability": {"capability_id": "catalog-b"}}
+        self.assertNotEqual(ComposerRunner._reviewed_scientific_topic(context, reviewed), reviewed)
+
     def test_topic_deferred_obligations_have_exact_dag_owners_and_literal_transport(self):
         with tempfile.TemporaryDirectory() as path:
             runner, topic, descriptor = self._owned_held_topic(Path(path))
@@ -17061,7 +17163,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                     patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate",
                           return_value=generated) as call:
                 result = runner._materialize_topic_capability(result, quality_contract=quality_contract)
-            self.assertEqual(result["topic"]["experiment_capability_id"], "generated_frontier")
+            self.assertNotIn("experiment_capability_id", result["topic"])
+            self.assertNotIn("experiment_capability_id", result["candidates"][0])
+            self.assertEqual(result["generated_capability"]["capability_id"], "generated_frontier")
             self.assertEqual(call.call_args.kwargs["required_intent"]["research_question"],
                              "Does transport alter patch recovery?")
             self.assertEqual(
@@ -17111,6 +17215,39 @@ class ComposerWorkflowTests(unittest.TestCase):
                 checked = runner._materialize_topic_capability(result)
             regenerate_existing.assert_not_called()
             self.assertTrue(checked["generated_capability"]["reused"])
+            frozen_intent = {"domain": "marine ecology", "research_question": "Does transport alter patch recovery?"}
+            frozen = {"assignment": {"capability_brief": "bounded frozen comparison",
+                "required_intent_fields": deepcopy(frozen_intent),
+                "configured_input": {"scientific_software": {"strategy": "custom_model"}}},
+                "last_attempt": {"executor_source": "print('observations')", "experiment_intent": frozen_intent}}
+            saved_descriptor = json.loads(descriptor_path.read_text())
+            descriptor_path.write_text(json.dumps({**saved_descriptor, "experiment": {**saved_descriptor["experiment"],
+                "execution": {"input": deepcopy(frozen["assignment"]["configured_input"])}}}))
+            candidate_path = descriptor_path.parent / "candidate.json"
+            candidate_path.write_text(json.dumps(frozen["last_attempt"]))
+            with patch.object(runner, "_format_recovery_foundry_assignment", return_value=("artifact:frozen@1", frozen)), \
+                    patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                    patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate") as regenerate:
+                self.assertTrue(runner._materialize_topic_capability(result)["generated_capability"]["reused"])
+            regenerate.assert_not_called()
+            for change in ("executor_source", "experiment_intent", "configured_input"):
+                foreign = deepcopy(frozen)
+                if change == "configured_input":
+                    foreign["assignment"][change] = {}
+                elif change == "experiment_intent":
+                    foreign["last_attempt"][change] = {**frozen_intent, "hypothesis": "different"}
+                else:
+                    foreign["last_attempt"][change] += "\nprint('different')"
+                # Freeze validation itself is tested separately; stop before a
+                # deliberately conflicting assignment can invoke any model.
+                with patch.object(runner, "_format_recovery_foundry_assignment", return_value=("artifact:frozen@1", foreign)), \
+                        patch("scisaurus.runtime.capability_registry.load_registry", return_value={"capabilities": [entry]}), \
+                        patch("scisaurus.runtime.program_admission.format_recovery_intent_constraints", return_value=(foreign["last_attempt"]["experiment_intent"], [])), \
+                        patch("scisaurus.runtime.capability_foundry.CapabilityFoundry.generate", side_effect=RuntimeError("new admission required")) as regenerate:
+                    with self.assertRaisesRegex(RuntimeError, "new admission required"):
+                        runner._materialize_topic_capability(result)
+                regenerate.assert_called_once()
+            descriptor_path.write_text(json.dumps(saved_descriptor))
             assessment = {"artifact_ref":"artifact:software-assessment@1", "review":{"decision":"accept"},
                 "evidence":{"selection":{"strategy":"custom_model"},"selected_operations":[]}}
             with patch.object(runner,"_assess_scientific_software",return_value=assessment), \

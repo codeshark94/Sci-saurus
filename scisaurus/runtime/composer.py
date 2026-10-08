@@ -1120,6 +1120,8 @@ class ComposerRunner:
                     raise ValidationError(
                         "composer resume workflow does not match the original immutable workflow")
             self._restore()
+            if self._reconcile_topic_execution_bindings():
+                self._checkpoint("resume:separate_topic_execution_bindings", force=True)
             if workflow_extension is not None:
                 try:
                     checkpoint, body = self._stopped_execution_checkpoint()
@@ -7495,6 +7497,31 @@ class ComposerRunner:
                 return identity["topic_cycle"] == 0
         return True
 
+    def _current_response_failure_ref(self, stage_id, context):
+        """Resolve a response owner from the current durable attempt frontier."""
+        record = self.stage_records.get(stage_id, {})
+        attempts = record.get("attempts", [])
+        latest = attempts[-1] if isinstance(attempts, list) and attempts else {}
+        latest = latest if isinstance(latest, dict) else {}
+        numbers = [value for value in (latest.get("attempt_number"), record.get("attempt_number"),
+                                      record.get("attempt_count")) if type(value) is int and value > 0]
+        number = max(numbers) if numbers else None
+        recovery = context.get("failure_recovery")
+        recovery = recovery if isinstance(recovery, dict) else {}
+        context_ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+        record_ref = latest.get("failure_dossier_ref") or record.get("failure_dossier_ref")
+        candidates = []
+        for ref in dict.fromkeys((record_ref, context_ref)):
+            if not isinstance(ref, str):
+                continue
+            evidence = self._failure_dossier_evidence(ref, expected_stage_id=stage_id)
+            if not isinstance(evidence, dict) or evidence.get("available") is not True:
+                continue
+            if type(number) is int and evidence.get("attempt_number") != number:
+                continue
+            candidates.append(ref)
+        return candidates[0] if len(candidates) == 1 else None
+
     def _unresolved_response_owner(self, request, context):
         """Identify a retained response across a pre-dispatch wrapper failure.
 
@@ -7513,9 +7540,7 @@ class ComposerRunner:
         if identity is not None and any(request.get(key) != identity[key]
                                         for key in ("topic_id", "topic_cycle")):
             return None
-        recovery = context.get("failure_recovery")
-        recovery = recovery if isinstance(recovery, dict) else {}
-        current_ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+        current_ref = self._current_response_failure_ref(stage_id, context)
         prior_ref = request.get("failure_dossier_ref")
         if not isinstance(prior_ref, str) or not isinstance(current_ref, str) or prior_ref == current_ref:
             return None
@@ -7672,9 +7697,7 @@ class ComposerRunner:
                 continue
             if self._unresolved_response_owner(request, context) is not None:
                 continue
-            recovery = context.get("failure_recovery")
-            recovery = recovery if isinstance(recovery, dict) else {}
-            current_ref = context.get("failure_dossier_ref") or recovery.get("dossier_ref")
+            current_ref = self._current_response_failure_ref(stage_id, context)
             old_ref = request.get("failure_dossier_ref")
             if not isinstance(old_ref, str) or not isinstance(current_ref, str) or old_ref == current_ref:
                 continue
@@ -7952,6 +7975,118 @@ class ComposerRunner:
                 requests.append(item)
         return requests
 
+    @staticmethod
+    def _reviewed_scientific_topic(context, reviewed):
+        """Separate legacy controller enrichment from an immutable scientific topic.
+
+        An authored catalog capability remains part of the scientific input.
+        Only a newly added binding to the context's generated descriptor can
+        be removed, and every reviewed field must still match exactly.
+        """
+        current = context.get("topic")
+        if current == reviewed:
+            return current
+        generated = context.get("generated_capability")
+        if (not isinstance(current, dict) or not isinstance(reviewed, dict)
+                or "experiment_capability_id" in reviewed
+                or not isinstance(generated, dict)
+                or not isinstance(generated.get("capability_id"), str)
+                or current.get("experiment_capability_id") != generated["capability_id"]):
+            return current
+        scientific = {key: value for key, value in current.items()
+                      if key != "experiment_capability_id"}
+        if scientific != reviewed:
+            return current
+        try:
+            descriptor = json.loads(Path(generated["descriptor_path"]).read_text())
+        except (KeyError, OSError, TypeError, ValueError):
+            return current
+        experiment = descriptor.get("experiment", {}) if isinstance(descriptor, dict) else {}
+        if (isinstance(descriptor, dict) and isinstance(experiment, dict)
+                and descriptor.get("capability_id") == generated["capability_id"]
+                and experiment.get("domain") == reviewed.get("domain")
+                and experiment.get("research_question") == reviewed.get("research_question")):
+            return scientific
+        return current
+
+    def _reconcile_topic_execution_bindings(self):
+        reconciled = []
+        for stage in self.workflow["stages"]:
+            if stage["kind"] != "topic_discovery":
+                continue
+            context = self.context.get(stage["id"], {})
+            if (not isinstance(context, dict)
+                    or not isinstance(context.get("specialist_verifier"), dict)
+                    or not isinstance(context.get("topic"), dict)
+                    or "experiment_capability_id" not in context["topic"]
+                    or not isinstance(context.get("generated_capability"), dict)):
+                continue
+            owned = self._owned_topic_review(stage)
+            if owned is None or owned[0]["topic"] == context.get("topic"):
+                continue
+            original = context["topic"]
+            context["topic"] = deepcopy(owned[0]["topic"])
+            for candidate in context.get("candidates", []):
+                if candidate == original:
+                    candidate.pop("experiment_capability_id")
+            event = {"action": "separate_topic_execution_binding", "stage_id": stage["id"],
+                     "verifier_execution_ref": owned[2], "verifier_execution_sha256": owned[3],
+                     "previous_topic_sha256": hashlib.sha256(canonical_bytes(original)).hexdigest(),
+                     "topic_sha256": hashlib.sha256(canonical_bytes(context["topic"])).hexdigest(),
+                     "capability_id": context["generated_capability"]["capability_id"]}
+            consumers = []
+            for consumer in self.workflow["stages"]:
+                record = self.stage_records.get(consumer["id"], {})
+                attempts = record.get("attempts", [])
+                latest = attempts[-1] if isinstance(attempts, list) and attempts else {}
+                if (record.get("status") != "blocked" or latest.get("state") != "failed"
+                        or record.get("error") != "StateError: carried topic review changes its owned scientific input"
+                        or latest.get("error") != record["error"]
+                        or record.get("failure_class") is not None):
+                    continue
+                ancestry = {consumer["id"], *consumer.get("depends_on", [])}
+                pending = list(consumer.get("depends_on", []))
+                by_id = {item["id"]: item for item in self.workflow["stages"]}
+                while pending:
+                    parent = pending.pop()
+                    for ancestor in by_id.get(parent, {}).get("depends_on", []):
+                        if ancestor not in ancestry:
+                            ancestry.add(ancestor)
+                            pending.append(ancestor)
+                if stage["id"] not in ancestry:
+                    continue
+                try:
+                    attempt = self.tasks.get_attempt(latest.get("attempt_id"))
+                except NotFoundError:
+                    continue
+                payload = attempt.get("payload", {})
+                identity = self._current_topic_identity()
+                if (attempt.get("state") != "failed" or attempt.get("task_id") != record.get("task_id")
+                        or payload.get("stage_id") != consumer["id"]
+                        or payload.get("attempt_number") != latest.get("attempt_number")
+                        or payload.get("project_dir") != latest.get("project_dir")
+                        or not self._request_context_matches_current_topic(
+                            consumer["id"], self.context.get(consumer["id"], {}))
+                        or identity is not None and any(
+                            key in owner and owner[key] != identity[key]
+                            for owner in (latest, record, payload)
+                            for key in ("topic_id", "topic_cycle"))):
+                    continue
+                consumers.append({"stage_id": consumer["id"], "attempt_id": latest["attempt_id"],
+                                  "attempt_number": latest["attempt_number"], "project_dir": latest["project_dir"]})
+            event["blocked_consumers"] = consumers
+            proof = self._publish("command/composer/topic-execution-bindings/" + stage["id"],
+                "note", event, "command.composer", subjects=[owned[2]])
+            event["proof_ref"] = proof["artifact_ref"]
+            for consumer in consumers:
+                record = self.stage_records[consumer["stage_id"]]
+                record.update(status="retrying", recovery_admitted=True,
+                              operational_recovery_ref=proof["artifact_ref"])
+                self.status = "running"
+            self.department_activity.append(event)
+            reconciled.append(event)
+        return reconciled
+
     def _owned_topic_review(self, topic_stage):
         context = self.context.get(topic_stage["id"], {})
         verifier = context.get("specialist_verifier") if isinstance(context, dict) else None
@@ -7967,14 +8102,15 @@ class ComposerRunner:
         manifest, digest, body = self._read_verified_artifact_json(ref)
         report = body.get("report", {})
         response = report.get("response", {})
+        scientific_topic = self._reviewed_scientific_topic(context, body.get("chief_result", {}).get("topic"))
         if response.get("decision") == "accept" and any(response.get(key) for key in ("blocking_findings", "required_revisions", "critical_findings")):
             raise StateError("accepted topic review retains blocking admission obligations")
         if (body.get("schema_version") != "specialist-verifier-execution-1"
                 or body.get("stage_kind") != "topic_discovery"
-                or body.get("chief_result", {}).get("topic") != context.get("topic")
+                or body.get("chief_result", {}).get("topic") != scientific_topic
                 or report.get("status") != "succeeded"):
             raise StateError("carried topic review changes its owned scientific input")
-        return context, plan_ref, ref, digest, response
+        return {**context, "topic": scientific_topic}, plan_ref, ref, digest, response
 
     def _topic_review_obligation(self, survey_stage):
         """Bind a carried topic review to its exact scientific input and execution."""
@@ -8097,7 +8233,8 @@ class ComposerRunner:
                 or execution.get("stage_id") != stage["id"]
                 or execution.get("stage_kind") != stage["kind"]
                 or (stage["kind"] == "topic_discovery"
-                    and execution.get("chief_result", {}).get("topic") != context.get("topic"))
+                    and execution.get("chief_result", {}).get("topic") != self._reviewed_scientific_topic(
+                        context, execution.get("chief_result", {}).get("topic")))
                 or not isinstance(plan_ref, str)
                 or self._stage_specialist_payment_proof(stage, plan_ref, ref) is None):
             raise StateError("stage review revalidation has no exact owned verifier input")
@@ -8123,7 +8260,7 @@ class ComposerRunner:
                         or result.get("kind") != "topic_discovery" or result.get("status") != "completed"
                         or result.get("output_path") != str(output)
                         or cached.get("output_sha256") != output_hash
-                        or result.get("topic") != context.get("topic")):
+                        or result.get("topic") != self._reviewed_scientific_topic(context, result.get("topic"))):
                     continue
                 producer_record, producer_digest, _ = self._read_verified_artifact_json(cached["cache_ref"])
                 if producer_record.get("author") != "command.controller":
@@ -14310,6 +14447,9 @@ class ComposerRunner:
         domain = selected.get("domain")
         if not isinstance(question, str) or not isinstance(domain, str):
             raise ValidationError("capability foundry requires topic domain and research question")
+        frozen_assignment = self._format_recovery_foundry_assignment(
+            continuation_requests, question=question, domain=domain)
+        frozen_work_ref, frozen_work = frozen_assignment or (None, None)
 
         foundry_stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
         evidence_frontier = None
@@ -14324,7 +14464,7 @@ class ComposerRunner:
                 error.usage = deepcopy(evidence_frontier["dispatch_usage"])
                 error.repair_panel_usage = deepcopy(evidence_frontier["dispatch_usage"])
                 raise error
-            if self._format_recovery_foundry_assignment(continuation_requests, question=question, domain=domain) is None:
+            if frozen_work is None:
                 software_assessment = self._assess_scientific_software(foundry_stage, descriptor, result,
                     computation_scope={"source_data_manifest": deepcopy(source_data_manifest),
                                        "work_orders": project_executable_work_orders(continuation_requests),
@@ -14351,7 +14491,23 @@ class ComposerRunner:
                 if superseded is None or experiment["revision"] > superseded["revision"]:
                     superseded = {"id": experiment["id"], "revision": experiment["revision"]}
                 registered_input = experiment.get("execution", {}).get("input", {})
-                if (not isinstance(registered_input, dict)
+                if frozen_work is not None:
+                    # A response repair owns the complete saved input and
+                    # authored program, not a newly projected software choice.
+                    try:
+                        candidate = json.loads((path.parent / "candidate.json").read_text())
+                    except (OSError, TypeError, ValueError):
+                        continue
+                    frozen_candidate = frozen_work.get("last_attempt")
+                    if (not isinstance(frozen_candidate, dict) or not isinstance(candidate, dict)
+                            or not isinstance(frozen_candidate.get("executor_source"), str)
+                            or not isinstance(frozen_candidate.get("experiment_intent"), dict)
+                            or any(canonical_bytes(candidate.get(key)) != canonical_bytes(frozen_candidate[key])
+                                   for key in ("executor_source", "experiment_intent"))
+                            or canonical_bytes(registered_input) != canonical_bytes(
+                                frozen_work["assignment"]["configured_input"])):
+                        continue
+                elif (not isinstance(registered_input, dict)
                         or registered_input.get("scientific_software") != self._scientific_software_projection(software_assessment)
                         or registered_input.get("source_data_manifest") != source_data_manifest
                         or registered_input.get("work_orders", []) != executable_work_orders
@@ -14372,7 +14528,7 @@ class ComposerRunner:
                         and (not isinstance(repair, dict)
                              or repair.get("repair_evidence_frontier") != evidence_binding)):
                     continue
-                if force_regenerate:
+                if force_regenerate and frozen_work is None:
                     if (not isinstance(repair, dict)
                             or repair.get("kind") != "independent_repair"
                             or repair.get("origin") != "composer_model_panel"):
@@ -14590,8 +14746,6 @@ class ComposerRunner:
                     repair_provenance = {**(repair_provenance or {}),
                                          "repair_evidence_frontier": evidence_binding}
                 author_brief = json.dumps(brief, ensure_ascii=False, sort_keys=True)
-                frozen_work_ref, frozen_work = self._format_recovery_foundry_assignment(
-                    continuation_requests, question=question, domain=domain) or (None, None)
                 if frozen_work is not None:
                     assignment = frozen_work["assignment"]
                     author_brief = assignment["capability_brief"]
@@ -14647,10 +14801,6 @@ class ComposerRunner:
         if not isinstance(existing.get("capability_id"), str):
             raise ValidationError("capability foundry did not return a capability identity")
         result["generated_capability"] = existing
-        selected["experiment_capability_id"] = existing["capability_id"]
-        for candidate in result.get("candidates", []):
-            if isinstance(candidate, dict) and candidate.get("id") == selected.get("id"):
-                candidate["experiment_capability_id"] = existing["capability_id"]
         return result
 
     def _apply_topic_to_experiment_config(self, stage, config, *, model_call_budget=None):
@@ -21294,7 +21444,7 @@ class ComposerRunner:
                 "attempt_id": result.get("attempt_id"),
                 "project_dir": result.get("project_dir"),
                 "execution_refs": execution_refs,
-                "capability_id": selected.get("experiment_capability_id"),
+                "capability_id": self._stage_experiment_capability_id(stage),
                 "capability_source": capability_source,
                 "execution_mode": feasibility_plan.get("execution_mode"),
                 "required_executables": deepcopy(feasibility_plan.get("required_executables", [])),
