@@ -81,6 +81,57 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.budget.get_window("run-window")["cumulative_usage"],
                          {"model_calls": 4, "input_tokens": 3000, "output_tokens": 1000})
 
+    def test_non_model_unknown_uses_declared_operation_counter_and_preserves_observed_usage(self):
+        for operation, counter in (("fetch", "retrieval_calls"), ("program", "program_calls")):
+            self.tasks.create(operation, "service", {"operation": operation}, "worker")
+            self.tasks.admit(operation, "scheduler")
+            self.budget.reserve(window_id="run-window", reservation_id=operation, task_id=operation,
+                                amount={"concurrent_calls": 1})
+            self.tasks.start_attempt(operation, operation + "-attempt", owner="worker", lease_ttl_seconds=1)
+            self.tasks.reconcile_unknown(operation + "-attempt", "command.controller",
+                                         observed_usage={counter: 2, "bytes": 500})
+        policy = self.policy()
+        policy["unknown_outcomes"]["usage_per_attempt"] = {"model_calls": 1, "output_tokens": 1000}
+        result = self.controller.prepare(self.config, policy)
+        for receipt in result["unknown_reconciliations"]:
+            self.assertNotIn("model_calls", receipt["charged_usage"])
+            self.assertNotIn("output_tokens", receipt["charged_usage"])
+            self.assertEqual(receipt["charged_usage"]["bytes"], 500)
+        window = self.budget.get_window("run-window")
+        self.assertEqual(window["reserved"], {})
+        self.assertEqual(window["cumulative_usage"], {"retrieval_calls": 2, "program_calls": 2, "bytes": 1000})
+
+    def test_undeclared_unknown_operation_cannot_be_charged_as_model(self):
+        self.unknown()
+        with self.control.tx() as conn:
+            conn.execute("UPDATE tasks SET payload_json=? WHERE task_id='remote'",
+                         (canonical_bytes({"operation": "unregistered"}).decode(),))
+        policy = self.policy()
+        policy["unknown_outcomes"]["usage_per_attempt"] = {"model_calls": 1}
+        with self.assertRaisesRegex(ValidationError, "unknown operation"):
+            self.controller.prepare(self.config, policy)
+        self.assertEqual(self.tasks.get_attempt("remote-attempt")["state"], "result_unknown")
+        self.assertEqual(self.budget.get_window("run-window")["reserved"], {"concurrent_calls": 1})
+
+    def test_unknown_operation_validation_is_independent_of_estimate_shape(self):
+        self.unknown()
+        with self.control.tx() as conn:
+            conn.execute("UPDATE tasks SET payload_json=? WHERE task_id='remote'",
+                         (canonical_bytes({"operation": "unregistered"}).decode(),))
+        with self.assertRaisesRegex(ValidationError, "unknown operation"):
+            self.controller.prepare(self.config, self.policy())
+        self.assertEqual(self.tasks.get_attempt("remote-attempt")["state"], "result_unknown")
+
+    def test_fetch_token_estimates_are_omitted_but_observed_quantities_are_preserved(self):
+        self.tasks.create("fetch", "service", {"operation": "fetch"}, "worker")
+        self.tasks.admit("fetch", "scheduler")
+        self.tasks.start_attempt("fetch", "fetch-attempt", owner="worker", lease_ttl_seconds=1)
+        self.tasks.reconcile_unknown("fetch-attempt", "command.controller", observed_usage={"input_tokens": 50})
+        policy = self.policy()
+        policy["unknown_outcomes"]["usage_per_attempt"] = {"retrieval_calls": 1, "input_tokens": 20, "output_tokens": 100}
+        result = self.controller.prepare(self.config, policy)
+        self.assertEqual(result["unknown_reconciliations"][0]["charged_usage"], {"retrieval_calls": 1, "input_tokens": 50})
+
     def test_source_change_requires_named_reopened_scope(self):
         (self.root / "scisaurus" / "worker.py").write_text("VERSION = 2\n")
         with self.assertRaisesRegex(ValidationError, "source changed"):

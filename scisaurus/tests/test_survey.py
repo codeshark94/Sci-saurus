@@ -545,6 +545,178 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_follow_up_reference_inventory_distinguishes_hits_capacity_and_captures(self):
+        order = self.follow_up_order("Compare W101 and W202; historical W303 is not required acquisition.")
+        runner = self.runtime(work_orders=[order])
+        self.addCleanup(runner.control.close)
+        runner.bounds["max_works"] = 1
+        runner.works = {"W101": {"abstract": "Captured abstract"}}
+        runner.work_records = {"W101": {"artifact_ref": "artifact:kb/works/W101@1"}}
+        runner.source_docs = {"artifact:kb/abstracts/W101@1": {
+            "work_id": "W101", "text": "Captured abstract", "representation": "abstract"}}
+        runner.query_refs = ["artifact:kb/queries/1@1"]
+        runner.search_log = [{"outcome": "ok", "returned_work_ids": ["W202"]}]
+        runner.gaps = [{"kind": "work_limit", "work_id": "W202"}]
+        inventory = runner._named_reference_inventory()
+        by_id = {row["work_id"]: row for row in inventory["references"]}
+        self.assertEqual(inventory["remaining_catalog_slots"], 0)
+        self.assertEqual(by_id["W101"]["source_availability"]["evidence_scope"], "abstract")
+        self.assertEqual(by_id["W202"]["returned_by_query_refs"], runner.query_refs)
+        self.assertTrue(by_id["W202"]["catalog_admission_blocked"])
+        self.assertIsNone(by_id["W202"]["work_ref"])
+        self.assertEqual(by_id["W202"]["sources"], [])
+        self.assertIn("not mandatory", inventory["scope"])
+        self.assertEqual(runner._follow_up_assignment({"phase": "counter_plan"})["named_reference_inventory"], inventory)
+        self.assertNotIn("named_reference_inventory", runner._follow_up_assignment({"phase": "map"}))
+
+    def test_full_catalog_prevents_new_follow_up_plan_without_reclassifying_references(self):
+        runner = self.runtime(work_orders=[self.follow_up_order("Discuss W202 as a historical comparison.")])
+        self.addCleanup(runner.control.close)
+        runner.works = {f"W{index}": {} for index in range(runner.bounds["max_works"])}
+        before = deepcopy(runner.works)
+        with patch.object(runner, "_refresh_countersearch_state"), patch.object(
+                runner, "_model_checked", side_effect=AssertionError("capacity failed before planning")):
+            with self.assertRaises(QuotaExceededError) as failure:
+                runner._counter_plan()
+        self.assertEqual(failure.exception.dimension, "max_works")
+        self.assertEqual(failure.exception.observed, runner.bounds["max_works"])
+        self.assertEqual(runner.works, before)
+        self.assertNotIn("required", failure.exception.diagnostics[0]["references"][0])
+        runner.counter_plan_record = {"artifact_ref": "retained"}
+        with patch.object(runner, "_refresh_countersearch_state"), patch.object(
+                runner, "_body", return_value={"queries": ["recorded search"], "rationale": "Retained plan"}):
+            value, _ = runner._counter_plan()
+        self.assertEqual(value["queries"], ["recorded search"])
+
+    def test_empty_length_response_is_capacity_failure_and_resume_cannot_renew_it(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        waves = []
+        answer = {"queries": ["recall"], "rationale": "Bounded search"}
+        def dispatch(specs, **kwargs):
+            waves.append(deepcopy(specs))
+            results = {}
+            for spec in specs:
+                task_id, actor = spec["task_id"], spec["actor"]
+                runner.tasks.create(task_id, "service", {}, actor)
+                runner.tasks.admit(task_id, actor)
+                runner.tasks.transition(task_id, "running", actor)
+                context = runner._publish("command/contexts/" + task_id, "note", spec["params"], actor)
+                empty = len(waves) == 1 and actor == "research.search-planner"
+                body = {"text": "" if empty else json.dumps(answer), "model": "fixture",
+                    "usage": {"model_calls": 1, "output_tokens": 100}, "elapsed_seconds": .01,
+                    "finish_reason": "length" if empty else "stop",
+                    "response_metadata": {"max_output_tokens": 100, "answer_bytes": 0 if empty else 20}}
+                execution = runner._publish("command/executions/" + task_id, "report", body,
+                                            actor, subjects=[context["artifact_ref"]])
+                results[task_id] = {"ok": True, "record_ref": execution["artifact_ref"], "result": body}
+            return results
+        jobs = [{"name": name, "actor": actor, "assignment": {"phase": "blind_plan"},
+                 "validator": runner._plan_validator} for name, actor in (
+                     ("empty", "research.search-planner"), ("sibling", "methods.blind-search-planner"))]
+        with patch.object(runner, "_call_batch", side_effect=dispatch):
+            with self.assertRaises(QuotaExceededError) as stopped:
+                runner._models_checked(jobs)
+        self.assertEqual(len(waves), 1)
+        self.assertEqual(stopped.exception.dimension, "generation_output_tokens")
+        self.assertEqual(stopped.exception.diagnostics[0]["usage"]["output_tokens"], 100)
+        runner.resume_session = {"session": 9}
+        with patch.object(runner, "_call_batch", side_effect=AssertionError("unchanged capacity dispatched again")):
+            with self.assertRaises(QuotaExceededError):
+                runner._models_checked([{**jobs[0], "assignment": {"phase": "blind_plan", "resume_boundary": "new"}}])
+            sibling = runner._models_checked([jobs[1]])
+        self.assertEqual(sibling["sibling"][0], answer)
+        with patch.object(runner, "_call_batch", side_effect=dispatch):
+            fixed = runner._models_checked([{**jobs[0], "assignment": {"phase": "blind_plan", "question": "New scope"}}])
+        self.assertEqual(fixed["empty"][0], answer)
+
+    def test_historical_empty_generation_requires_settled_owner_and_same_execution_capacity(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize()
+        actor, name, task_id = "methods.survey-reviewer", "historical", "survey-historical-1"
+        assignment = runner._follow_up_assignment({"phase": "survey_review", "question": "Exact original question"})
+        runner.tasks.create(task_id, "service", {"operation": "model"}, actor)
+        runner.tasks.admit(task_id, actor)
+        runner.tasks.start_attempt(task_id, "paid-original", owner=actor, lease_ttl_seconds=60)
+        client = runner._base_model_config({"actor": actor, "params": {"client": runner.model_config, "role": actor}})
+        context = runner._publish("command/contexts/" + task_id, "note", {
+            "client": client, "role": actor, "prompt": json.dumps(assignment)}, actor)
+        usage = {"model_calls": 1, "output_tokens": client["max_output_tokens"]}
+        execution = runner._publish("command/executions/" + task_id, "report", {
+            "text": "", "model": client["model"], "usage": usage, "elapsed_seconds": 1,
+            "finish_reason": "length", "response_metadata": {}}, actor, subjects=[context["artifact_ref"]])
+        runner.tasks.finish_attempt("paid-original", "succeeded", usage=usage)
+        runner.tasks.transition(task_id, "awaiting_review", actor)
+        runner.tasks.transition(task_id, "blocked", "command.controller")
+        proposal = runner._publish("kb/model-proposals/" + task_id, "note", {"raw_text": ""}, actor,
+                                   subjects=[execution["artifact_ref"]])
+        runner._publish("command/validation/" + task_id, "note", {"error": "Not JSON", "finish_reason": "length"},
+                        "command.controller", subjects=[proposal["artifact_ref"]])
+        runner.resume_session = {"session": 1}
+        job = {"name": name, "actor": actor, "assignment": {**assignment, "resume_boundary": "fresh"},
+               "validator": lambda value: None}
+        with patch.object(runner, "_call_batch", side_effect=AssertionError("paid empty answer was dispatched again")):
+            with self.assertRaises(QuotaExceededError) as blocked:
+                runner._models_checked([job])
+        self.assertEqual(blocked.exception.dimension, "generation_output_tokens")
+        self.assertEqual(blocked.exception.diagnostics[0]["execution_ref"], execution["artifact_ref"])
+        retained = runner._retained_settled_response(name, actor, assignment,
+            execution_ref=execution["artifact_ref"], model={**runner.model_config, "max_output_tokens": usage["output_tokens"] + 1})
+        self.assertFalse(retained["model_matches"])
+        changed = deepcopy(assignment)
+        changed["question"] = "A different question"
+        self.assertIsNone(runner._retained_settled_response(name, actor, changed,
+            execution_ref=execution["artifact_ref"], model=runner.model_config))
+        runner.control._conn.execute("UPDATE attempts SET lease_owner=? WHERE attempt_id=?", ("foreign", "paid-original"))
+        self.assertIsNone(runner._retained_settled_response(name, actor, assignment,
+            execution_ref=execution["artifact_ref"], model=runner.model_config))
+        foreign = {**job, "model_overrides": {"max_output_tokens": usage["output_tokens"] + 1}}
+        with patch.object(runner, "_call_batch", side_effect=AssertionError("unowned receipt authorized dispatch")):
+            with self.assertRaises(StateError):
+                runner._models_checked([foreign])
+
+    def test_invalid_json_escape_repairs_only_failed_assignment_with_exact_feedback(self):
+        config = survey_config(self.endpoint)
+        config["limits"]["max_rounds"] = 2
+        runner = self.runtime(config)
+        runner._initialize()
+        runner._complete = lambda task_id: None
+        invalid = r'{"queries":["resonator dispersion"],"rationale":"ratio \omega"}'
+        valid = r'{"queries":["resonator dispersion"],"rationale":"ratio \\omega"}'
+        waves = []
+        assignments = [{"name": name, "actor": role,
+            "assignment": {"phase": "blind_plan", "question": "Original question"},
+            "validator": runner._plan_validator}
+            for name, role in (("first-plan", "research.search-planner"),
+                               ("second-plan", "methods.blind-search-planner"))]
+        def dispatch(specs, **kwargs):
+            waves.append(deepcopy(specs))
+            outcomes = {}
+            for spec in specs:
+                task_id = spec["task_id"]
+                runner.tasks.create(task_id, "service", {}, spec["actor"])
+                runner.tasks.admit(task_id, spec["actor"])
+                runner.tasks.transition(task_id, "running", spec["actor"])
+                text = invalid if spec["actor"] == "methods.blind-search-planner" and len(waves) == 1 else valid
+                execution = runner._publish("command/executions/" + task_id, "report",
+                    {"text": text}, spec["actor"])
+                outcomes[task_id] = {"ok": True, "record_ref": execution["artifact_ref"],
+                    "result": {"text": text, "model": "fixture", "usage": {"model_calls": 1},
+                               "elapsed_seconds": 0.01, "finish_reason": "stop"}}
+            return outcomes
+        with patch.object(runner, "_call_batch", side_effect=dispatch):
+            results = runner._models_checked(assignments)
+        self.assertEqual([len(wave) for wave in waves], [2, 1])
+        repair = json.loads(waves[1][0]["params"]["prompt"])
+        self.assertEqual(repair["question"], "Original question")
+        self.assertIn("Invalid", repair["validation_feedback"]["error"])
+        self.assertIn("column", repair["validation_feedback"]["error"])
+        self.assertEqual(repair["validation_feedback"]["previous_response"], {"raw_text": invalid})
+        self.assertEqual(results["second-plan"][0]["rationale"], r"ratio \omega")
+
     def test_map_capacity_cannot_truncate_required_capture_or_target_catalog(self):
         from scisaurus.runtime.models import ModelContextBudgetError
         runner = self.runtime()
@@ -1726,10 +1898,11 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(contexts, [])
         runner.control.close()
 
-    def runtime(self, config=None, *, on_progress=None, resume_policy=None, work_orders=None, review_obligations=None):
+    def runtime(self, config=None, *, on_progress=None, resume_policy=None, work_orders=None, review_obligations=None,
+                model_execution_config=None):
         runner = SurveyRunner(self.root / "run", config or survey_config(self.endpoint),
                               on_progress=on_progress, resume_policy=resume_policy, work_orders=work_orders,
-                              review_obligations=review_obligations)
+                              review_obligations=review_obligations, model_execution_config=model_execution_config)
         self.addCleanup(runner.control.close)
         runner.worker_target = simulated_survey_worker
         return runner
@@ -4210,6 +4383,66 @@ class TestSurveyRunner(unittest.TestCase):
                             == config["model"]["max_output_tokens"]
                             for context in contexts))
 
+    def test_resumed_execution_capacity_reaches_review_without_replacing_retained_input(self):
+        config = survey_config(self.endpoint)
+        first = self.runtime(config)
+        retained = deepcopy(first.config)
+        self.assertEqual(first.run()["status"], "completed")
+        control, store = self.open_store()
+        original = store.head("inputs/run-config")
+        control.close()
+        requested = deepcopy(retained["model"])
+        requested["max_output_tokens"] = 32768
+        requested["reasoning_effort"] = "low"
+        first.control.close()
+        policy = {"additional_seconds": 20, "unknown_outcomes": {"mode": "block", "usage_per_attempt": {}},
+                  "source_changes": {"mode": "reopen", "reopen_scopes": ["integrated_review"]}}
+        resumed = self.runtime(retained, resume_policy=policy, model_execution_config=requested)
+        self.assertEqual(resumed.config, retained)
+        self.assertEqual(resumed.model_config["max_output_tokens"], 32768)
+        resumed._initialize()
+        resumed._accept_survey_once()
+        self.assertEqual(resumed.store.head("inputs/run-config"), original)
+        contexts = [json.loads(resumed.store.read_body(record["body_hash"]))
+                    for record, prompt in self.model_contexts(resumed.control, resumed.store)
+                    if prompt.get("phase") == "survey_review"]
+        self.assertEqual(contexts[-1]["client"]["max_output_tokens"], 32768)
+        self.assertEqual(contexts[-1]["client"]["reasoning_effort"], "low")
+        self.assertTrue(resumed._heads("command/model-execution-controls/"))
+
+    def test_resumed_execution_controls_reject_route_and_quota_changes(self):
+        from scisaurus.runtime.models import resumed_model_execution_config
+        retained = {"model": "fixture", "max_output_tokens": 8192, "max_calls_per_model": 4,
+                    "role_models": {"methods.survey-reviewer": {"model": "review-fixture"}}}
+        for key, value in (("model", "foreign"), ("max_calls_per_model", 5)):
+            with self.subTest(key=key):
+                changed = {**retained, key: value}
+                with self.assertRaisesRegex(ValidationError, "routes or quotas"):
+                    resumed_model_execution_config(retained, changed)
+        changed = deepcopy(retained)
+        changed["role_models"]["methods.survey-reviewer"]["model"] = "foreign"
+        with self.assertRaisesRegex(ValidationError, "routes or quotas"):
+            resumed_model_execution_config(retained, changed)
+        config = survey_config(self.endpoint)
+        invalid = {**config["model"], "model": "foreign"}
+        root = self.root / "invalid-runtime-controls"
+        with self.assertRaisesRegex(ValidationError, "routes or quotas"):
+            SurveyRunner(root, config, model_execution_config=invalid)
+        self.assertFalse(root.exists())
+        retained = deepcopy(config["model"])
+        retained.update(context_window_tokens=262144, max_input_tokens=245760, max_output_tokens=8192)
+        retained["role_models"] = {"methods.survey-reviewer": {}}
+        retained["role_routes"] = {"methods.survey-reviewer": [{"id": "review-route", "pool": "review-pool",
+            "protocol": retained["protocol"], "base_url": retained["base_url"], "model": retained["model"],
+            "max_input_tokens": 245760}]}
+        requested = deepcopy(retained)
+        requested["role_models"]["methods.survey-reviewer"].update(max_output_tokens=32768,
+                                                                  max_input_tokens=229376)
+        with self.assertRaisesRegex(ValidationError, "exceeds context_window_tokens"):
+            resumed_model_execution_config(retained, requested)
+        requested["role_routes"]["methods.survey-reviewer"][0]["max_input_tokens"] = 229376
+        self.assertEqual(resumed_model_execution_config(retained, requested), requested)
+
     def test_aggregate_review_initial_and_repair_share_exact_response_contract(self):
         from scisaurus.runtime.survey_records import survey_review_response_contract
         runner = self.runtime()
@@ -4218,7 +4451,7 @@ class TestSurveyRunner(unittest.TestCase):
         control, store = self.open_store()
         prompt = next(prompt for _, prompt in self.model_contexts(control, store)
                       if prompt.get("phase") == "survey_review")
-        contract = survey_review_response_contract(prompt["map"])
+        contract = survey_review_response_contract(prompt["map"], indexed=True)
         self.assertEqual(prompt["response_contract"], contract)
         repaired = runner._repair_assignment({"assignment": prompt, "actor": "methods.survey-reviewer"},
                                             {"error": "unexpected findings inside a check", "finish_reason": "stop"})
@@ -4498,10 +4731,13 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(coverage["entry_inclusion_counts"], {"included": 1, "uncertain": 1})
         self.assertEqual(coverage["claimless_entry_count"], 1)
         self.assertEqual(coverage["abstention_count"], 2)
-        self.assertEqual(coverage["abstention_work_ids"], ["W101", "W102"])
+        self.assertNotIn("abstention_work_ids", coverage)
+        self.assertNotIn("source_windows", coverage)
         self.assertIn("partial withdrawals", coverage["count_definitions"]["abstention_count"])
         self.assertEqual(packet["deterministic_integrity"]["map_entry_count"], 2)
-        self.assertEqual(packet["deterministic_integrity"]["source_inventory_work_count"], 2)
+        self.assertEqual(packet["deterministic_integrity"]["catalog_work_count"], 2)
+        self.assertEqual(packet["deterministic_integrity"]["captured_source_work_count"], 2)
+        self.assertEqual(coverage["captured_source_work_count"], 2)
         self.assertTrue(packet["deterministic_integrity"]["all_relationship_endpoints_in_map_entries"])
         self.assertIn("abstract_work_count", coverage["count_definitions"])
         self.assertEqual(packet["map"]["projection"], packet["projection"])
@@ -4514,6 +4750,29 @@ class TestSurveyRunner(unittest.TestCase):
         runner.source_docs = dict(reversed(list(runner.source_docs.items())))
         runner.analysis_records = dict(reversed(list(runner.analysis_records.items())))
         self.assertEqual(packet, runner._survey_review_packet())
+
+    def test_aggregate_review_distinguishes_catalog_records_from_captured_sources(self):
+        runner = self.runtime()
+        self.addCleanup(runner.control.close)
+        runner._initialize(); runner._setup()
+        for wid in ("W101", "W102"):
+            runner._bibliographic_call("work", role="research.seed-reader", work_id=wid)
+        runner._map()
+        runner._materialize_source_less_map("W102", runner.analyzed_basis["W102"],
+                                           scope="review_exhausted")
+        runner.source_docs = {ref: source for ref, source in runner.source_docs.items()
+                              if source["work_id"] != "W102"}
+        runner.works["W102"]["abstract"] = None
+        packet = runner._survey_review_packet()
+        self.assertEqual(packet["coverage"]["unique_works"], 2)
+        self.assertEqual(packet["coverage"]["source_inventory_work_records"], 2)
+        self.assertEqual(packet["coverage"]["captured_source_work_count"], 1)
+        self.assertEqual(packet["deterministic_integrity"]["catalog_work_count"], 2)
+        self.assertEqual(packet["deterministic_integrity"]["captured_source_work_count"], 1)
+        self.assertNotIn("source_inventory_work_count", packet["deterministic_integrity"])
+        self.assertIn("excluded", packet["coverage"]["count_definitions"]["captured_source_work_count"])
+        self.assertNotIn("source_windows", packet["coverage"])
+        self.assertNotIn("abstention_work_ids", packet["coverage"])
 
     def test_failed_and_unknown_full_text_attempts_survive_review_resume(self):
         runner = self.runtime()
@@ -5992,6 +6251,66 @@ class TestSurveyRunner(unittest.TestCase):
 
 
 class TestSurveyContracts(unittest.TestCase):
+    def test_map_prompt_is_independent_of_restored_dictionary_order(self):
+        from types import SimpleNamespace
+        runner = SurveyRunner.__new__(SurveyRunner)
+        runner.store = SimpleNamespace(read_body=lambda value: value)
+        runner.map_record = {"body_hash": json.dumps({"entry_refs": ["entry-a", "entry-b"],
+                                                     "relationship_refs": ["relation-a", "relation-b"]})}
+        runner.analysis_records = {"W2": {"artifact_ref": "entry-b", "body_hash": '{"work_id":"W2"}'},
+                                   "W1": {"artifact_ref": "entry-a", "body_hash": '{"work_id":"W1"}'}}
+        runner.relationships = {"b": {"artifact_ref": "relation-b", "claim": "Same claim B"},
+                                "a": {"artifact_ref": "relation-a", "claim": "Same claim A"}}
+        original = deepcopy(runner._map_body())
+        for field in ("analysis_records", "relationships"):
+            setattr(runner, field, dict(reversed(list(getattr(runner, field).items()))))
+        self.assertEqual(runner._map_body(), original)
+        self.assertEqual(original["entries"], [{"work_id": "W1"}, {"work_id": "W2"}])
+        runner.relationships["a"]["claim"] = "Changed claim"
+        self.assertNotEqual(runner._map_body(), original)
+
+    def test_map_snapshot_is_independent_of_restored_dictionary_order(self):
+        runner = SurveyRunner.__new__(SurveyRunner)
+        runner._analysis_selection = lambda: set()
+        runner.resume_session = None
+        runner.work_records = {}
+        runner.works = {"W2": {"referenced_works": ["W3", "W1"]},
+                        "W1": {"referenced_works": ["W2"]}, "W3": {"referenced_works": []}}
+        runner.aliases = {}
+        runner.analysis_records = {"W2": {"artifact_ref": "entry-b"}, "W1": {"artifact_ref": "entry-a"}}
+        runner.relationships = {"b": {"artifact_ref": "relation-b", "source": "W2", "target": "W1", "claim": {"evidence": []}},
+                                "a": {"artifact_ref": "relation-a", "source": "W1", "target": "W2", "claim": {"evidence": []}}}
+        runner.score = {"question": "Same question"}
+        runner.register_ref = "register"
+        runner._record = lambda logical, kind, body, actor, **kwargs: deepcopy(body)
+        runner._map()
+        original = runner.map_record
+        for field in ("works", "analysis_records", "relationships"):
+            setattr(runner, field, dict(reversed(list(getattr(runner, field).items()))))
+        runner.works["W2"]["referenced_works"].reverse()
+        runner._map()
+        self.assertEqual(runner.map_record, original)
+        runner.works["W3"]["referenced_works"].append("W1")
+        runner._map()
+        self.assertNotEqual(runner.map_record, original)
+
+    def test_search_plan_contract_preserves_limits_and_rejects_extra_scope_fields(self):
+        from scisaurus.runtime.survey_config import search_plan_response_contract, validate_search_plan
+        contract = search_plan_response_contract(4)
+        self.assertEqual(contract["exact_fields"], ["queries", "rationale"])
+        self.assertFalse(contract["additional_fields"])
+        self.assertEqual(contract["queries"]["max_items"], 4)
+        valid = {"queries": ["resonant array"], "rationale": "Unresolved scope; searches not yet run."}
+        validate_search_plan(valid, 4)
+        for field in ("limitations", "rationale_note"):
+            with self.subTest(field=field), self.assertRaisesRegex(ValidationError, "extra.*" + field):
+                validate_search_plan({**valid, field: "Retained note"}, 4)
+        for value in ({"queries": valid["queries"]}, {**valid, "queries": ["a", " a "]},
+                      {**valid, "queries": ["a", "b"]}, {**valid, "queries": [False]},
+                      {**valid, "queries": []}, {**valid, "rationale": ""}, []):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                validate_search_plan(value, 1)
+
     def test_completion_context_retains_repaired_evidence_catalog(self):
         from scisaurus.runtime.survey_records import follow_up_completion_context
         assignment = {key: [] for key in ("sources", "query_refs", "searches")}

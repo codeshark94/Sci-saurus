@@ -274,6 +274,27 @@ def main(argv=None) -> int:
     p_prepare_review.add_argument("--output-dir", required=True)
     p_prepare_review.add_argument("--brief", required=True)
 
+    p_prepare_lab = sub.add_parser(
+        "prepare-laboratory-workflow",
+        help="bind an opt-in laboratory to a new workflow copy without launching a mission")
+    p_prepare_lab.add_argument("--from-workflow", required=True)
+    p_prepare_lab.add_argument("--laboratory", required=True)
+    p_prepare_lab.add_argument("--output", required=True)
+    p_prepare_lab.add_argument("--extend-laboratory", action="store_true", help="allow only appended runtime and family definitions in a new bound workflow revision")
+    p_prepare_lab.add_argument("--project-id", help="retarget the inert copy to a fresh project directory")
+    p_prepare_lab.add_argument(
+        "--attestation", help="sealed provisioning attestation to pin by content address (optional)")
+
+    p_provision_lab = sub.add_parser(
+        "provision-laboratory",
+        help="execute and attest the operator-declared laboratory runtimes without launching a mission")
+    p_provision_lab.add_argument("--laboratory", required=True)
+    p_provision_lab.add_argument("--output", required=True)
+    p_provision_lab.add_argument(
+        "--allow-unsandboxed", action="store_true",
+        help="explicitly allow diagnostics without the native sandbox; the attestation records the "
+             "weaker mode and is ineligible for production, scientific readiness or admission")
+
     p_interim = sub.add_parser(
         "composer-interim-report", help="print the latest concise Composer stop/progress report")
     p_interim.add_argument("project_dir")
@@ -319,6 +340,49 @@ def main(argv=None) -> int:
             return 2
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result.get("status") in {"prepared", "candidate_needs_review"} else 2
+    if args.cmd in {"prepare-laboratory-workflow", "provision-laboratory"}:
+        import time
+        from scisaurus.core.errors import ValidationError
+        from scisaurus.runtime.laboratory import (
+            direct_runner, load_laboratory, prepare_laboratory_workflow, provision_laboratory)
+        try:
+            if args.cmd == "prepare-laboratory-workflow":
+                result = prepare_laboratory_workflow(
+                    args.from_workflow, args.laboratory, args.output,
+                    project_id=args.project_id, attestation_path=args.attestation,
+                    allow_additive_upgrade=args.extend_laboratory)
+            else:
+                from scisaurus.runtime.program_sandbox import probe_sandbox, run_sandboxed
+                sandbox = probe_sandbox()
+                if sandbox.get("available"):
+                    runner = run_sandboxed
+                    production_eligible = True
+                elif args.allow_unsandboxed:
+                    runner = direct_runner
+                    production_eligible = False
+                else:
+                    print(json.dumps({
+                        "status": "sandbox_unavailable", "sandbox_probe": sandbox,
+                        "production_eligible": False,
+                        "hint": "trusted preparation may run with --allow-unsandboxed for diagnostics; "
+                                "the attestation records the weaker mode and is ineligible for "
+                                "production, scientific readiness or admission"},
+                        ensure_ascii=False))
+                    return 2
+                laboratory = load_laboratory(args.laboratory)
+                attestation = provision_laboratory(laboratory, args.output,
+                                                   deadline=time.monotonic() + 3600,
+                                                   runner=runner)
+                result = {key: attestation[key] for key in (
+                    "schema_version", "laboratory_id", "verified_labels",
+                    "unverified_labels", "isolation")}
+                result["production_eligible"] = production_eligible
+                result["scientific_readiness"] = "not_verified"
+        except (OSError, ValueError, ValidationError) as exc:
+            print(f"laboratory preparation rejected: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result.get("status") == "prepared" or args.cmd == "provision-laboratory" else 2
     if args.cmd == "dashboard":
         from scisaurus.dashboard import run_dashboard
         try:

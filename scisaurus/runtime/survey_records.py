@@ -21,7 +21,11 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-retained-review-frontier-8"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-reference-capacity-and-generation-16"
+CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-3"
+CURRENT_MAP_REVIEW_PROTOCOLS = frozenset({
+    "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL,
+})
 SURVEY_QUOTE_LOCATION_INSTRUCTION = (
     "Finding field identifies the affected decision or assertion and controls repair authority; "
     "quote_field separately identifies the field containing the exact quote on the same target_ref. "
@@ -42,11 +46,16 @@ CRITIQUE_DISPOSITIONS = {
 }
 
 
-def survey_review_response_contract(current_map, *, legacy=False):
+def survey_review_response_contract(current_map, *, legacy=False, indexed=False):
     """Expose the exact review envelope and immutable finding destinations."""
     contract = {
         "required_fields": ["checks", "rationale"],
         "optional_fields": ["findings"],
+        "conditional_requirements": {
+            "non_passed_scientific_checks": ["map-support", "source-fidelity"],
+            "findings": "For each non-passed scientific check, return at least one finding naming an exact current assertion. A negative rationale without an assertion finding is incomplete. Do not change the verdict to avoid supplying the location.",
+            "all_passed": "findings may be omitted or empty when all scientific checks pass.",
+        },
         "checks": [{"check_id": name, "required_fields": sorted(REVIEW_CHECK_FIELDS),
                     "additional_fields": False} for name in SURVEY_CHECKS],
         "findings": {
@@ -62,6 +71,14 @@ def survey_review_response_contract(current_map, *, legacy=False):
     }
     if not legacy:
         contract["assertion_catalog"] = survey_assertion_catalog(current_map)
+        if indexed:
+            contract["assertion_catalog"] = [
+                {key: value for key, value in row.items() if key != "quote"}
+                for row in contract["assertion_catalog"]]
+            contract["assertion_text_location"] = (
+                "Read the full current text in map at target_ref and quote_field. "
+                "Entry scientific fields use their text member; screening uses reason. "
+                "Relationship assertions use claim.text. The assertion_id binds those exact bytes.")
         contract["findings"] = {
             "location": "top-level findings only; never inside a check row",
             "required_fields": ["check_id", "assertion_id", "rationale"],
@@ -641,11 +658,19 @@ def follow_up_inventory(store, survey_ref):
             "coverage_ref": survey["coverage_ref"], "works": works}
 
 
+def named_reference_ids(order, *, known_ids=()):
+    """Address explicitly mentioned identifiers without inferring necessity."""
+    text = json.dumps(order, ensure_ascii=False)
+    names = set(re.findall(r"(?<!\w)W[0-9]+(?!\w)", text))
+    names.update(wid for wid in known_ids
+                 if re.search(r"(?<!\w)" + re.escape(wid) + r"(?!\w)", text))
+    return sorted(names)
+
+
 def project_follow_up_inventory(inventory, order):
     """Expose exact named records while disclosing the full catalog size."""
-    order_text = json.dumps(order, ensure_ascii=False)
-    named = [row for row in inventory["works"]
-             if re.search(r"(?<!\w)" + re.escape(row["work_id"]) + r"(?!\w)", order_text)]
+    references = set(named_reference_ids(order, known_ids=[row["work_id"] for row in inventory["works"]]))
+    named = [row for row in inventory["works"] if row["work_id"] in references]
     return {**inventory, "catalog_work_count": len(inventory["works"]),
             "projection_scope": "named_records" if named else "catalog", "works": named or inventory["works"]}
 

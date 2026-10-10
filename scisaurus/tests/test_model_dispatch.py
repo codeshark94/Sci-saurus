@@ -14,7 +14,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from scisaurus.runtime.dsh_batch import DshBatchRunner
+from scisaurus.runtime.dsh_batch import DshBatchRunner, DshBatchError
 from scisaurus.runtime.model_dispatch import ModelSlotTimeout, model_dispatch_slot
 from scisaurus.runtime.models import ModelCallError, ModelClient
 from scisaurus.runtime.run_control import RunPausedError
@@ -149,11 +149,15 @@ class DispatchTests(unittest.TestCase):
         for _ in range(3):
             self.occupy()
         runner = DshBatchRunner.__new__(DshBatchRunner)
-        runner.config = {"timeout_seconds": 0.1}
+        runner.config = {"timeout_seconds": 0.1, "provider": "offline", "model": "offline"}
+        runner.root = self.root / "queued-batches"
         with patch.object(runner, "_run") as launch:
-            with self.assertRaises(ModelSlotTimeout):
+            with self.assertRaises(DshBatchError) as failure:
                 runner.run("task", inputs={}, outputs=["answer"])
         launch.assert_not_called()
+        self.assertIsInstance(failure.exception.__cause__, ModelSlotTimeout)
+        self.assertEqual(failure.exception.usage["model_calls"], 0)
+        self.assertEqual(json.loads(Path(failure.exception.receipt).read_text())["status"], "not_dispatched")
 
     def test_dsh_reservation_and_real_http_clients_share_three_slots(self):
         state = {"http_active": 0, "batch_active": 0, "peak": 0, "requests": 0}

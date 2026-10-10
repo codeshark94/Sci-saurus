@@ -140,6 +140,26 @@ class TestSurveyGate(unittest.TestCase):
             "survey_ref": survey, "execution_ref": execution, **reply,
         }, author=author)
 
+    def test_review_accepts_supported_context_versions_and_rejects_unknown_versions(self):
+        from scisaurus.runtime.survey_records import CURRENT_MAP_REVIEW_PROTOCOL
+        reply = {"checks": checks(SURVEY_CHECKS), "rationale": "Inspect the current evidence."}
+        current_map = {"entries": [self.entry_body], "relationships": [],
+                       "entry_refs": {self.entry_body["work_id"]: self.entry}, "relationship_refs": {}}
+        for protocol in (None, "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL,
+                         "literature-current-map-review-999", ""):
+            with self.subTest(protocol=protocol):
+                prompt = {"map": current_map}
+                if protocol is not None:
+                    prompt["review_contract"] = {"context_protocol": protocol}
+                execution = self.model(reply, prompt=prompt)
+                review = self.publish(f"kb/context-review-{self.serial}",
+                    {"survey_ref": self.survey, "execution_ref": execution, **reply}, author="methods.reviewer")
+                if protocol in (None, "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL):
+                    self.gate._review(self.store.get(self.survey), review)
+                else:
+                    with self.assertRaisesRegex(ValidationError, "context protocol is unsupported"):
+                        self.gate._review(self.store.get(self.survey), review)
+
     def work_review_for(self, entry, relationships=(), *, author="methods.work-reviewer", reply=None,
                         task=True, prompt=None, prompt_overrides=None, overrides=None):
         reply = reply or {"checks": checks(work_review_checks(relationships)),

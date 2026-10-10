@@ -42,6 +42,36 @@ def topic_package():
 
 
 class ResearchProgramTests(unittest.TestCase):
+    def test_concept_comparison_retains_branches_and_routes_only_selected_design(self):
+        from scisaurus.tests.test_material_development import concept_candidates
+        package = topic_package()
+        package["intake_mode"] = "concept"
+        for candidate, concept in zip(package["candidates"], concept_candidates()):
+            candidate.update(mechanism=concept["mechanism"], design_brief=concept["design_brief"],
+                             research_form="theory_simulation", evidence_mode="synthetic_simulation",
+                             comparison_type="mechanism_ablation")
+        program = build_research_program(package)
+        self.assertEqual(len(program["branches"]), 3)
+        self.assertEqual([b["id"] for b in program["branches"] if b["status"] == "selected"], ["branch_1"])
+        projection = project_research_program(program)
+        self.assertEqual(projection["selected_branch"]["id"], "branch_1")
+        self.assertEqual(len(projection["retained_branches"]), 2)
+        self.assertIn("convenience alone", " ".join(projection["selection_criteria"]))
+
+    def test_concept_intake_materializes_one_validated_design(self):
+        from scisaurus.tests.test_material_development import brief
+        package = topic_package()
+        package["candidates"] = [package["candidates"][1]]
+        package["candidates"][0]["design_brief"] = brief()
+        package["intake_mode"] = "concept"
+        program = build_research_program(package)
+        self.assertEqual(len(program["branches"]), 1)
+        self.assertEqual(program["selected_id"], package["selected_id"])
+        validate_research_program(program)
+        package["candidates"][0].pop("design_brief")
+        with self.assertRaisesRegex(ValidationError, "design_brief"):
+            build_research_program(package)
+
     def test_scoped_single_candidate_refinement_survives_program_validation(self):
         package = topic_package()
         selected = next(item for item in package["candidates"]

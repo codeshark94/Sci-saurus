@@ -100,7 +100,10 @@ class BatchTests(unittest.TestCase):
         self.script.write_text("raise RuntimeError('changed')")
         with self.assertRaisesRegex(ValidationError, "pin mismatch"):
             self.run_job(config)
-        self.assertFalse((self.root / "jobs").exists())
+        receipt = next((self.root / "jobs").glob("*/receipt.json"))
+        state = json.loads(receipt.read_text())
+        self.assertEqual(state["status"], "not_dispatched")
+        self.assertEqual(state["usage"]["model_calls"], 0)
 
     def test_configuration_inspection_never_rehashes_runtime_files(self):
         config = self.config()
@@ -131,7 +134,7 @@ class BatchTests(unittest.TestCase):
             return profile
         with patch("scisaurus.runtime.dsh_batch.sandbox_profile", side_effect=slow_profile), \
                 patch("scisaurus.runtime.dsh_batch.start_process") as launch:
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(DshBatchError):
                 self.run_job(self.config(seconds=0.05))
         launch.assert_not_called()
         receipts = list((self.root / "jobs").glob("*/receipt.json"))
@@ -139,6 +142,33 @@ class BatchTests(unittest.TestCase):
         state = json.loads(receipts[0].read_text())
         self.assertEqual(state["status"], "not_dispatched")
         self.assertEqual(state["usage"]["model_calls"], 0)
+
+    def test_initial_running_receipt_failure_reaps_started_transport(self):
+        from scisaurus.runtime.dsh_batch import terminate_tree
+        replace = Path.replace
+        reaped = []
+        def fail_running_receipt(path, target):
+            if path.name == "receipt.tmp" and json.loads(path.read_text()).get("status") == "running":
+                raise OSError("initial receipt storage unavailable")
+            return replace(path, target)
+        def cleanup(process):
+            terminate_tree(process)
+            reaped.append(process.poll() is not None)
+        with patch.object(Path, "replace", fail_running_receipt), \
+                patch("scisaurus.runtime.dsh_batch.terminate_tree", side_effect=cleanup):
+            with self.assertRaisesRegex(DshBatchError, "initial receipt storage unavailable") as failure:
+                self.run_job(self.config())
+        self.assertEqual(reaped, [True])
+        state = json.loads(Path(failure.exception.receipt).read_text())
+        self.assertEqual(state["status"], "result_unknown")
+        self.assertTrue(state["process_reaped"])
+
+    def test_launch_error_retains_zero_call_receipt(self):
+        with patch("scisaurus.runtime.dsh_batch.start_process", side_effect=OSError("cannot spawn")):
+            with self.assertRaises(DshBatchError) as failure:
+                self.run_job(self.config())
+        self.assertEqual(failure.exception.usage["model_calls"], 0)
+        self.assertEqual(json.loads(Path(failure.exception.receipt).read_text())["status"], "not_dispatched")
 
     def test_managed_pause_reaps_runtime(self):
         control = self.root / "control"
@@ -188,9 +218,35 @@ class BatchTests(unittest.TestCase):
             reaped.append(process.poll() is not None)
         with patch.object(Path, "replace", fail_terminal_receipt), \
                 patch("scisaurus.runtime.dsh_batch.terminate_tree", side_effect=cleanup):
-            with self.assertRaisesRegex(OSError, "receipt storage unavailable"):
+            with self.assertRaisesRegex(DshBatchError, "receipt storage unavailable") as caught:
                 self.run_job(self.config("length"))
         self.assertEqual(reaped, [True])
+        self.assertTrue(Path(caught.exception.receipt).is_file())
+        self.assertEqual(caught.exception.usage, {"model_calls": 1, "input_tokens": 21, "output_tokens": 8})
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+
+    def test_cleanup_failure_retains_paid_receipt_and_reaped_process(self):
+        from scisaurus.runtime.dsh_batch import terminate_tree
+        for mode, expected_status in (("ok", "completed"), ("length", "result_unknown")):
+            with self.subTest(mode=mode):
+                observed = []
+                def cleanup(process):
+                    terminate_tree(process)
+                    observed.append(process.poll() is not None)
+                    raise OSError("cleanup observer failed")
+                with patch("scisaurus.runtime.dsh_batch.terminate_tree", side_effect=cleanup):
+                    with self.assertRaisesRegex(DshBatchError, "transport disposal failed") as caught:
+                        self.run_job(self.config(mode))
+                error = caught.exception
+                state = json.loads(Path(error.receipt).read_text())
+                self.assertEqual(observed, [True])
+                self.assertTrue(state["process_reaped"])
+                self.assertEqual(state["status"], expected_status)
+                self.assertEqual(error.usage, {"model_calls": 1, "input_tokens": 21, "output_tokens": 8})
+                self.assertEqual(state["usage"], error.usage)
+                self.assertIn("cleanup observer failed", state["cleanup_error"])
+                if mode == "length":
+                    self.assertIn("files are not accepted", state["error"])
 
     def test_author_repairs_files_and_preserves_full_execution_input(self):
         from scisaurus.runtime.capability_foundry import _source_patch_context

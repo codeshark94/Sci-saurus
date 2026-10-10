@@ -96,6 +96,108 @@ class _ComposerTestSpecialistClient:
 
 
 class ComposerWorkflowTests(unittest.TestCase):
+    def test_review_recovery_distinguishes_scheduled_retry_from_dispatched_producer(self):
+        with tempfile.TemporaryDirectory() as path:
+            control = ControlStore(path); self.addCleanup(control.close)
+            record = {"status": "retrying", "attempt_count": 0}
+            def pending(value):
+                return ComposerRunner._undispatched_stage_frontier("experiment", value, connection=control._conn)
+            self.assertTrue(pending(record))
+            for change in ({"status": "running"}, {"attempt_count": 1}, {"task_id": "owner"},
+                           {"attempt_id": "owner"}, {"last_attempt_id": "owner"}, {"attempt_number": 1},
+                           {"attempt_count": False}, {"attempt_count": None}, {"last_task_id": "owner"},
+                           {"project_dir": "previous-production"}, {"assignment_plan_ref": "owned-plan"},
+                           {"attempts": [{"attempt_number": 1}]}):
+                self.assertFalse(pending({**record, **change}))
+            tasks = TaskManager(control); tasks.create("owner", "production", {}, "command.controller")
+            tasks.transition("owner", "queued", "command.controller")
+            tasks.start_attempt("owner", "actual-attempt", owner="command.controller", lease_ttl_seconds=60,
+                                payload={"stage_id": "experiment"})
+            self.assertFalse(pending(record))
+
+    def test_idle_producer_recovery_accepts_owned_completion_and_rejects_live_ledgers(self):
+        with tempfile.TemporaryDirectory() as path:
+            control = ControlStore(path); self.addCleanup(control.close)
+            store = ArtifactStore(control); store.init_project(principal_note="Idle producer evidence")
+            tasks = TaskManager(control)
+            for number, phase in enumerate(("completed", "calls_settled", "paused", "executing"), 1):
+                actual = {"model_calls": 2}
+                store.publish_artifact(logical_id=f"command/progress/idle-{number}",
+                    artifact_type="progress_checkpoint", author="command.controller",
+                    body=canonical_bytes({"cumulative_usage": {"actual": actual}, "next_action": {"decision": phase}}),
+                    media_type="application/json")
+                snapshot = {"run_id": "idle", "checkpoint": number, "phase": phase,
+                            "cumulative_usage": actual, "active_tasks": [], "active_operations": []}
+                proof = ComposerRunner._idle_producer_checkpoint_evidence(path, snapshot)
+                if phase == "executing":
+                    self.assertIsNone(proof); continue
+                self.assertEqual(proof["actual_usage"], actual)
+                self.assertIsNone(ComposerRunner._idle_producer_checkpoint_evidence(path, {**snapshot, "cumulative_usage": {"model_calls": 3}}))
+                self.assertIsNone(ComposerRunner._idle_producer_checkpoint_evidence(path, {**snapshot, "active_operations": ["live"]}))
+            snapshot["checkpoint"] = 1; snapshot["phase"] = "completed"
+            tasks.create("live-task", "production", {}, "command.controller")
+            tasks.transition("live-task", "queued", "command.controller")
+            tasks.start_attempt("live-task", "live-attempt", owner="command.controller", lease_ttl_seconds=60)
+            with self.assertRaisesRegex(StateError, "active producer"):
+                ComposerRunner._idle_producer_checkpoint_evidence(path, snapshot)
+            control._conn.execute("UPDATE tasks SET state='completed' WHERE task_id='live-task'")
+            with self.assertRaisesRegex(StateError, "active producer"):
+                ComposerRunner._idle_producer_checkpoint_evidence(path, snapshot)
+            control._conn.execute("UPDATE attempts SET state='succeeded' WHERE attempt_id='live-attempt'")
+            control._conn.execute("INSERT INTO reservations VALUES ('hold','window','live-task','{}','reserved','now')")
+            with self.assertRaisesRegex(StateError, "active producer"):
+                ComposerRunner._idle_producer_checkpoint_evidence(path, snapshot)
+            control._conn.execute("UPDATE reservations SET state='settled' WHERE reservation_id='hold'")
+            self.assertIsNotNone(ComposerRunner._idle_producer_checkpoint_evidence(path, snapshot))
+
+    def test_carried_obligation_intake_annotations_preserve_producer_identity(self):
+        runner = ComposerRunner.__new__(ComposerRunner)
+        runner._current_topic_identity = lambda: {"topic_id": "selected", "topic_cycle": 4}
+        stage = {"id": "survey", "kind": "survey"}
+        order = {"id": "carried", "kind": "literature_expansion", "owner": "research.intelligence",
+                 "objective": "Check the reviewed claim", "why": "Held review", "success_condition": "Exact evidence",
+                 "evidence_needed": "Captured text", "target_stage_id": "survey", "target_stage_kind": "survey",
+                 "attempt_lineage": {"verifier_execution_ref": "artifact:review@1", "topic_sha256": "a" * 64}}
+        active = {**deepcopy(order), "source_stage_id": "survey", "topic_id": "selected", "topic_cycle": 4}
+        original = deepcopy(active)
+        self.assertEqual(runner._merge_carried_obligation([], order, stage), [order])
+        self.assertEqual(runner._merge_carried_obligation([active], order, stage), [order])
+        self.assertEqual(active, original)
+        for field, replacement in [("objective", "Different claim"), ("topic_id", "other"),
+                                   ("topic_cycle", 5), ("source_stage_id", "foreign"),
+                                   ("attempt_lineage", {"topic_sha256": "b" * 64})]:
+            with self.subTest(field=field), self.assertRaises(StateError):
+                runner._merge_carried_obligation([{**active, field: replacement}], order, stage)
+        with self.assertRaises(StateError):
+            runner._merge_carried_obligation([active, deepcopy(active)], order, stage)
+
+    def test_carried_deferred_bindings_restore_only_owned_intake_omissions(self):
+        runner = ComposerRunner.__new__(ComposerRunner)
+        runner._current_topic_identity = lambda: {"topic_id": "selected", "topic_cycle": 4}
+        stage = {"id": "survey", "kind": "survey"}
+        order = {"id": "carried", "kind": "literature_expansion", "owner": "research.intelligence",
+                 "objective": "Check the reviewed claim", "why": "Held review", "success_condition": "Exact evidence",
+                 "evidence_needed": "Captured text", "target_stage_id": "survey", "target_stage_kind": "survey",
+                 "topic_ids": ["selected"], "work_kind": "evidence",
+                 "attempt_lineage": {"verifier_execution_ref": "artifact:review@1", "topic_sha256": "a" * 64,
+                    "deferred_obligation": {"topic_ids": ["selected"], "work_kind": "evidence"}}}
+        active = {key: deepcopy(value) for key, value in order.items() if key not in {"topic_ids", "work_kind"}}
+        active.update(source_stage_id="survey", topic_id="selected", topic_cycle=4)
+        original = deepcopy(active)
+        self.assertEqual(runner._merge_carried_obligation([active], order, stage), [order])
+        self.assertEqual(active, original)
+        for key, value in [("topic_ids", ["foreign"]), ("work_kind", "calculation"),
+                           ("objective", "Different claim"), ("attempt_lineage", {})]:
+            with self.subTest(key=key), self.assertRaises(StateError):
+                runner._merge_carried_obligation([{**active, key: value}], order, stage)
+        for key in ("topic_ids", "work_kind"):
+            altered = deepcopy(order)
+            altered["attempt_lineage"]["deferred_obligation"].pop(key)
+            missing = {field: deepcopy(value) for field, value in altered.items()
+                       if field not in {"topic_ids", "work_kind"}}
+            with self.subTest(missing_proof=key), self.assertRaises(StateError):
+                runner._merge_carried_obligation([missing], altered, stage)
+
     def test_development_stage_quota_retains_usage_and_provider_limits(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path)))
@@ -178,7 +280,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                     else:
                         panel.assert_not_called()
 
-    def _owned_held_topic(self, root, *, include_experiment=True):
+    def _owned_held_topic(self, root, *, include_experiment=True, active_role_ids=None):
         workflow = self._workflow(root)
         workflow["time_policy"]["hard_seconds"] = 120
         workflow["retry_policy"] = {"mode": "bounded", "max_attempts": 1, "backoff_seconds": 0}
@@ -211,7 +313,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                      "project_dir": str(topic_dir), "model_budget_cycle": 0})
         plan = runner.departments.begin_stage("topic", "topic_discovery", attempt_number=1,
             input_ref={"kind": "composer_stage_task", "ref": "topic-stage", "digest": "a" * 64},
-            deadline_seconds=60, active_role_ids=["frontier-scout"])
+            deadline_seconds=60, active_role_ids=active_role_ids if active_role_ids is not None else ["frontier-scout"])
         runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "running",
             "task_id": "topic-stage", "attempt_id": "topic-stage-attempt", "attempt_number": 1,
             "attempt_count": 1, "project_dir": str(topic_dir), **runner._stage_assignment_fields(plan)}
@@ -260,7 +362,50 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertNotIn("later experiment outputs", request["objective"])
             self.assertEqual(request["attempt_lineage"]["research_question"], runner.context["topic"]["topic"]["research_question"])
             completed = {"status": "completed", "gap_state": "eligible_for_experiment"}
-            self.assertEqual(runner._gate_free_topic_survey(completed, stage=source)["status"], "research_expansion_required")
+            held = runner._gate_free_topic_survey(completed, stage=source)
+            self.assertEqual(held["status"], "research_expansion_required")
+            repair = held["research_expansion_requests"][0]
+            self.assertEqual(repair["kind"], "topic_refinement")
+            self.assertEqual(repair["target_stage_id"], topic_stage["id"])
+            self.assertEqual(repair["attempt_lineage"], request["attempt_lineage"])
+            self.assertEqual(repair["supersedes_request_id"], request["id"])
+            self.assertFalse(runner._is_topic_pivot_request(repair))
+            self.assertEqual(runner._autonomous_recovery_request(source["id"],
+                {**held, "kind": "survey", "status": "review_rejected"}), repair)
+            runner.active_research_requests = [repair]
+            self.assertNotIn(request["id"], [item["id"] for item in runner._requests_for_stage(source)])
+            for key, value in [("topic_id", "foreign"), ("topic_cycle", 999),
+                               ("owner", "strategy.interpretation"), ("attempt_lineage", {}),
+                               ("target_stage_kind", "survey"), ("source_stage_id", "foreign")]:
+                runner.active_research_requests = [{**deepcopy(repair), key: value}]
+                with self.subTest(superseding_binding=key), self.assertRaises(StateError):
+                    runner._requests_for_stage(source)
+            runner.active_research_requests = [repair]
+            refinement = runner._topic_refinement_context(topic_stage)
+            owned = refinement["review_owner_evidence"]
+            self.assertEqual(owned["topic"], runner.context["topic"]["topic"])
+            self.assertEqual(owned["review"]["required_revisions"], request["attempt_lineage"]["required_revisions"])
+            from scisaurus.runtime.topic_discovery import _topic_prompt_refinement_projection
+            self.assertEqual(_topic_prompt_refinement_projection(refinement)["review_owner_evidence"], owned)
+            self.assertIsNone(refinement["salvage_plan"])
+            self.assertEqual(refinement["cycle"], runner._current_topic_identity()["topic_cycle"])
+            self.assertEqual(refinement["repair_cycle"], runner.continuation_cycles)
+            runner._validate_refined_topic_result({"topic": deepcopy(owned["topic"])}, refinement)
+            changed_question = deepcopy(owned["topic"])
+            changed_question["research_question"] = "Another question"
+            with self.assertRaisesRegex(ValidationError, "research identity"):
+                runner._validate_refined_topic_result({"topic": changed_question}, refinement)
+            changed_review = deepcopy(repair)
+            changed_review["attempt_lineage"]["required_revisions"] = ["Unsupported change"]
+            runner.active_research_requests = [changed_review]
+            with self.assertRaisesRegex(StateError, "owned topic review"):
+                runner._topic_refinement_context(topic_stage)
+            runner.active_research_requests = [repair]
+            altered = deepcopy(request)
+            altered["attempt_lineage"]["topic_sha256"] = "0" * 64
+            with self.assertRaisesRegex(StateError, "immutable review"):
+                runner._topic_review_owner_repair(source, completed, altered)
+            runner.active_research_requests = []
             limited = {**completed, "follow_up_result": {"orders": [{"id": request["id"], "status": "limited"}]}}
             with patch.object(runner, "_survey_work_order_was_fulfilled", return_value=True):
                 self.assertFalse(runner._topic_review_obligation_is_closed(source, limited, request))
@@ -283,6 +428,39 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.context["topic"] = forged
             with self.assertRaisesRegex(StateError, "scientific input"):
                 runner._topic_review_obligation(source)
+
+    def test_definition_repair_preserves_survey_ledger_during_continuation(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, topic_stage, _ = self._owned_held_topic(Path(path))
+            source = runner.workflow["stages"][1]
+            obligation = runner._topic_review_obligation(source)
+            survey_context = {"status": "review_rejected", "kind": "survey", "survey_ref": "current-survey"}
+            runner.context[source["id"]] = deepcopy(survey_context)
+            repair = runner._topic_review_owner_repair(source, survey_context, obligation)
+            deferred = {"id": "separate-evidence", "kind": "literature_expansion"}
+            expanded = {"status": "research_expansion_required", "survey_ref": "current-survey",
+                        "research_requests": [deferred], "research_expansion_requests": [deferred]}
+            routed = runner._gate_free_topic_survey(expanded, stage=source)
+            for key in ("research_requests", "research_expansion_requests"):
+                self.assertEqual(routed[key][0], deferred)
+                self.assertEqual(routed[key][1]["recovery_mode"], "authored_definition_repair")
+                self.assertEqual(routed[key][1]["supersedes_request_id"], obligation["id"])
+            self.assertNotIn("topic_admission", routed)
+            runner.active_research_requests = [obligation]
+            by_id = {item["id"]: item for item in runner.workflow["stages"]}
+            with patch.object(runner, "_continuation_requests", return_value=[repair]), \
+                 patch.object(runner, "_checkpoint"), \
+                 patch.object(runner, "_research_request_was_admitted", return_value=True):
+                self.assertTrue(runner._begin_continuation({source["id"]}, by_id))
+            self.assertEqual(runner.active_research_requests, [repair])
+            self.assertEqual(runner.context[source["id"]], survey_context)
+            self.assertNotEqual(runner.stage_records.get(source["id"], {}).get("lineage_state"), "awaiting_topic_admission")
+            refinement = runner._topic_refinement_context(topic_stage)
+            self.assertEqual(refinement["cycle"], runner._current_topic_identity()["topic_cycle"])
+            retained = Path(source["project_dir"]) / "retained"
+            with patch.object(runner, "_latest_resumable_survey_project", return_value=retained) as resume:
+                self.assertEqual(runner._stage_for_cycle(source)["project_dir"], str(retained))
+                resume.assert_called_once_with(source)
 
     def test_runtime_binding_preserves_owned_topic_and_obligation_identity(self):
         with tempfile.TemporaryDirectory() as path:
@@ -758,6 +936,47 @@ class ComposerWorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(StateError, 'exact current completed producer'):
                 runner._stage_review_revalidation_input(stage)
 
+    def test_failed_new_producer_does_not_revalidate_a_historical_paid_review(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, run = self._owned_held_survey_review(Path(path))
+            prior = deepcopy(runner.context[stage['id']]['specialist_verifier'])
+            task = runner.tasks.create('new-producer', 'production', {}, 'command.composer')
+            runner.stage_records[stage['id']].update(status='blocked', task_id=task['task_id'],
+                assignment_plan_ref='artifact:command/new-producer-plan@1', attempt_number=2)
+            with patch.object(runner, '_survey_review_revalidation_producer',
+                              side_effect=AssertionError('historical reviewer selected for a newer producer')):
+                self.assertIsNone(runner._stage_review_revalidation_input(stage))
+            self.assertEqual(runner.context[stage['id']]['specialist_verifier'], prior)
+
+    def test_historical_review_requires_exact_controller_admission_for_current_review_task(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, run = self._owned_held_survey_review(Path(path))
+            verifier = runner.context[stage['id']]['specialist_verifier']
+            body = {'schema_version': 'stage-review-revalidation-1', 'stage_id': stage['id'],
+                'producer': {'prior_assignment_plan_ref': verifier['assignment_plan_ref'],
+                             'prior_verifier_execution_ref': verifier['artifact_ref']}}
+            cases = [('valid', body, 'command.composer', stage['id']),
+                ('foreign-plan', {**body, 'producer': {**body['producer'], 'prior_assignment_plan_ref': 'foreign'}},
+                 'command.composer', stage['id']),
+                ('foreign-task', body, 'command.composer', 'topic'),
+                ('foreign-author', body, 'command.controller', stage['id'])]
+            for label, admission_body, author, task_stage in cases:
+                with self.subTest(label=label):
+                    admission = runner._publish('command/composer/stage-review-revalidations/' + label,
+                                               'decision_note', admission_body, author)
+                    task = runner.tasks.create(label, 'review',
+                        {'stage_id': task_stage, 'admission_ref': admission['artifact_ref']}, 'command.composer')
+                    runner.stage_records[stage['id']].update(status='blocked', task_id=task['task_id'],
+                        assignment_plan_ref='artifact:command/new-review-plan@1',
+                        review_revalidation_admission_ref=admission['artifact_ref'], attempt_number=2)
+                    if label == 'valid':
+                        with patch.object(runner, '_survey_references_are_current', return_value=True), \
+                             patch.object(runner, '_survey_follow_up_was_replayed', return_value=True):
+                            self.assertIsNotNone(runner._stage_review_revalidation_input(stage))
+                    else:
+                        with self.assertRaisesRegex(StateError, 'current revalidation admission'):
+                            runner._stage_review_revalidation_input(stage)
+
     def test_survey_review_revalidation_resumes_only_paid_review_and_settles_boundary(self):
         with tempfile.TemporaryDirectory() as path:
             runner, stage, native = self._owned_held_survey_review(Path(path))
@@ -1008,12 +1227,133 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(resumed._read_verified_artifact_json(old["artifact_ref"])[2]["report"]["response"]["decision"], "hold")
             new_execution = resumed._read_verified_artifact_json(current["specialist_verifier"]["artifact_ref"])[2]
             for report, peer in zip(new_execution["specialist_reports"], peers):
-                self.assertEqual({key: value for key, value in report.items() if key != "input_scope"}, peer)
+                self.assertEqual({key: value for key, value in report.items() if key != "input_scope"},
+                                 {key: value for key, value in peer.items() if key != "input_scope"})
+                for key, value in peer.get("input_scope", {}).items():
+                    self.assertEqual(report["input_scope"][key], value)
                 self.assertEqual(report["input_scope"]["contract_state"], "retained_original")
                 self.assertEqual(report["input_scope"]["execution_ref"], peer["artifact_ref"])
             self.assertEqual(new_execution["chief_result"]["topic"], current["topic"])
             self.assertEqual(current["review_revalidation"]["producer_calls_replayed"], 0)
             self.assertIsNone(resumed._topic_review_obligation(resumed.workflow["stages"][1]))
+
+    def test_topic_review_revalidation_refreshes_only_changed_exact_peer_projection(self):
+        from scisaurus.runtime.specialists import build_specialist_prompt
+        def clipped(assignment, packet):
+            prompt = json.loads(build_specialist_prompt(assignment, packet))
+            if assignment.get("role_id") == "topic-maturity-reviewer":
+                prompt["projected_input"]["candidate_topics"][0]["why_promising"] = "clipped"
+            return json.dumps(prompt)
+        with tempfile.TemporaryDirectory() as path:
+            with patch("scisaurus.runtime.specialists.build_specialist_prompt", side_effect=clipped), \
+                 patch("scisaurus.runtime.composer.build_specialist_prompt", side_effect=clipped):
+                runner, stage, _ = self._owned_held_topic(Path(path),
+                    active_role_ids=["academic-scout", "topic-maturity-reviewer"])
+            peers = deepcopy(runner.context["topic"]["specialist_reports"])
+            before = deepcopy(runner.usage); deadline = runner.deadline_epoch
+            output = Path(runner.context["topic"]["output_path"]).read_bytes()
+            retained = runner._stage_review_revalidation_input(stage)
+            self.assertEqual(set(retained["peer_projection_changes"]), {"topic-maturity-reviewer"})
+            self.assertEqual(set(retained["peer_projection_changes"]["topic-maturity-reviewer"]), {"candidate_topics"})
+            workflow = deepcopy(runner.workflow)
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            runner = ComposerRunner(workflow, resume=True); self.addCleanup(runner.close)
+            with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                 patch.object(runner, "_run_stage", side_effect=AssertionError("must not repeat production")):
+                current = runner.revalidate_topic_review("topic")
+                self.assertIsNone(runner.revalidate_topic_review("topic"))
+            self.assertEqual(runner.usage["model_calls"], before["model_calls"] + 2)
+            self.assertEqual(runner.deadline_epoch, deadline)
+            self.assertEqual(Path(current["output_path"]).read_bytes(), output)
+            old = {peer["role_id"]: peer for peer in peers}
+            new = {peer["role_id"]: peer for peer in current["specialist_reports"]}
+            self.assertEqual(new["academic-scout"]["artifact_ref"], old["academic-scout"]["artifact_ref"])
+            self.assertNotEqual(new["topic-maturity-reviewer"]["artifact_ref"], old["topic-maturity-reviewer"]["artifact_ref"])
+            self.assertEqual(current["review_revalidation"]["peer_calls_replayed"], 1)
+            self.assertEqual(runner.stage_records["topic"]["usage"]["model_calls"], 2)
+            for peer in peers:
+                self.assertEqual(runner._read_verified_artifact_json(peer["artifact_ref"])[2]["report"]["response"], peer["response"])
+            contract = runner._stage_acceptance_contract
+            def changed_contract(*args, **kwargs):
+                value = contract(*args, **kwargs); value["current_requirements"].append("Reassess exact ownership.")
+                return value
+            with patch.object(runner, "_stage_acceptance_contract", side_effect=changed_contract), \
+                 patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient):
+                again = runner.revalidate_topic_review("topic")
+            self.assertEqual(again["review_revalidation"]["peer_calls_replayed"], 0)
+
+    def test_changed_peer_refresh_failure_preserves_paid_history_without_verifier_fallback(self):
+        from scisaurus.runtime.specialists import build_specialist_prompt
+        def clipped(assignment, packet):
+            prompt = json.loads(build_specialist_prompt(assignment, packet))
+            if assignment.get("role_id") == "topic-maturity-reviewer":
+                prompt["projected_input"]["candidate_topics"][0]["why_promising"] = "clipped"
+            return json.dumps(prompt)
+        class InvalidPeer(_ComposerTestSpecialistClient):
+            def complete(self, *, system, prompt, images=None):
+                return ModelResult(text="{", model="test", usage={"model_calls": 1, "input_tokens": 1, "output_tokens": 1},
+                    elapsed_seconds=.001, finish_reason="stop")
+        with tempfile.TemporaryDirectory() as path:
+            with patch("scisaurus.runtime.specialists.build_specialist_prompt", side_effect=clipped), \
+                 patch("scisaurus.runtime.composer.build_specialist_prompt", side_effect=clipped):
+                runner, stage, _ = self._owned_held_topic(Path(path), active_role_ids=["topic-maturity-reviewer"])
+            peers = deepcopy(runner.context["topic"]["specialist_reports"])
+            before = runner.usage["model_calls"]; workflow = deepcopy(runner.workflow)
+            runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+            runner = ComposerRunner(workflow, resume=True); self.addCleanup(runner.close)
+            with patch("scisaurus.runtime.specialists.ModelClient", InvalidPeer), \
+                 patch.object(runner, "_run_specialist_verifier", side_effect=AssertionError("must not use stale peer")):
+                with self.assertRaisesRegex(ModelWorkBlocked, "complete independent review"):
+                    runner.revalidate_topic_review("topic")
+            self.assertEqual(runner.status, "paused")
+            self.assertEqual(runner.stage_records["topic"]["status"], "review_revalidation_failed")
+            self.assertEqual(runner.context["topic"]["specialist_reports"], peers)
+            self.assertEqual(runner.usage["model_calls"], before + 2)
+            attempt = runner.tasks.get_attempt(runner.stage_records["topic"]["attempt_id"])
+            self.assertEqual(attempt["usage"]["actual"]["model_calls"], 2)
+
+    def test_interrupted_projection_refresh_reuses_paid_peer_and_verifier(self):
+        from scisaurus.runtime.specialists import build_specialist_prompt
+        def clipped(assignment, packet):
+            prompt = json.loads(build_specialist_prompt(assignment, packet))
+            if assignment.get("role_id") == "topic-maturity-reviewer":
+                prompt["projected_input"]["candidate_topics"][0]["why_promising"] = "clipped"
+            return json.dumps(prompt)
+        for boundary in (1, 2):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as path:
+                with patch("scisaurus.runtime.specialists.build_specialist_prompt", side_effect=clipped), \
+                     patch("scisaurus.runtime.composer.build_specialist_prompt", side_effect=clipped):
+                    runner, stage, _ = self._owned_held_topic(Path(path), include_experiment=False,
+                        active_role_ids=["academic-scout", "topic-maturity-reviewer"])
+                before = runner.usage["model_calls"]; workflow = deepcopy(runner.workflow); deadline = runner.deadline_epoch
+                runner.status = "paused"; runner._checkpoint("paused", force=True); runner.close()
+                first = ComposerRunner(workflow, resume=True); self.addCleanup(first.close)
+                settle = first._settle_stage_specialist_payment; payments = []
+                def interrupt(*args):
+                    paid = settle(*args); payments.append(args)
+                    if len(payments) == boundary:
+                        raise KeyboardInterrupt("paid review boundary")
+                    return paid
+                with patch("scisaurus.runtime.specialists.ModelClient", _ComposerTestSpecialistClient), \
+                     patch.object(first, "_settle_stage_specialist_payment", side_effect=interrupt):
+                    stopped = first.run()
+                self.assertEqual(stopped["status"], "paused")
+                self.assertEqual(stopped["usage"]["model_calls"], before + boundary)
+                second = ComposerRunner(workflow, resume=True); self.addCleanup(second.close)
+                calls = []
+                class RemainingVerifier(_ComposerTestSpecialistClient):
+                    def complete(self, *, system, prompt, images=None):
+                        calls.append(json.loads(prompt))
+                        if boundary == 2 or "verifier_contract" not in calls[-1]:
+                            raise AssertionError("paid review must be reused")
+                        return super().complete(system=system, prompt=prompt, images=images)
+                with patch("scisaurus.runtime.specialists.ModelClient", RemainingVerifier), \
+                     patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner.run", side_effect=AssertionError("paid source must be reused")):
+                    current = second.revalidate_topic_review("topic")
+                self.assertEqual(current["status"], "completed")
+                self.assertEqual(len(calls), 2 - boundary)
+                self.assertEqual(second.usage["model_calls"], before + 2)
+                self.assertEqual(second.deadline_epoch, deadline)
 
     def test_repeated_topic_review_revalidation_preserves_original_peer_payment_plan(self):
         with tempfile.TemporaryDirectory() as path:
@@ -8178,6 +8518,69 @@ class ComposerWorkflowTests(unittest.TestCase):
                              {"topic", "survey", "experiment"})
             runner.close()
 
+    def test_concept_contract_transition_preserves_accounting_and_reopens_only_once(self):
+        from scisaurus.tests.test_material_development import brief
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            (root / "topic").mkdir()
+            descriptor = root / "topic.json"
+            descriptor.write_text(json.dumps({"intake_mode": "concept"}))
+            workflow["stages"].insert(0, {"id": "topic", "kind": "topic_discovery",
+                "config_path": str(descriptor), "project_dir": str(root / "topic"),
+                "depends_on": [], "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None})
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            with closing(ComposerRunner(workflow)) as runner:
+                runner.context = {"topic": {"kind": "topic_discovery", "topic": {"id": "old"}},
+                                  "survey": {"kind": "survey", "error": "retained failure"}}
+                attempts = [{"attempt_number": 8, "state": "completed"}]
+                runner.stage_records["topic"] = {"kind": "topic_discovery", "status": "completed",
+                                                 "attempt_count": 8, "attempts": deepcopy(attempts), "project_dir": "/old/completed/topic"}
+                runner.usage["model_calls"] = 156
+                deadline = runner.deadline_epoch
+                runner._reconcile_concept_intake()
+                self.assertEqual(runner.usage["model_calls"], 156)
+                self.assertEqual(runner.deadline_epoch, deadline)
+                self.assertEqual(runner.stage_records["topic"]["attempts"], attempts)
+                self.assertEqual(runner.stage_records["topic"]["status"], "retrying")
+                self.assertNotIn("project_dir", runner.stage_records["topic"])
+                self.assertIsNone(runner._recover_interrupted_topic_result(workflow["stages"][0], runner.stage_records["topic"]))
+                self.assertEqual(runner.reopened_stage_ids, {"topic", "survey", "experiment"})
+                receipt = runner.store.get(runner.context["topic"]["concept_intake_transition_ref"])
+                body = json.loads(runner.store.read_body(receipt["body_hash"]))
+                self.assertEqual(body["prior_contexts"]["survey"]["error"], "retained failure")
+                cycle = runner.continuation_cycles
+                runner._reconcile_concept_intake()
+                self.assertEqual(runner.continuation_cycles, cycle)
+                runner.context["topic"]["topic"] = {"id": "new", "design_brief": brief()}
+                runner._reconcile_concept_intake()
+                self.assertEqual(runner.continuation_cycles, cycle)
+
+    def test_concept_brief_follows_upstream_topic_into_survey(self):
+        from scisaurus.tests.test_material_development import brief
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            (root / "topic").mkdir()
+            workflow["stages"].insert(0, {"id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"], "project_dir": str(root / "topic"),
+                "depends_on": [], "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None})
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            with closing(ComposerRunner(workflow)) as runner:
+                runner.context = {"unrelated": {"kind": "topic_discovery", "topic": {"research_question": "Wrong?"}},
+                    "topic": {"kind": "topic_discovery", "intake_mode": "concept",
+                        "topic": {"id": "concept", "research_question": "Does the design isolate vibration?",
+                                  "design_brief": brief(), "search_queries": ["elastic lattice isolation"]}}}
+                from scisaurus.tests.test_survey import survey_config
+                config = survey_config("http://127.0.0.1:1")
+                result = runner._apply_topic_to_survey_config(workflow["stages"][1], config)
+                self.assertEqual(result["survey"]["design_brief"], brief())
+                self.assertEqual(result["survey"]["question"], "Does the design isolate vibration?")
+                from scisaurus.runtime.survey_config import validate_survey_config
+                validate_survey_config(result)
+
     def test_topic_pivot_archives_and_clears_downstream_live_lineage(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -8526,6 +8929,104 @@ class ComposerWorkflowTests(unittest.TestCase):
             runner.continuation_cycles = 8
             self.assertEqual(runner._continuation_requests(), [])
             runner.close()
+
+    def test_concept_development_scope_preserves_pilot_and_implementation_gates(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path); workflow = self._workflow(root)
+            topic = {**workflow["stages"][0], "id": "topic", "kind": "topic_discovery"}
+            config = root/"topic.json"; config.write_text(json.dumps({"intake_mode": "concept"}))
+            topic["config_path"] = str(config); workflow["stages"].insert(0, topic)
+            workflow["progression_policy"] = "forward_first"
+            runner = ComposerRunner(workflow); self.addCleanup(runner.close)
+            stage = next(item for item in runner.workflow["stages"] if item["id"] == "survey")
+            scope = runner._stage_acceptance_contract(stage)
+            self.assertIn("exploratory pilot", scope["acceptance_target"])
+            self.assertIn("exact assigned obligations", scope["development_scope"]["blocking_requirements"])
+            self.assertIn("unverified hypotheses", scope["development_scope"]["claim_boundary"])
+            self.assertIn("DSH", scope["development_scope"]["delegation"])
+            runner.workflow["progression_policy"] = "evidence_first"
+            self.assertNotIn("development_scope", runner._stage_acceptance_contract(stage))
+
+    def test_definition_repair_identity_binds_owned_scientific_input(self):
+        order = {"kind": "topic_refinement", "owner": "research.intelligence",
+            "recovery_mode": "authored_definition_repair", "source_stage_id": "survey",
+            "target_stage_id": "topic", "target_stage_kind": "topic_discovery",
+            "objective": "Repair the authored definition", "success_condition": "Owned fresh review",
+            "evidence_needed": "Current source and verdict", "source_survey_ref": "artifact:kb/surveys/current@12",
+            "source_assessment_ref": "artifact:kb/gap-assessments/current@4",
+            "attempt_lineage": {"topic_sha256": "a"*64, "verifier_execution_sha256": "b"*64,
+                "blocking_findings": ["Current dimensional inconsistency"],
+                "required_revisions": ["Reconcile the declared bound"]}}
+        signature = ComposerRunner._research_request_signature(order)
+        self.assertEqual(signature, ComposerRunner._research_request_signature({**order, "id": "another-wrapper"}))
+        for key, value in (("topic_sha256", "c"*64), ("verifier_execution_sha256", "d"*64),
+                ("blocking_findings", ["A different finding"]), ("required_revisions", ["Different repair"])):
+            altered = deepcopy(order); altered["attempt_lineage"][key] = value
+            self.assertNotEqual(signature, ComposerRunner._research_request_signature(altered))
+
+    def test_response_contract_completion_preserves_scientific_hold_and_evidence_debt(self):
+        for outcome in ("research_expansion_required", "review_rejected"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as path:
+                runner = ComposerRunner(self._workflow(Path(path)))
+                self.addCleanup(runner.close)
+                stage = runner.workflow["stages"][0]
+                prior = runner._publish("command/composer/failure-recovery/survey/attempt-1", "report", {
+                    "schema_version": "composer-failure-recovery-1", "stage_id": "survey", "stage_kind": "survey",
+                    "failure_class": "model_contract", "input_sha256": "a"*64, "attempt_number": 1}, "command.composer")
+                request = {"id": "format-repair", "kind": "recovery", "owner": "research.intelligence",
+                    "objective": "Repair response format", "why": "Invalid response schema",
+                    "success_condition": "A valid response", "evidence_needed": "Original error",
+                    "source_stage_id": "survey", "target_stage_id": "survey", "target_stage_kind": "survey",
+                    "failure_dossier_ref": prior["artifact_ref"], "failure_input_sha256": "a"*64,
+                    "recovery_mode": "format_repair_then_rerun"}
+                debt = {"id": "source-debt", "kind": "literature_expansion", "owner": "research.intelligence",
+                    "objective": "Capture the missing source", "why": "Incomplete evidence",
+                    "success_condition": "Captured evidence", "evidence_needed": "Exact source",
+                    "source_stage_id": "survey", "target_stage_id": "survey", "target_stage_kind": "survey"}
+                runner.feedback.append({"action": "continue_research", "cycle": 2, "research_requests": [request]})
+                runner.active_research_requests = [request, debt]
+                runner.departments.activate_work_orders(runner.active_research_requests)
+                runner.tasks.create("owned-return", "production", {}, "command.composer")
+                runner.tasks.transition("owned-return", "queued", "command.composer")
+                runner.tasks.start_attempt("owned-return", "owned-attempt", owner="command.composer", lease_ttl_seconds=60)
+                runner.tasks.finish_attempt("owned-attempt", "succeeded", usage={})
+                assignment = runner.departments.begin_stage("survey", "survey", attempt_number=2,
+                    input_ref={"kind": "composer_stage_task", "ref": "owned-return", "digest": "f"*64},
+                    deadline_seconds=10, active_role_ids=[])
+                row = next(item for item in runner.departments._assignment_task_rows(stage_id="survey", attempt_number=2)
+                    if item["assigned_role"] == assignment["verifier_agent"])
+                execution = {"schema_version": "specialist-verifier-execution-1", "project_id": runner.workflow["project_id"],
+                    "stage_id": "survey", "stage_kind": "survey", "attempt_number": 2,
+                    **{key: row[key] for key in ("task_id", "assignment_id", "assigned_role", "role_id")},
+                    "chief_result": {"status": outcome, "error": None},
+                    "report": {"status": "succeeded", "usage": {}, "response": {"decision": "hold"}}}
+                runner._publish(row["assignment_logical_id"]+"/execution", "report", execution, row["assigned_role"])
+                runner.departments.finish_stage("survey", "survey", attempt_number=2, outcome=outcome,
+                    verifier_result=execution["report"])
+                runner.stage_records["survey"] = {"status": outcome, "attempts": [{
+                    "attempt_number": 2, "attempt_id": "owned-attempt", "state": "succeeded", "cycle": 2}]}
+                runner.context["survey"] = {"status": outcome, "preserve_work_orders": True,
+                    "research_requests": [request, debt], "gap_state": "insufficient_evidence"}
+                runner.format_recovery_ledger["original"] = {"request_ids": [request["id"]], "status": "dispatched"}
+                usage, deadline = deepcopy(runner.usage), runner.deadline_epoch
+                for key, value in (("failure_input_sha256", "b"*64), ("target_stage_kind", "experiment")):
+                    runner.active_research_requests = [{**request, key: value}, debt]
+                    self.assertEqual(runner._reconcile_completed_response_recovery_orders(), [])
+                runner.active_research_requests = [request, debt]
+                runner.stage_records["survey"]["attempts"][0]["cycle"] = 3
+                self.assertEqual(runner._reconcile_completed_response_recovery_orders(), [])
+                runner.stage_records["survey"]["attempts"][0]["cycle"] = 2
+                closed = runner._reconcile_completed_response_recovery_orders()
+                self.assertEqual(len(closed), 1)
+                self.assertEqual(closed[0]["scientific_outcome"], outcome)
+                self.assertEqual(runner.active_research_requests, [debt])
+                self.assertEqual(runner.context["survey"]["research_requests"], [debt])
+                self.assertEqual(runner.context["survey"]["status"], outcome)
+                self.assertEqual(runner.context["survey"]["gap_state"], "insufficient_evidence")
+                self.assertTrue(runner.context["survey"]["preserve_work_orders"])
+                self.assertEqual(runner.format_recovery_ledger["original"]["status"], "completed")
+                self.assertEqual(runner._reconcile_completed_response_recovery_orders(), [])
+                self.assertEqual((runner.usage, runner.deadline_epoch), (usage, deadline))
 
     def test_research_request_signature_ignores_volatile_attempt_provenance(self):
         first = {
@@ -11766,7 +12267,7 @@ class ComposerWorkflowTests(unittest.TestCase):
             with patch.object(runner, "_survey_references_are_current", return_value=True):
                 self.assertEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
                 runner.active_research_requests = [{**order, "target_stage_id": "experiment", "kind": "analysis_repair", "owner": "methods.validation"}]
-                self.assertNotEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
+                self.assertEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
                 runner.active_research_requests = [order]
                 Path(stage["config_path"]).write_bytes(canonical_bytes({**stored, "survey": {"question": "Other question"}}))
                 self.assertNotEqual(runner._stage_for_cycle(stage)["project_dir"], str(project))
@@ -11790,6 +12291,18 @@ class ComposerWorkflowTests(unittest.TestCase):
             self.assertEqual(captured["options"]["resume_policy"]["source_changes"]["reopen_scopes"], ["follow_up"])
             self.assertEqual(runner.deadline_epoch, deadline)
             self.assertEqual(runner._durable_stage_config(project), stored)
+            runner.active_research_requests = []
+            with patch("scisaurus.runtime.survey.SurveyRunner", RetainedSurvey), \
+                    patch.object(runner, "_stage_remaining", return_value=7), \
+                    patch.object(runner, "_survey_references_are_current", return_value=True), \
+                    patch.object(runner, "_stage_model_delegation", return_value=None), \
+                    patch.object(runner, "_gate_free_topic_survey", side_effect=lambda value, **kwargs: value):
+                runner._produce_stage(stage)
+            self.assertEqual(captured["config"], stored)
+            self.assertEqual(captured["options"]["work_orders"], [])
+            self.assertEqual(captured["options"]["resume_policy"]["source_changes"]["reopen_scopes"],
+                             ["integrated_review", "gap_assessment"])
+            runner.active_research_requests = [order]
             older = (Path(path) / "older-partial").resolve()
             old_control = ControlStore(older); old_store = ArtifactStore(old_control)
             old_store.init_project(principal_note="Earlier source ledger")
@@ -13713,6 +14226,103 @@ class ComposerWorkflowTests(unittest.TestCase):
                 ))
             finally:
                 runner.close()
+
+    def test_concept_intake_does_not_add_maturity_review_for_paper_workflow(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            model = root / "model.json"
+            model.write_text("{}")
+            config = {"schema_version": "topic-discovery-config-1", "intake_mode": "concept",
+                      "candidate_count": 1, "max_attempts": 2, "maturity_review_rounds": 0,
+                      "model_config_path": str(model), "output_path": str(root / "topic-output.json")}
+            config_path = root / "topic.json"
+            config_path.write_text(json.dumps(config))
+            stage = {"id": "topic", "kind": "topic_discovery", "config_path": str(config_path),
+                     "project_dir": str(root / "topic"), "depends_on": [], "estimate_seconds": 1,
+                     "bindings": [], "deadline_seconds": 10, "reuse_completed": False,
+                     "reuse_output_path": None}
+            runner = ComposerRunner(workflow)
+            try:
+                runner.workflow["stages"][0]["kind"] = "paper"
+                with patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as producer:
+                    producer.return_value.run.side_effect = ValidationError("offline stop after dispatch")
+                    with self.assertRaises(ValidationError):
+                        runner._run_stage(stage)
+                kwargs = producer.return_value.run.call_args.kwargs
+                self.assertEqual(kwargs["intake_mode"], "concept")
+                self.assertEqual(kwargs["candidate_count"], 1)
+                self.assertEqual(kwargs["maturity_review_rounds"], 0)
+            finally:
+                runner.close()
+
+    def test_concept_materializer_preserves_producer_and_owns_internal_failure(self):
+        from scisaurus.tests.test_material_development import brief
+        for fail_materializer in [False, True]:
+            with self.subTest(fail=fail_materializer), tempfile.TemporaryDirectory() as path:
+                root = Path(path)
+                workflow = self._workflow(root)
+                model = root / "model.json"; model.write_text("{}")
+                output = root / "concept.json"
+                config = {"schema_version": "topic-discovery-config-1", "intake_mode": "concept",
+                          "candidate_count": 1, "max_attempts": 2, "maturity_review_rounds": 0,
+                          "model_config_path": str(model), "output_path": str(output)}
+                config_path = root / "topic.json"; config_path.write_text(json.dumps(config))
+                stage = {"id": "topic", "kind": "topic_discovery", "config_path": str(config_path),
+                         "project_dir": str(root / "topic"), "depends_on": [], "estimate_seconds": 1,
+                         "bindings": [], "deadline_seconds": 10, "reuse_completed": False,
+                         "reuse_output_path": None}
+                result = topic_package()
+                result["candidates"] = [result["candidates"][1]]
+                result["candidates"][0]["design_brief"] = brief()
+                result.update({"intake_mode": "concept", "status": "completed",
+                    "topic": deepcopy(result["candidates"][0]),
+                    "usage": {"model_calls": 1, "input_tokens": 100, "output_tokens": 50}})
+                runner = ComposerRunner(workflow)
+                try:
+                    with patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as producer, \
+                            patch.object(runner, "_runtime_context", return_value={}):
+                        producer.return_value.run.return_value = deepcopy(result)
+                        if fail_materializer:
+                            with patch("scisaurus.runtime.research_program.build_research_program",
+                                       side_effect=ValidationError("invalid controller projection")):
+                                with self.assertRaises(ValidationError) as caught:
+                                    runner._run_stage(stage)
+                            error = caught.exception
+                            self.assertEqual(error.failure_class, "harness_bug")
+                            self.assertEqual(error.stage_result["topic"]["design_brief"], brief())
+                            self.assertEqual(error.usage, result["usage"])
+                            self.assertFalse(runner._should_run_failure_specialist_review(error, stage))
+                        else:
+                            completed = runner._run_stage(stage)
+                            self.assertEqual(len(completed["research_program"]["branches"]), 1)
+                        saved = json.loads(output.read_text())
+                        self.assertEqual(saved["topic"]["design_brief"], brief())
+                        self.assertEqual(saved["usage"], result["usage"])
+                        producer.return_value.run.assert_called_once()
+                finally:
+                    runner.close()
+
+    def test_unbound_topic_refinement_is_archived_without_research_mutation(self):
+        with tempfile.TemporaryDirectory() as path:
+            runner, stage, _ = self._owned_held_topic(Path(path))
+            runner.context["topic"] = {"status": "blocked", "specialist_reports": [{"response": "empty candidate"}]}
+            runner.active_research_requests = [
+                {"id": "unbound", "kind": "topic_refinement", "target_stage_id": "topic", "source_stage_id": "topic"},
+                {"id": "retained", "kind": "evidence", "target_stage_id": "survey", "source_stage_id": "survey"}]
+            before_usage = deepcopy(runner.usage)
+            before_deadline = runner.deadline_epoch
+            runner._reconcile_unbound_topic_refinement()
+            self.assertEqual([order["id"] for order in runner.active_research_requests], ["retained"])
+            self.assertEqual(runner.usage, before_usage)
+            self.assertEqual(runner.deadline_epoch, before_deadline)
+            self.assertNotIn("topic", runner.context["topic"])
+            receipt = runner.store.head("command/composer/unbound-topic-refinement/topic")
+            body = json.loads(runner.store.read_body(receipt["body_hash"]))
+            self.assertEqual(body["prior_context"]["specialist_reports"], [{"response": "empty candidate"}])
+            self.assertEqual(body["retired_orders"][0]["id"], "unbound")
+            runner._reconcile_unbound_topic_refinement()
+            self.assertEqual(runner.store.head("command/composer/unbound-topic-refinement/topic")["artifact_ref"], receipt["artifact_ref"])
 
     def test_unbudgeted_topic_contract_failure_keeps_typed_retry_metadata(self):
         with tempfile.TemporaryDirectory() as path:
@@ -17124,11 +17734,13 @@ class ComposerWorkflowTests(unittest.TestCase):
                 with self.assertRaises(SourceDataUnavailable):
                     runner._materialize_topic_capability(
                         empirical_result, stage_id="experiment")
-            runtime_context = runner._runtime_context(json.loads(model_path.read_text()))
+            with patch("importlib.util.find_spec", return_value=None):
+                runtime_context = runner._runtime_context(json.loads(model_path.read_text()))
             self.assertEqual(runtime_context["experiment_catalog"], [])
             self.assertEqual(len(runtime_context["fallback_experiment_catalog"]), 1)
             self.assertTrue(runtime_context["capability_foundry"]["enabled"])
-            self.assertTrue(runtime_context["python_packages"]["numpy"])
+            self.assertFalse(runtime_context["python_packages"]["numpy"])
+            self.assertEqual(runtime_context["research_feasibility"]["foundry_runtime_packages"], ["numpy"])
             self.assertEqual(
                 runtime_context["capability_foundry"]["runtime_packages"],
                 [{"name": "numpy", "version": "2.5.2"}],
@@ -22231,6 +22843,13 @@ class ComposerWorkflowTests(unittest.TestCase):
 
                 retained = ComposerRunner._recover_interrupted_topic_result(stage, record)
                 self.assertIsNotNone(retained)
+                raw_producer = deepcopy(result)
+                raw_producer.pop("research_program")
+                output.write_text(json.dumps(raw_producer))
+                raw_retained = ComposerRunner._recover_interrupted_topic_result(stage, record)
+                self.assertIsNotNone(raw_retained)
+                self.assertEqual(raw_retained["result"]["research_program"], result["research_program"])
+                output.write_text(json.dumps(result))
                 stage["_resume_topic_result"] = retained
                 runner._remaining = lambda: 10.0
                 with patch("scisaurus.runtime.topic_discovery.TopicDiscoveryRunner") as producer:

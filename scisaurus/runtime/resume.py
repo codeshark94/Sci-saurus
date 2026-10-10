@@ -12,6 +12,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.store import ArtifactStore
 from scisaurus.core.tasks import TaskManager
+from scisaurus.runtime.operation_adapters import ADAPTERS
 
 
 RESUME_SCOPES = frozenset({"operations", "retrieval", "mapping", "focused_review",
@@ -163,25 +164,44 @@ class ResumeController:
         if changed and source_policy["mode"] != "reopen":
             raise ValidationError("executed source changed; resume requires explicit affected scopes")
         unknown_rows = self.control._conn.execute(
-            "SELECT a.attempt_id, a.task_id, a.usage_json, r.reservation_id, r.window_id"
-            " FROM attempts a LEFT JOIN reservations r ON r.task_id=a.task_id AND r.state='reserved'"
+            "SELECT a.attempt_id, a.task_id, a.usage_json, t.payload_json AS task_payload_json, r.reservation_id, r.window_id"
+            " FROM attempts a JOIN tasks t ON t.task_id=a.task_id"
+            " LEFT JOIN reservations r ON r.task_id=a.task_id AND r.state='reserved'"
             " WHERE a.state='result_unknown' ORDER BY a.attempt_id"
         ).fetchall()
         if unknown_rows and policy["unknown_outcomes"]["mode"] != "charge_and_retry":
             raise ValidationError("unknown external outcomes require explicit conservative reconciliation")
-        reconciled = []
+        planned = []
         for row in unknown_rows:
             usage = dict(policy["unknown_outcomes"]["usage_per_attempt"])
+            operation = json.loads(row["task_payload_json"]).get("operation")
+            if operation != "model":
+                dimensions = {adapter.usage_dimension for adapter in ADAPTERS.values()
+                              if adapter.dispatch_kind == operation}
+                if len(dimensions) != 1:
+                    raise ValidationError("unknown operation cannot inherit a model-call reconciliation estimate")
+                dimension = dimensions.pop()
+                if "model_calls" in usage:
+                    usage[dimension] = max(usage.get(dimension, 0), usage.pop("model_calls"))
+                # Model token estimates describe inference, not a retrieval
+                # or program dispatch. Actual observations remain a floor.
+                for field in ("input_tokens", "output_tokens"):
+                    usage.pop(field, None)
             observed = json.loads(row["usage_json"]).get("observed", {})
             for key, amount in observed.items():
                 if (not isinstance(key, str) or type(amount) not in (int, float)
                         or not math.isfinite(amount) or amount < 0):
                     raise ValidationError("stored observed usage is invalid")
                 usage[key] = max(usage.get(key, 0), amount)
-            self.tasks.finish_attempt(row["attempt_id"], "failed", usage=usage)
+            planned.append((row, usage, operation))
+        reconciled = []
+        for row, usage, operation in planned:
+            self.tasks.finish_attempt(row["attempt_id"], "failed", usage=usage,
+                                      accounting="operation_scoped_conservative_reconciliation")
             if row["reservation_id"] is not None:
                 self.budget.settle(window_id=row["window_id"], reservation_id=row["reservation_id"], actual=usage)
             reconciled.append({"attempt_id": row["attempt_id"], "task_id": row["task_id"],
+                               "operation": operation,
                                "reservation_id": row["reservation_id"], "charged_usage": usage,
                                "disposition": "prior response discarded; a retry may duplicate provider cost"})
         serial = self.control._conn.execute(

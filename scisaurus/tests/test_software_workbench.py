@@ -411,6 +411,65 @@ class SoftwareWorkbenchTests(unittest.TestCase):
             failure = {"action":{"operation":operation,"arguments":{}},"outcome":"failed","result":{},"error":"missing prerequisite"}
             self.assertEqual(project_receipt(failure),failure)
 
+    def test_retained_results_require_exact_receipt_and_allow_reuse_metadata(self):
+        result = self.action("search_evidence", terms=["solver"])
+        self.workbench.validate_retained_results([result, {**deepcopy(result), "reused": True}])
+        for field, value in (("result", {"matches": ["fabricated"]}),
+                             ("outcome", "failed"), ("extra", "unbound annotation")):
+            changed = deepcopy(result)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValidationError, "exact receipt"):
+                self.workbench.validate_retained_results([changed])
+        receipt = Path(self.directory.name) / "receipts" / (result["receipt_ref"].split(":")[-1] + ".json")
+        receipt.write_text('{"outcome":"ok"}')
+        with self.assertRaisesRegex(ValidationError, "receipt hash changed"):
+            self.workbench.validate_retained_results([result])
+
+    def test_retained_run_rechecks_current_environment_and_run_state(self):
+        _, _, docs, installed = self.provision()
+        with patch("scisaurus.runtime.software_workbench.sandbox_status", return_value={"mode":"sandbox-exec"}):
+            result = self.action("run", environment_ref=installed["receipt_ref"], source='cat("{\\\"answer\\\":42}")',
+                                 input={}, purpose="scientific_computation", documentation_refs=[docs["receipt_ref"]], expected=None)
+        self.assertEqual(result["outcome"], "ok", result)
+        with patch.object(self.workbench, "_verify_run_state", wraps=self.workbench._verify_run_state) as verify:
+            self.workbench.validate_retained_results([result])
+        verify.assert_called_once_with(result["action"]["arguments"], result["result"])
+        (Path(installed["result"]["environment_path"]) / "library/tinyprobe/package").write_text("changed after execution")
+        with self.assertRaisesRegex(ValidationError, "environment changed"):
+            self.workbench.validate_retained_results([result])
+
+    def test_controller_rejects_tampered_producer_tools_before_independent_review(self):
+        from scisaurus.tests.test_composer import ComposerWorkflowTests
+        from scisaurus.runtime.composer import ComposerRunner
+        for execution_mode in ("model", "retained_model_result"):
+            with self.subTest(execution_mode=execution_mode):
+                root = Path(self.directory.name) / execution_mode
+                root.mkdir()
+                runner = ComposerRunner(ComposerWorkflowTests()._workflow(root))
+                self.addCleanup(runner.close)
+                stage = runner.workflow["stages"][1]
+                for ancestor in runner.workflow["stages"]:
+                    if ancestor["kind"] == "survey":
+                        runner.context[ancestor["id"]] = {"project_dir": str(root / "survey"),
+                            "survey_ref": "artifact:research/survey/latest@1"}
+                workbench = SoftwareWorkbench(runner.root / "scientific-software", deadline=time.monotonic()+60)
+                receipt = workbench.execute({"operation": "search_evidence", "arguments": {"terms": ["solver"]}})
+                receipt["result"]["matches"] = ["unbound scientific evidence"]
+                response = selection_contract()
+                response.update(decision="pass", summary="Claimed solver selection")
+                response["software_selection"].update(strategy="unavailable", rationale="No admitted solver")
+                produced = {"status": "succeeded", "execution_mode": execution_mode, "role_id": "methodologist",
+                            "assigned_role": "methods.methodologist", "response": response,
+                            "software_tool_results": [receipt], "usage": {}}
+                bundle = {"reports": [produced], "by_role": {"methodologist": produced}, "usage": {}, "model_enabled": True}
+                with patch.object(runner, "_run_specialist_pool", return_value=bundle), \
+                        patch("scisaurus.runtime.software_discovery.accepted_survey_sources", return_value={"sources": []}), \
+                        patch.object(runner, "_run_specialist_verifier") as reviewer:
+                    with self.assertRaisesRegex(ValidationError, "exact receipt"):
+                        runner._assess_scientific_software(stage, {}, {"topic": {
+                            "id": "solver-test", "domain": "test science", "research_question": "Does the solver apply?"}})
+                reviewer.assert_not_called()
+
     def test_dependency_license_and_path_ownership_are_required(self):
         inspected = self.action("inspect", repository="upstream/tinyprobe", revision="main")
         invalid = self.action("read", inspection_ref=inspected["receipt_ref"], path="../../private")
@@ -520,6 +579,10 @@ class SoftwareWorkbenchTests(unittest.TestCase):
         runner.workflow["capability_foundry_config_path"] = "configured-by-test"
         self.addCleanup(runner.close)
         stage = workflow["stages"][1]
+        for ancestor in runner.workflow["stages"]:
+            if ancestor["kind"] == "survey":
+                runner.context[ancestor["id"]] = {"project_dir": str(root / "survey"),
+                    "survey_ref": "artifact:research/survey/latest@1"}
         task = runner._stage_task(stage)
         runner.tasks.start_attempt(task["task_id"], "software-assessment-owner", owner="command.composer", lease_ttl_seconds=30, payload={"stage_id":stage["id"]})
         runner.stage_records[stage["id"]] = {"status":"running","kind":stage["kind"],"task_id":task["task_id"],"attempt_id":"software-assessment-owner","attempts":[]}
@@ -578,6 +641,7 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                         response["decision"] = "hold"
             return ModelResult(json.dumps(response),"fixture",{"model_calls":1,"input_tokens":10,"output_tokens":10},0.001,"stop",1)
         with patch.object(runner,"_specialist_model_config",return_value=model), \
+                patch("scisaurus.runtime.software_discovery.accepted_survey_sources", return_value={"sources": []}), \
                 patch("scisaurus.runtime.composer.enforce_model_cost_limits",return_value=True), \
                 patch("scisaurus.runtime.specialists.ModelClient") as client, \
                 patch("scisaurus.runtime.software_workbench.SoftwareWorkbench._fetch",side_effect=self.fetch), \

@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,6 +57,7 @@ from scisaurus.runtime.topic_discovery import (
     _normalise_topic_model_response,
     _single_topic_candidate_response,
     _portfolio_shape_plan,
+    _retained_portfolio_shape_plan,
     _record_attempt_selection,
     _repair_executable_selection,
     _repair_foundry_selection,
@@ -333,25 +335,33 @@ class PortfolioRepairModel(FakeModel):
 
 class SingleCandidateThenPortfolioModel(FakeModel):
     calls = []
+    completion_payloads = []
+    authored_candidates = []
 
     def complete(self, *, system, prompt, images=None):
         payload = json.loads(prompt)
         type(self).calls.append(payload.get("assignment"))
-        result = super().complete(system=system, prompt=prompt, images=images)
-        package_value = json.loads(result.text)
-        if payload.get("assignment") == "free_topic_discovery":
-            return ModelResult(
-                text=json.dumps(package_value["candidates"][0]), model="fake",
-                usage=result.usage, elapsed_seconds=result.elapsed_seconds,
-                finish_reason="stop")
-        if payload.get("assignment") == "complete_topic_portfolio":
-            package_value["candidates"][0] = deepcopy(
-                payload["portfolio_completion"]["candidate_to_preserve"])
-            return ModelResult(
-                text=json.dumps(package_value), model="fake",
-                usage=result.usage, elapsed_seconds=result.elapsed_seconds,
-                finish_reason="stop")
-        return result
+        value = package(payload["principal_objective"])
+        assignment = payload.get("assignment")
+        if assignment == "select_topic_portfolio":
+            type(self).completion_payloads.append(deepcopy(payload))
+            value = {"selected_id": payload["candidates"][1]["id"],
+                     "selection_rationale": "The comparison has bounded evidence and a reproducible test."}
+        elif assignment in {"free_topic_discovery", "generate_topic_portfolio_member"}:
+            slot = payload["candidate_slot"] if "candidate_slot" in payload else payload["portfolio_shape_plan"][0]
+            index = slot["candidate_index"]
+            candidate = value["candidates"][index % 3]
+            candidate["id"] = f"direction_{index}"
+            candidate.update({field: slot[field] for field in PORTFOLIO_DIMENSIONS})
+            type(self).authored_candidates.append(deepcopy(candidate))
+            if assignment == "generate_topic_portfolio_member":
+                type(self).completion_payloads.append(deepcopy(payload))
+                value = {"candidate": candidate}
+            else:
+                value = candidate
+        return ModelResult(text=json.dumps(value), model="fake",
+                           usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 20},
+                           elapsed_seconds=0.01, finish_reason="stop")
 
 
 class RepeatedInvalidTopicResponseModel(FakeModel):
@@ -749,6 +759,23 @@ class TopicDiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "valid JSON"):
             _normalise_topic_model_response(result)
 
+    def test_topic_response_adapter_does_not_promote_nested_truncated_content(self):
+        for text in (
+                '{"schema_version":"1","candidates":[{"design_brief":'
+                '{"schema_version":"material-design-brief-1","use_case":"x"},"title":"unterminated',
+                '{"result":{"candidates":[{"id":"x"}],"objective":"unterminated'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValidationError, "valid JSON"):
+                _normalise_topic_model_response(ModelResult(
+                    text=text, model="fake", usage={}, elapsed_seconds=.01, finish_reason="length"))
+
+    def test_feasibility_call_estimate_is_scientific_execution_only(self):
+        from scisaurus.runtime.topic_discovery import feasibility_plan_contract, CONCEPT_SYSTEM
+        estimate = feasibility_plan_contract()["estimated_model_calls"]
+        self.assertIn("executed scientific program itself", estimate)
+        self.assertIn("exclude controller calls", estimate)
+        self.assertIn("zero model calls", estimate)
+        self.assertIn("design_brief is nested", CONCEPT_SYSTEM)
+
     def test_single_candidate_response_is_only_a_completion_seed(self):
         candidate = package("objective")["candidates"][0]
         self.assertEqual(_single_topic_candidate_response(candidate), candidate)
@@ -761,21 +788,187 @@ class TopicDiscoveryTests(unittest.TestCase):
 
     def test_runner_completes_candidate_only_response_without_inventing_portfolio_members(self):
         SingleCandidateThenPortfolioModel.calls = []
-        with patch("scisaurus.runtime.topic_discovery.ModelClient",
-                   SingleCandidateThenPortfolioModel):
+        SingleCandidateThenPortfolioModel.completion_payloads = []
+        SingleCandidateThenPortfolioModel.authored_candidates = []
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", SingleCandidateThenPortfolioModel):
             result = TopicDiscoveryRunner({
                 "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
                 "timeout_seconds": 1, "max_output_tokens": 4096,
             }).run("Choose a feasible research direction", candidate_count=3,
-                   bibliography=False, maturity_review_rounds=0, max_attempts=4)
+                   bibliography=False, maturity_review_rounds=0, max_attempts=1)
         self.assertEqual(SingleCandidateThenPortfolioModel.calls, [
-            "free_topic_discovery", "complete_topic_portfolio",
+            "free_topic_discovery", "generate_topic_portfolio_member",
+            "generate_topic_portfolio_member", "select_topic_portfolio",
         ])
-        self.assertEqual(len(result["candidates"]), 3)
-        self.assertEqual(result["candidates"][0]["id"], "direction_0")
-        self.assertEqual(result["candidate_attempt_trace"][0]["response_shape"],
-                         "single_candidate")
-        self.assertEqual(result["candidate_attempt_trace"][0]["status"], "rejected")
+        members = SingleCandidateThenPortfolioModel.completion_payloads[:-1]
+        for payload in members:
+            self.assertEqual(set(payload["output_contract"]), {"candidate"})
+            self.assertIn("research_question", payload["output_contract"]["candidate"])
+            self.assertNotIn("portfolio_completion", payload)
+            self.assertNotIn("candidate_response", payload)
+            self.assertNotIn("complete JSON package", " ".join(payload["constraints"]))
+        selection = SingleCandidateThenPortfolioModel.completion_payloads[-1]
+        self.assertEqual(set(selection["output_contract"]), {"selected_id", "selection_rationale"})
+        self.assertEqual(result["candidates"], SingleCandidateThenPortfolioModel.authored_candidates)
+        self.assertEqual(result["selected_id"], selection["candidates"][1]["id"])
+        self.assertEqual(result["usage"]["model_calls"], 4)
+        self.assertEqual(result["usage"]["input_tokens"], 40)
+        self.assertEqual(result["usage"]["output_tokens"], 80)
+        retained = result["candidate_attempt_trace"][:3]
+        self.assertTrue(all(t["status"] == "portfolio_member_retained" for t in retained))
+        self.assertTrue(all(t["scientific_admission"] is False for t in retained))
+        for trace in retained:
+            self.assertEqual(hashlib.sha256(trace["response"].encode()).hexdigest(), trace["response_sha256"])
+
+    def test_incremental_portfolio_rejects_duplicate_members_without_credit(self):
+        class Duplicate(SingleCandidateThenPortfolioModel):
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                payload = json.loads(prompt)
+                if payload["assignment"] == "generate_topic_portfolio_member":
+                    value = json.loads(result.text)
+                    value["candidate"]["id"] = payload["retained_candidates"][0]["id"]
+                    result = replace(result, text=json.dumps(value))
+                return result
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", Duplicate):
+            with self.assertRaisesRegex(ValidationError, "new candidate id") as raised:
+                TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                    "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                    maturity_review_rounds=0, max_attempts=1)
+        self.assertEqual(raised.exception.usage["model_calls"], 2)
+        self.assertEqual(sum(t["status"] == "portfolio_member_retained" for t in raised.exception.candidate_attempt_trace), 1)
+
+    def test_incremental_portfolio_never_selects_unknown_id(self):
+        class UnknownSelection(SingleCandidateThenPortfolioModel):
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if json.loads(prompt)["assignment"] == "select_topic_portfolio":
+                    result = replace(result, text=json.dumps({"selected_id": "invented", "selection_rationale": "Unsupported choice."}))
+                return result
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", UnknownSelection):
+            with self.assertRaisesRegex(ValidationError, "retained candidate id") as raised:
+                TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                    "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                    maturity_review_rounds=0, max_attempts=1)
+        self.assertEqual(raised.exception.usage["model_calls"], 4)
+
+    def test_retained_shape_matching_preserves_diversity_and_authored_labels(self):
+        for count in range(3, 9):
+            for seed in range(10):
+                original = _portfolio_shape_plan(count, seed)
+                retained = {0: {
+                    "research_form": "experimental_design", "evidence_mode": "synthetic_simulation",
+                    "comparison_type": "mechanism_ablation"}}
+                while len(retained) < count:
+                    snapshot = deepcopy(retained)
+                    planned = _retained_portfolio_shape_plan(original, retained)
+                    validate_topic_portfolio(planned)
+                    self.assertEqual(retained, snapshot)
+                    for index, candidate in retained.items():
+                        self.assertEqual({field: planned[index][field] for field in PORTFOLIO_DIMENSIONS}, candidate)
+                    index = next(index for index in range(count) if index not in retained)
+                    retained[index] = {field: planned[index][field] for field in PORTFOLIO_DIMENSIONS}
+
+    def test_incremental_portfolio_invalid_identifier_types_are_accounted(self):
+        for target in ("candidate", "selection"):
+            for invalid in ([], {}, True, None):
+                class InvalidIdentifier(SingleCandidateThenPortfolioModel):
+                    def complete(self, *, system, prompt, images=None):
+                        result = super().complete(system=system, prompt=prompt, images=images)
+                        payload = json.loads(prompt)
+                        value = json.loads(result.text)
+                        if target == "candidate" and payload["assignment"] == "free_topic_discovery":
+                            value["id"] = invalid
+                        if target == "selection" and payload["assignment"] == "select_topic_portfolio":
+                            value["selected_id"] = invalid
+                        return replace(result, text=json.dumps(value))
+                with self.subTest(target=target, invalid=invalid), patch(
+                        "scisaurus.runtime.topic_discovery.ModelClient", InvalidIdentifier):
+                    with self.assertRaises(ValidationError) as raised:
+                        TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                            "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                            maturity_review_rounds=0, max_attempts=1)
+                    self.assertEqual(raised.exception.usage["model_calls"], 1 if target == "candidate" else 4)
+
+    def test_incremental_portfolio_does_not_bypass_call_quota(self):
+        for maximum in (1, 3):
+            with self.subTest(maximum=maximum), patch(
+                    "scisaurus.runtime.topic_discovery.ModelClient", SingleCandidateThenPortfolioModel):
+                with self.assertRaises(QuotaExceededError) as raised:
+                    TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                        "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                        maturity_review_rounds=0, max_attempts=4, budgets={"max_model_calls": maximum})
+                self.assertEqual(raised.exception.usage["model_calls"], maximum)
+
+    def test_incremental_portfolio_selection_cannot_rewrite_candidates(self):
+        class Rewrite(SingleCandidateThenPortfolioModel):
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if json.loads(prompt)["assignment"] == "select_topic_portfolio":
+                    value = json.loads(result.text)
+                    value["candidates"] = [{"id": "fabricated"}]
+                    return replace(result, text=json.dumps(value))
+                return result
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", Rewrite):
+            with self.assertRaisesRegex(ValidationError, "exactly selected_id") as raised:
+                TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                    "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                    maturity_review_rounds=0, max_attempts=1)
+        self.assertEqual(raised.exception.usage["model_calls"], 4)
+
+    def test_repeated_selection_trace_keeps_its_actual_owner(self):
+        class RepeatSelection(SingleCandidateThenPortfolioModel):
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if json.loads(prompt)["assignment"] == "select_topic_portfolio":
+                    return replace(result, text=json.dumps({
+                        "selected_id": "invented", "selection_rationale": "Unsupported selection."}))
+                return result
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", RepeatSelection):
+            with self.assertRaisesRegex(ValidationError, "byte-identical rejected response") as raised:
+                TopicDiscoveryRunner({"model": "fake", "protocol": "ollama", "base_url": "http://example.invalid"}).run(
+                    "Choose a feasible research direction", candidate_count=3, bibliography=False,
+                    maturity_review_rounds=0, max_attempts=2)
+        trace = raised.exception.candidate_attempt_trace[-1]
+        self.assertEqual(trace["status"], "repeated_response")
+        self.assertIsNone(trace.get("selected_id"))
+        self.assertIsNone(trace.get("selected_topic"))
+        self.assertEqual(trace["portfolio_step"]["request"]["assignment"], "select_topic_portfolio")
+        self.assertEqual(json.loads(trace["portfolio_step"]["response"])["selected_id"], "invented")
+        self.assertEqual(raised.exception.usage["model_calls"], 5)
+
+    def test_scoped_refinement_rotates_routes_after_invalid_response(self):
+        class FailedScoped(RefinementValidationRepairModel):
+            routes = []
+            systems = []
+            challenge_calls = 0
+            refinement_calls = 0
+            payloads = []
+
+            def complete(self, *, system, prompt, images=None):
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if json.loads(prompt)["assignment"] == "repair_selected_topic_candidate":
+                    type(self).routes.append(self.config["model"])
+                    type(self).systems.append(system)
+                    if len(type(self).routes) == 1:
+                        return replace(result, text=json.dumps({"required_shape": "not a candidate"}))
+                return result
+        config = {"base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+                  "timeout_seconds": 1, "max_output_tokens": 4096,
+                  "role_models": {"topic_discovery": {"model": "primary"}},
+                  "role_model_fallbacks": {"topic_discovery": [{"model": "secondary"}]}}
+        with patch("scisaurus.runtime.topic_discovery.OpenAlexClient", FakeOpenAlex), patch(
+                "scisaurus.runtime.topic_discovery.ModelClient", FailedScoped):
+            result = TopicDiscoveryRunner(config).run(
+                "Choose a feasible research direction", candidate_count=3,
+                max_attempts=4, maturity_review_rounds=0)
+        self.assertEqual(FailedScoped.routes, ["secondary", "primary"])
+        self.assertTrue(all("sole key candidate" in system for system in FailedScoped.systems))
+        records = [trace["scoped_response"] for trace in result["candidate_attempt_trace"] if "scoped_response" in trace]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(json.loads(records[0]["response"]), {"required_shape": "not a candidate"})
+        self.assertEqual(records[0]["request"]["output_contract"].keys(), {"candidate"})
+        self.assertEqual(records[1]["request"]["validation_error"], "selected topic repair requires exactly one candidate object")
 
     def test_runner_stops_after_byte_identical_invalid_topic_response(self):
         RepeatedInvalidTopicResponseModel.calls = 0
@@ -838,6 +1031,231 @@ class TopicDiscoveryTests(unittest.TestCase):
         unexpected["commentary"] = "not part of the scientific package"
         with self.assertRaisesRegex(ValidationError, "unexpected=.*commentary"):
             validate_topic_package(unexpected)
+
+    def test_concept_intake_config_allows_comparison_without_maturity_loop(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            model = root / "model.json"
+            model.write_text("{}")
+            config = {"schema_version": STAGE_CONFIG_SCHEMA_VERSION,
+                      "model_config_path": str(model), "output_path": str(root / "topic.json"),
+                      "candidate_count": 1, "max_attempts": 2, "intake_mode": "concept",
+                      "maturity_review_rounds": 0}
+            self.assertEqual(validate_topic_stage_config(config), config)
+            for count in (1, 3, 4, 8):
+                validate_topic_stage_config({**config, "candidate_count": count})
+            for field, value in (("candidate_count", 0), ("candidate_count", 9),
+                                 ("candidate_count", True), ("maturity_review_rounds", 1),
+                                 ("intake_mode", "unknown")):
+                invalid = {**config, field: value}
+                with self.subTest(field=field), self.assertRaises(ValidationError):
+                    validate_topic_stage_config(invalid)
+            legacy = {**config, "intake_mode": "portfolio"}
+            with self.assertRaises(ValidationError):
+                validate_topic_stage_config(legacy)
+
+    def test_concept_intake_precedes_bibliography_and_defers_novelty(self):
+        class ConceptModel(FakeModel):
+            requests = []
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).requests.append((system, payload))
+                assignment = payload.get("assignment")
+                if assignment in {"topic_maturity_review", "repair_topic_maturity_review"}:
+                    raise AssertionError("concept intake must not dispatch a maturity loop")
+                result = super().complete(system=system, prompt=prompt, images=images)
+                if assignment in {"free_topic_discovery", "repair_invalid_topic_discovery"}:
+                    value = json.loads(result.text)
+                    value["candidates"] = value["candidates"][:1]
+                    value["selected_id"] = value["candidates"][0]["id"]
+                    from scisaurus.tests.test_material_development import brief
+                    value["candidates"][0]["design_brief"] = brief()
+                    result = replace(result, text=json.dumps(value))
+                return result
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", ConceptModel), \
+                patch("scisaurus.runtime.topic_discovery.OpenAlexClient", side_effect=AssertionError("bibliography before concept")):
+            result = TopicDiscoveryRunner({"base_url": "http://example.invalid", "model": "fake",
+                                           "protocol": "ollama", "timeout_seconds": 1}).run(
+                "Design a useful architected material", intake_mode="concept", candidate_count=1,
+                max_attempts=2, sampling_seed=3,
+                runtime_context={"laboratory": {"scope": "architected materials",
+                    "physics_families": [{"id": "elasticity"}], "design_families": [{"id": "lattice"}],
+                    "runtimes": [{"executable": "/private/runtime"}]}})
+        self.assertEqual([p["assignment"] for _, p in ConceptModel.requests], ["free_topic_discovery"])
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertIsNone(result["frontier_seed_plan"])
+        self.assertEqual(result["admission_state"], "provisional_for_survey")
+        self.assertEqual(result["next_evidence_action"], "implementation_literature")
+        self.assertIn("convergence", result["deferred_validation"])
+        prompt = next(p for _, p in ConceptModel.requests if p["assignment"] == "free_topic_discovery")
+        self.assertEqual(prompt["portfolio_shape_plan"], [])
+        self.assertEqual(prompt["portfolio_requirements"], {})
+        self.assertNotIn("four distinct", json.dumps(prompt))
+        self.assertIsNone(result["source_challenge"])
+        self.assertEqual(result["novelty_status"], "unverified")
+        self.assertEqual(result["usage"]["model_calls"], len(ConceptModel.requests))
+
+    def test_concept_comparison_is_one_call_without_bibliography_or_shape_pivots(self):
+        from scisaurus.tests.test_material_development import concept_candidates
+        class ComparisonModel:
+            requests = []
+            def __init__(self, **config):
+                self.model = "fake"
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).requests.append(payload)
+                if payload["assignment"] != "free_topic_discovery":
+                    raise AssertionError("unexpected additional concept call")
+                value = package(payload["principal_objective"])
+                for candidate, concept in zip(value["candidates"], concept_candidates()):
+                    candidate.update(mechanism=concept["mechanism"], design_brief=concept["design_brief"],
+                                     research_form="theory_simulation", evidence_mode="synthetic_simulation",
+                                     comparison_type="mechanism_ablation")
+                return ModelResult(text=json.dumps(value), model="fake", finish_reason="stop",
+                                   usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 10},
+                                   elapsed_seconds=.01)
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", ComparisonModel), \
+                patch("scisaurus.runtime.topic_discovery.OpenAlexClient", side_effect=AssertionError("early literature")):
+            result = TopicDiscoveryRunner({"base_url": "http://example.invalid", "model": "fake",
+                                           "protocol": "ollama", "timeout_seconds": 1}).run(
+                "Develop an unconventional useful material", intake_mode="concept", candidate_count=3,
+                max_attempts=1, sampling_seed=3)
+        self.assertEqual(len(ComparisonModel.requests), 1)
+        self.assertEqual(len(result["candidates"]), 3)
+        self.assertEqual(result["selected_id"], "direction_1")
+        self.assertEqual(result["novelty_status"], "unverified")
+        self.assertEqual(result["usage"]["model_calls"], 1)
+        evidence = result["candidate_attempt_trace"][0]["model_response"]
+        self.assertEqual(evidence["request"], ComparisonModel.requests[0])
+        self.assertEqual(evidence["model"], "fake")
+        self.assertEqual(evidence["finish_reason"], "stop")
+        self.assertEqual(hashlib.sha256(evidence["response"].encode()).hexdigest(), evidence["response_sha256"])
+        from scisaurus.runtime.research_program import build_research_program
+        self.assertEqual(len(build_research_program(result)["branches"]), 3)
+        self.assertEqual(ComparisonModel.requests[0]["portfolio_shape_plan"], [])
+        self.assertIn("strongest conventional", ComparisonModel.requests[0]["output_contract"]["selection_rationale"])
+
+    def test_concept_prompt_allows_remote_functions_without_new_tools(self):
+        payload = json.loads(topic_prompt("Develop a useful material", 3, intake_mode="concept"))
+        rules = " ".join(payload["constraints"])
+        self.assertNotIn("Do not produce alternative candidates", rules)
+        self.assertIn("Unconventional use cases", rules)
+        self.assertIn("currently attested tools", rules)
+        self.assertIn("Do not assume additional installations", rules)
+        self.assertIn("same bounded response", rules)
+        self.assertEqual(payload["output_contract"]["candidates"]["minItems"], 3)
+
+    def test_every_concept_checks_native_runtime_and_supplied_source_provenance(self):
+        from scisaurus.tests.test_material_development import concept_candidates
+        from scisaurus.tests.test_laboratory_feasibility import _plan
+        objective = "Develop a useful material"
+        value = package(objective)
+        for candidate, concept in zip(value["candidates"], concept_candidates()):
+            candidate.update(mechanism=concept["mechanism"], design_brief=concept["design_brief"],
+                             research_form="theory_simulation", evidence_mode="synthetic_simulation",
+                             comparison_type="mechanism_ablation",
+                             feasibility_plan=_plan(execution_mode="native_runtime", runtime_labels=["heat"]))
+            candidate.pop("capability_requirements", None)
+        context = {"capability_foundry": {"enabled": True, "allowed_evidence_modes": ["synthetic_simulation"]},
+                   "executables": {"python3": True}, "configured_stage_kinds": ["experiment"],
+                   "research_feasibility": {"execution_modes": ["native_runtime", "foundry"],
+                       "allowed_input_kinds": ["synthetic"], "allowed_data_access": ["closed_world"],
+                       "runtime_labels": ["heat"], "attested_runtime_labels": ["heat"],
+                       "network_access": False, "available_executables": [], "available_packages": [],
+                       "foundry_runtime_packages": [], "max_experiment_seconds": 100}}
+        class BoundaryModel:
+            def __init__(self, **config):
+                self.model = "fake"
+            def complete(self, *, system, prompt, images=None):
+                return ModelResult(text=json.dumps(value), model="fake", finish_reason="stop",
+                                   usage={"model_calls": 1}, elapsed_seconds=.01)
+        config = {"base_url": "http://example.invalid", "model": "fake", "protocol": "ollama", "timeout_seconds": 1}
+        def run():
+            return TopicDiscoveryRunner(config).run(objective, intake_mode="concept", candidate_count=3,
+                                                    max_attempts=1, runtime_context=context)
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", BoundaryModel), \
+                patch("scisaurus.runtime.topic_discovery.OpenAlexClient", side_effect=AssertionError("early literature")):
+            self.assertEqual(run()["status"], "completed")
+            value["candidates"][0]["feasibility_plan"]["runtime_labels"] = ["not_installed"]
+            with self.assertRaisesRegex(ValidationError, "direction_0.*first-test boundary"):
+                run()
+            value["candidates"][0]["feasibility_plan"]["runtime_labels"] = ["heat"]
+            context["research_feasibility"]["attested_runtime_labels"] = []
+            with self.assertRaisesRegex(ValidationError, "unattested"):
+                run()
+            context["research_feasibility"]["attested_runtime_labels"] = ["heat"]
+            value["candidates"][0]["prior_work_ids"] = ["W999999999"]
+            with self.assertRaisesRegex(ValidationError, "direction_0 prior_work_ids must cite supplied"):
+                run()
+
+    def test_concept_prompt_does_not_assign_functions_by_capability_slots(self):
+        context = {"experiment_catalog": [{"id": "heat"}, {"id": "waves"}],
+                   "candidate_capability_plan": [{"candidate_index": 0, "experiment_capability_id": "heat"}]}
+        concept = json.loads(topic_prompt("Develop a useful material", 3, intake_mode="concept", runtime_context=context))
+        portfolio = json.loads(topic_prompt("Develop a useful material", 3, runtime_context=context))
+        self.assertFalse(any("cover every listed" in item or "assign candidate positions" in item
+                             for item in concept["constraints"]))
+        self.assertTrue(any("assign candidate positions" in item for item in portfolio["constraints"]))
+        self.assertIn("experiment_capability_id", concept["output_contract"]["candidates"]["items"])
+
+    def test_scoped_concept_repair_needs_no_frontier_and_preserves_scientific_shape(self):
+        from scisaurus.tests.test_material_development import brief
+        parent = package("Develop a useful material")["candidates"][1]
+        parent.update(phenomenon="Optical sheet mode filtering", mechanism="Interference of dielectric modes",
+                      research_question="Does interference change optical sheet mode filtering transmission?",
+                      design_brief=brief(), evidence_mode="synthetic_simulation")
+        class RepairModel:
+            requests = []
+            def __init__(self, **config):
+                self.model = "fake"
+            def complete(self, *, system, prompt, images=None):
+                payload = json.loads(prompt)
+                type(self).requests.append(payload)
+                candidate = deepcopy(payload["parent_candidate"])
+                candidate["design_brief"]["baseline"] = "Unpatterned sheet of equal thickness and composition"
+                return ModelResult(text=json.dumps({"candidate": candidate}), model="fake", finish_reason="stop",
+                                   usage={"model_calls": 1, "input_tokens": 10, "output_tokens": 10}, elapsed_seconds=.01)
+        with patch("scisaurus.runtime.topic_discovery.ModelClient", RepairModel), \
+                patch("scisaurus.runtime.topic_discovery.OpenAlexClient", side_effect=AssertionError("early literature")):
+            result = TopicDiscoveryRunner({"base_url": "http://example.invalid", "model": "fake",
+                                           "protocol": "ollama", "timeout_seconds": 1}).run(
+                "Develop a useful material", intake_mode="concept", candidate_count=3, max_attempts=1,
+                refinement_context={"mode": "refinement", "parent_topic": parent,
+                    "parent_evidence": {"recent_papers": [], "candidate_prior_work": []},
+                    "work_orders": [{"kind": "topic_refinement", "objective": "Clarify the first pilot baseline"}]})
+        self.assertEqual(len(RepairModel.requests), 1)
+        self.assertEqual(result["selected_id"], parent["id"])
+        self.assertEqual(result["topic"]["research_question"], parent["research_question"])
+        self.assertEqual(result["topic"]["research_form"], parent["research_form"])
+        self.assertEqual(result["topic"]["evidence_mode"], parent["evidence_mode"])
+        self.assertIsNone(result["frontier_seed_plan"])
+        self.assertNotIn("frontier_seed_id", RepairModel.requests[0]["output_contract"]["candidate"])
+        self.assertNotIn("prior_work_ids", RepairModel.requests[0]["output_contract"]["candidate"])
+        self.assertEqual(result["topic_evolution"]["package_contract"], "single_candidate_parent_refinement")
+        self.assertEqual(result["topic_evolution"]["parent_topic_id"], parent["id"])
+        from scisaurus.runtime.research_program import build_research_program
+        self.assertEqual(len(build_research_program(result)["branches"]), 1)
+
+    def test_refinement_rejects_conflicting_parent_identity_before_dispatch(self):
+        parent = package("Develop a useful material")["candidates"][1]
+        with patch("scisaurus.runtime.topic_discovery.ModelClient") as client:
+            with self.assertRaisesRegex(ValidationError, "parent_topic_id must match"):
+                TopicDiscoveryRunner({"base_url": "http://example.invalid", "model": "fake",
+                                      "protocol": "ollama", "timeout_seconds": 1}).run(
+                    "Develop a useful material", intake_mode="concept", candidate_count=3,
+                    refinement_context={"mode": "refinement", "parent_topic": parent,
+                                        "parent_topic_id": "another_topic"})
+        client.assert_not_called()
+
+    def test_single_seed_requires_explicit_scope_and_retains_source_shape_checks(self):
+        plan = frontier_plan(1)
+        self.assertEqual(validate_frontier_seed_plan(plan, seed_count=1), plan)
+        with self.assertRaises(ValidationError):
+            validate_frontier_seed_plan(plan)
+        invalid = deepcopy(plan)
+        invalid["seeds"][0].pop("mechanism")
+        with self.assertRaises(ValidationError):
+            validate_frontier_seed_plan(invalid, seed_count=1)
 
     def test_config_and_package_contracts(self):
         with tempfile.TemporaryDirectory() as path:
@@ -2373,6 +2791,16 @@ class TopicDiscoveryTests(unittest.TestCase):
         self.assertIsNone(_repair_executable_selection(value, context))
         self.assertEqual(value["selected_id"], "direction_1")
 
+    def test_executable_selection_preserves_feasible_authored_choice_before_earlier_peers(self):
+        value = package("Choose a feasible research direction")
+        original = deepcopy(value)
+        with patch("scisaurus.runtime.topic_discovery.validate_topic_feasibility",
+                   return_value={"status": "passed"}) as gate:
+            self.assertIsNone(_repair_executable_selection(value, {"research_feasibility": {}}))
+        self.assertEqual(value, original)
+        self.assertEqual(gate.call_count, 1)
+        self.assertEqual(gate.call_args.args[0]["selected_id"], "direction_1")
+
     def test_refinement_selection_repair_uses_actual_candidate_shapes(self):
         value = package("Choose a feasible research direction")
         parent = value["candidates"][1]
@@ -2446,7 +2874,12 @@ class TopicDiscoveryTests(unittest.TestCase):
             "Choose a feasible research direction", 6,
             candidate_history=[{"status": "rejected", "candidate_signatures": []}]))
         self.assertEqual(payload["portfolio_requirements"]["minimum_distinct_research_forms"], 4)
-        self.assertIn("research_form", payload["output_contract"]["candidate"])
+        self.assertIn("research_form", payload["output_contract"]["candidates"]["items"])
+        self.assertEqual(set(payload["output_contract"]), {
+            "schema_version", "objective", "candidates", "selected_id", "selection_rationale"})
+        self.assertEqual(payload["output_contract"]["candidates"]["type"], "array")
+        self.assertEqual(payload["output_contract"]["candidates"]["minItems"], 6)
+        self.assertEqual(payload["output_contract"]["candidates"]["maxItems"], 6)
         self.assertEqual(payload["previous_candidate_directions"][0]["status"], "rejected")
 
     def test_topic_prompt_applies_computational_native_preferences(self):

@@ -3030,12 +3030,20 @@ class DashboardService:
             raise FileNotFoundError("project is outside the dashboard workspace or does not exist")
         return candidate
 
-    def _workflow(self, project_dir, *, for_execution=False):
+    def _workflow(self, project_dir, *, for_execution=False, allow_additive_upgrade=False):
         snapshot = DashboardSnapshot(project_dir)
         if snapshot.workflow_path is None:
             raise ValueError("project has no Composer workflow.json")
         if for_execution and snapshot.workflow_control_error:
-            raise ValueError(snapshot.workflow_control_error)
+            candidate = _read_json(snapshot.workflow_path)
+            from scisaurus.runtime.composer import ComposerRunner
+            if not allow_additive_upgrade or not ComposerRunner._is_laboratory_extension(snapshot.workflow, candidate or {}):
+                raise ValueError(snapshot.workflow_control_error)
+            checked = ComposerRunner.__new__(ComposerRunner)
+            checked.workflow = candidate
+            checked.root = Path(candidate["project_id"])
+            checked._preflight_resume_workflow(True)
+            return snapshot.workflow_path, candidate
         workflow = snapshot.workflow
         if not isinstance(workflow, dict):
             raise ValueError("project workflow.json is not a JSON object")
@@ -3321,7 +3329,8 @@ class DashboardService:
 
     def start_composer(self, project_ref=None, *, resume=False, settings=None):
         project_dir = self._resolve_project(project_ref)
-        workflow_path, workflow = self._workflow(project_dir, for_execution=True)
+        extension_requested = isinstance(settings, dict) and settings.get("extend_workflow") is True and resume
+        workflow_path, workflow = self._workflow(project_dir, for_execution=True, allow_additive_upgrade=extension_requested)
         workflow, project_id = self._validate_composer_workflow(workflow_path, workflow, project_dir)
         with self._run_lock(project_id) as output:
             existing = self._composer_processes(workflow_path)
@@ -3335,19 +3344,22 @@ class DashboardService:
                 raise ValueError("project already has Composer state; choose Resume")
             if resume:
                 status = self.run_status(project_ref)
-                if not status["can_resume"]:
+                if not status["can_resume"] and not extension_requested:
                     raise ValueError("this checkpoint is complete or its original deadline has elapsed")
             if settings is None:
                 settings = self.run_status(project_ref)["settings"]
-            if not isinstance(settings, dict) or set(settings) - {"development", "stop_after_stage"}:
+            if not isinstance(settings, dict) or set(settings) - {"development", "stop_after_stage", "extend_workflow"}:
                 raise ValueError("unsupported run settings")
+            extension = settings.get("extend_workflow", False)
+            if type(extension) is not bool or extension and not resume:
+                raise ValueError("workflow extension requires an explicit resume")
             development = settings.get("development", True)
             stop_stage = settings.get("stop_after_stage")
             if type(development) is not bool:
                 raise ValueError("development must be a boolean")
             if stop_stage is not None and stop_stage not in {item["id"] for item in workflow["stages"]}:
                 raise ValueError("stop stage must belong to the selected workflow")
-            settings = {"development": development, "stop_after_stage": stop_stage}
+            settings = {"development": development, "stop_after_stage": stop_stage, **({"extend_workflow": True} if extension else {})}
             repository = self.repository
             command = [self.runtime_python, "-u", "-m", "scisaurus.cli", "run-composer",
                        "--workflow", str(workflow_path), "--watch"]
@@ -3360,6 +3372,8 @@ class DashboardService:
                 command.extend(["--env-file", env_file])
             if resume:
                 command.append("--resume")
+            if extension:
+                command.append("--extend-workflow")
             log_path = project_id / "output" / "composer-console.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             from scisaurus.runtime.run_control import authorized_control
@@ -3395,6 +3409,23 @@ class DashboardService:
             return {"status": "started", "project": project_dir.name,
                     "workflow_path": str(workflow_path), "pid": process.pid,
                     "resume": resume, "command": command, "log_path": str(log_path)}
+
+    def reselect_concepts(self, project_ref, criteria):
+        """Revise concept selection while preserving a stopped mission ledger."""
+        project_dir = self._resolve_project(project_ref)
+        workflow_path, workflow = self._workflow(project_dir)
+        project_id = Path(workflow["project_id"]).expanduser().resolve()
+        if not project_id.is_relative_to(project_dir) or not workflow_path.resolve().is_relative_to(project_dir):
+            raise ValueError("workflow ownership must stay inside its managed project")
+        with self._run_lock(project_id):
+            if self._composer_processes(workflow_path):
+                raise ValueError("stop the owning supervisor before concept reselection")
+            from scisaurus.runtime.composer import ComposerRunner
+            runner = ComposerRunner(workflow, resume=True, control_only=True)
+            try:
+                return runner.reselect_concepts(criteria)
+            finally:
+                runner.close()
 
     def stop_composer(self, project_ref=None):
         project_dir = self._resolve_project(project_ref)
@@ -3626,6 +3657,10 @@ class DashboardService:
                         if config_path.is_file():
                             config = _read_json(config_path)
                             if isinstance(config, dict) and type(config.get("max_attempts")) is int:
+                                if workflow.get("laboratory_config_path") and "intake_mode" not in config:
+                                    from scisaurus.runtime.material_development import CONCEPT_CANDIDATE_COUNT
+                                    config.update(intake_mode="concept", candidate_count=CONCEPT_CANDIDATE_COUNT,
+                                                  maturity_review_rounds=0)
                                 # A journal-oriented intake may spend one or
                                 # more bounded turns on a maturity-directed
                                 # refinement.  Do not let the fresh-mission

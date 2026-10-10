@@ -1,0 +1,507 @@
+{
+  "schema_version": "metamaterial-laboratory-template-1",
+  "status": "template_unresolved",
+  "purpose": "Portable, host-independent template for the opt-in metamaterial laboratory. Paths are placeholders; run scripts/prepare-laboratory-profile.py with an explicit runtime root to produce a validated, host-resolved laboratory profile. This file is not admitted as a laboratory configuration and must never be loaded directly.",
+  "placeholders": {
+    "${LABORATORY_ROOT}": "operator root containing the continuum and waves runtimes",
+    "${FREECAD_APP}": "FreeCAD application bundle path on this host"
+  },
+  "known_installations": {
+    "continuum": "conda prefix with SfePy 2026.3 and meshio/numpy/scipy/h5py; Gmsh uses the meshing runtime",
+    "waves": "conda prefix with serial Meep 1.34.0 and bundled MPB 1.12.0",
+    "freecad": "FreeCAD application bundle providing the headless Part/Import/Mesh/Fem interpreter"
+  },
+  "unsupported_here": [
+    "Elmer",
+    "MOOSE",
+    "OpenFOAM",
+    "MPI/HPC parallel Meep",
+    "GPU execution",
+    "GUI FreeCAD workbenches"
+  ],
+  "preparation": "python scripts/prepare-laboratory-profile.py --template config/laboratory-metamaterial.example.json --runtime-root <dir> --freecad-app <path> --output deployment-profile.json",
+  "notes": "Preparation is a trusted operator step. It validates every declared runtime, resolves the placeholders without reading the caller environment, and never advertises an uninstalled solver.",
+  "laboratory": {
+    "schema_version": "metamaterial-laboratory-1",
+    "id": "metamaterial-lab",
+    "enabled": true,
+    "scope": {
+      "domain": "architected and metamaterial engineering",
+      "objective": "Bound the permitted engineering families for free-topic missions that opt into this laboratory. The laboratory names broad design and physics families, installed toolchains and evidence obligations. It deliberately does not select the research topic, hypothesis, candidate geometry or expected outcome; those remain agent-authored from captured literature.",
+      "non_goals": [
+        "selecting a fixed experiment or candidate geometry",
+        "substituting a homemade surrogate for an established solver",
+        "claiming verified readiness from a runtime's presence or an import statement",
+        "claiming novel research output from an operational solver check"
+      ],
+      "notes": null
+    },
+    "design_families": [
+      {
+        "id": "parametric_solid",
+        "kind": "cad_solid",
+        "description": "Parametric solid built from primitives and booleans and exported as STEP/BREP plus an editable FCStd document.",
+        "tool": "freecad",
+        "limitations": [
+          "Headless CAD kernel supports the FreeCAD Part/Import/Mesh workbenches; GUI-only workbenches are unavailable."
+        ]
+      },
+      {
+        "id": "periodic_cell",
+        "kind": "periodic_cell",
+        "description": "Unit cell intended for homogenization or band-structure work; periodicity and the cell lattice must be declared explicitly.",
+        "tool": "freecad+gmsh",
+        "limitations": [
+          "No automatic periodic-mesh constraint generation is provided."
+        ]
+      },
+      {
+        "id": "through_hole_lattice",
+        "kind": "lattice",
+        "description": "Plate or block perforated by an array of through features, a common metamaterial building block.",
+        "tool": "freecad+gmsh",
+        "limitations": [
+          "Manufacturability of thin ligaments must be assessed per process."
+        ]
+      },
+      {
+        "id": "porous_medium",
+        "kind": "porous",
+        "description": "Random or graded porosity realized by boolean subtraction and meshed as a volume.",
+        "tool": "freecad+gmsh",
+        "limitations": [
+          "Random realizations need an explicit ensemble and robustness study."
+        ]
+      }
+    ],
+    "physics_families": [
+      {
+        "id": "thermal_conduction",
+        "domain": "thermal",
+        "description": "Steady or transient heat conduction producing a temperature field.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_laplace",
+          "dw_dot",
+          "steady_and_transient"
+        ],
+        "coupling_role": "independent",
+        "coupling_note": "Produces a temperature field without consuming another physics field.",
+        "limitations": [
+          "Radiation and phase change need separate models."
+        ]
+      },
+      {
+        "id": "structural_elasticity",
+        "domain": "structural",
+        "description": "Linear elasticity with declared stiffness and boundary conditions; stress, strain and displacement outputs.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_lin_elastic",
+          "ev_cauchy_stress",
+          "linear_static"
+        ],
+        "coupling_role": "independent",
+        "coupling_note": "Mechanical equilibrium without a temperature or electromagnetic load.",
+        "limitations": [
+          "Large deformation, contact and plasticity require other formulations."
+        ]
+      },
+      {
+        "id": "thermoelastic_one_way",
+        "domain": "multiphysics",
+        "description": "Temperature field feeds thermal strain through the documented SfePy dw_biot term; the mechanical field does not feed back.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_biot",
+          "dw_lin_elastic",
+          "one_way_temperature_to_strain"
+        ],
+        "coupling_role": "one_way",
+        "coupling_note": "Sequential receipt-bound runs: a temperature field is retained as an artifact and consumed as the parameter field of the elasticity run. A monolithic two-field problem is also possible but is not assumed.",
+        "limitations": [
+          "No thermomechanical feedback, latent heat or temperature-dependent properties are implied."
+        ]
+      },
+      {
+        "id": "acoustic_helmholtz",
+        "domain": "acoustic",
+        "description": "Frequency-domain acoustic pressure satisfying the Helmholtz equation with declared wavenumber and boundary conditions.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_laplace",
+          "dw_dot",
+          "helmholtz"
+        ],
+        "coupling_role": "independent",
+        "coupling_note": "Scalar pressure solve; a vibro-acoustic coupling would be a separate declared one-way or two-way workflow.",
+        "limitations": [
+          "No automatic absorbing/radiation boundary; standing-wave and impedance conditions must be declared."
+        ]
+      },
+      {
+        "id": "electromagnetic_time_domain",
+        "domain": "electromagnetic",
+        "description": "Time-domain Maxwell evolution with a broadband or continuous source and recorded fields.",
+        "runtime": "waves",
+        "capabilities": [
+          "meep_fdtd",
+          "time_evolution",
+          "pml"
+        ],
+        "coupling_role": "independent",
+        "coupling_note": "Fields are evolved independently; thermal or mechanical coupling would require a separate declared exchange.",
+        "limitations": [
+          "Serial Meep build; large 3D cells exceed the local budget."
+        ]
+      },
+      {
+        "id": "electromagnetic_eigenmode",
+        "domain": "electromagnetic",
+        "description": "Periodic eigenmode and band-structure solve for a declared lattice and material contrast.",
+        "runtime": "waves",
+        "capabilities": [
+          "mpb_eigenmode",
+          "band_structure",
+          "te_tm"
+        ],
+        "coupling_role": "homogenization",
+        "coupling_note": "The unit cell is periodic; eigenfrequencies describe the infinite lattice rather than a finite specimen.",
+        "limitations": [
+          "Infinite-lattice result; finite-size validation is a separate step."
+        ]
+      },
+      {
+        "id": "homogenization_effective_property",
+        "domain": "homogenization",
+        "description": "Effective thermal, elastic or acoustic property derived from a unit-cell problem with declared boundary conditions.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_laplace",
+          "dw_lin_elastic",
+          "unit_cell_averaging"
+        ],
+        "coupling_role": "homogenization",
+        "coupling_note": "Effective properties are only meaningful together with the applied unit-cell boundary conditions and volume averaging.",
+        "limitations": [
+          "Scale separation between unit cell and specimen must be justified."
+        ]
+      },
+      {
+        "id": "finite_structure_validation",
+        "domain": "finite_structure",
+        "description": "The same design solved at the specimen scale to test whether the homogenized or infinite-lattice prediction survives finite size and boundaries.",
+        "runtime": "continuum",
+        "capabilities": [
+          "dw_lin_elastic",
+          "dw_laplace",
+          "specimen_scale_mesh"
+        ],
+        "coupling_role": "finite_structure",
+        "coupling_note": "Consumes the homogenized property as a declared input and compares it with a direct finite-structure solve.",
+        "limitations": [
+          "Requires a converged specimen mesh and equal-constraint comparison."
+        ]
+      }
+    ],
+    "workflows": [
+      {
+        "id": "parametric_solid_to_step",
+        "description": "Build a parametric solid headlessly, export STEP plus an editable FCStd document, and check the CAD kernel volume against a closed-form reference.",
+        "stages": [
+          {
+            "id": "build",
+            "operation": "cad_export_step",
+            "runtime": "freecad",
+            "inputs": [],
+            "outputs": [
+              "step",
+              "fcstd"
+            ]
+          }
+        ],
+        "coupling_plan": null,
+        "limitations": [
+          "Volume comparison is an implementation check, not a research result."
+        ]
+      },
+      {
+        "id": "step_to_volume_mesh",
+        "description": "Import the retained STEP artifact into Gmsh, generate a 3D volume mesh, and export MSH and a tetra-only VTK.",
+        "stages": [
+          {
+            "id": "mesh",
+            "operation": "gmsh_volume_mesh",
+            "runtime": "meshing",
+            "inputs": [
+              "step"
+            ],
+            "outputs": [
+              "msh",
+              "vtk"
+            ]
+          }
+        ],
+        "coupling_plan": null,
+        "limitations": [
+          "Mesh quality and convergence must still be demonstrated for the admitted geometry."
+        ]
+      },
+      {
+        "id": "thermoelastic_sequential",
+        "description": "Solve heat conduction, retain the temperature field, and feed it as the parameter field of a linear-elasticity problem with thermal strain.",
+        "stages": [
+          {
+            "id": "thermal",
+            "operation": "sfepy_thermal",
+            "runtime": "continuum",
+            "inputs": [
+              "vtk"
+            ],
+            "outputs": [
+              "vtk",
+              "hdf5"
+            ]
+          },
+          {
+            "id": "elastic",
+            "operation": "sfepy_thermoelastic",
+            "runtime": "continuum",
+            "inputs": [
+              "vtk"
+            ],
+            "outputs": [
+              "vtk"
+            ]
+          }
+        ],
+        "coupling_plan": {
+          "kind": "one_way",
+          "direction": "temperature -> thermal strain",
+          "note": "The thermal run retains a temperature field; the elasticity run consumes that exact artifact and applies dw_biot. No mechanical feedback is claimed."
+        },
+        "limitations": [
+          "Linear thermoelasticity only."
+        ]
+      },
+      {
+        "id": "em_time_and_band",
+        "description": "Run a time-domain FDTD evolution and a periodic eigenmode band solve on declared cells.",
+        "stages": [
+          {
+            "id": "time_domain",
+            "operation": "meep_time_evolution",
+            "runtime": "waves",
+            "inputs": [],
+            "outputs": [
+              "hdf5"
+            ]
+          },
+          {
+            "id": "band_structure",
+            "operation": "mpb_eigenmode",
+            "runtime": "waves",
+            "inputs": [],
+            "outputs": [
+              "hdf5"
+            ]
+          }
+        ],
+        "coupling_plan": null,
+        "limitations": [
+          "Serial solver; results are infinite-lattice or single-cell and need finite-size validation."
+        ]
+      },
+      {
+        "id": "acoustic_helmholtz",
+        "description": "Solve the frequency-domain acoustic Helmholtz equation and compare the pressure field with a plane-wave analytic reference below the duct cutoff.",
+        "stages": [
+          {
+            "id": "acoustic",
+            "operation": "sfepy_acoustic",
+            "runtime": "continuum",
+            "inputs": [],
+            "outputs": [
+              "vtk"
+            ]
+          }
+        ],
+        "coupling_plan": null,
+        "limitations": [
+          "Analytic comparison is a one-dimensional plane-wave limit."
+        ]
+      }
+    ],
+    "runtimes": [
+      {
+        "label": "continuum",
+        "kind": "conda",
+        "executable": "${LABORATORY_ROOT}/continuum/bin/python",
+        "description": "Continuum thermal, structural and acoustic SfePy environment.",
+        "capabilities": [
+          "sfepy",
+          "meshio",
+          "numpy",
+          "scipy",
+          "h5py",
+          "matplotlib"
+        ],
+        "probe_modules": [
+          "sfepy",
+          "meshio",
+          "numpy",
+          "scipy",
+          "h5py"
+        ],
+        "environment": {},
+        "lock_provenance": {
+          "kind": "conda-meta",
+          "path": "${LABORATORY_ROOT}/continuum/conda-meta",
+          "note": "Operator-managed continuum prefix; meshing uses its separate runtime."
+        },
+        "read_only_roots": [
+          "${LABORATORY_ROOT}/continuum"
+        ],
+        "resource_limits": {
+          "address_space_bytes": 8589934592,
+          "cpu_seconds": 900
+        },
+        "limitations": []
+      },
+      {
+        "label": "waves",
+        "kind": "conda",
+        "executable": "${LABORATORY_ROOT}/waves/bin/python",
+        "description": "Separate serial environment for electromagnetic work: Meep 1.34.0 with bundled MPB 1.12.0.",
+        "capabilities": [
+          "meep",
+          "mpb",
+          "h5py",
+          "numpy",
+          "scipy"
+        ],
+        "probe_modules": [
+          "meep",
+          "meep.mpb",
+          "h5py",
+          "numpy",
+          "scipy"
+        ],
+        "environment": {},
+        "lock_provenance": {
+          "kind": "conda-meta",
+          "path": "${LABORATORY_ROOT}/waves/conda-meta",
+          "note": "Operator-managed conda prefix; MPB is imported as meep.mpb."
+        },
+        "read_only_roots": [
+          "${LABORATORY_ROOT}/waves"
+        ],
+        "resource_limits": {
+          "address_space_bytes": 8589934592,
+          "cpu_seconds": 900
+        },
+        "limitations": [
+          "Serial build; no MPI parallel Meep."
+        ]
+      },
+      {
+        "label": "freecad",
+        "kind": "app_bundle",
+        "executable": "${FREECAD_APP}/Contents/Resources/bin/python",
+        "description": "Headless FreeCAD 1.1.4 parametric CAD and FEM workbench interpreter. Runs with the bundle's own PYTHONHOME/PYTHONPATH and a per-run cache home.",
+        "capabilities": [
+          "FreeCAD",
+          "Part",
+          "Import",
+          "Mesh",
+          "Fem",
+          "gmsh"
+        ],
+        "probe_modules": [
+          "FreeCAD",
+          "Part",
+          "Import",
+          "Mesh"
+        ],
+        "environment": {
+          "PYTHONHOME": "${FREECAD_APP}/Contents/Resources",
+          "PYTHONPATH": "${FREECAD_APP}/Contents/Resources/lib:${FREECAD_APP}/Contents/Resources",
+          "DYLD_LIBRARY_PATH": "${FREECAD_APP}/Contents/Resources/lib",
+          "CFFIXED_USER_HOME": "$WORKSPACE",
+          "SSL_CERT_FILE": "${FREECAD_APP}/Contents/Resources/ssl/cacert.pem",
+          "GIT_SSL_CAINFO": "${FREECAD_APP}/Contents/Resources/ssl/cacert.pem"
+        },
+        "lock_provenance": {
+          "kind": "app-bundle",
+          "path": "${FREECAD_APP}/Contents/Resources/conda-meta",
+          "note": "FreeCAD application bundle package inventory."
+        },
+        "read_only_roots": [
+          "${FREECAD_APP}/Contents/Resources"
+        ],
+        "resource_limits": {
+          "address_space_bytes": 8589934592,
+          "cpu_seconds": 900
+        },
+        "limitations": [
+          "GUI workbenches and interactive selection are unavailable; only headless modules are exposed."
+        ]
+      },
+      {
+        "label": "meshing",
+        "kind": "venv",
+        "description": "Isolated Gmsh and meshio environment for CAD import and volume meshing.",
+        "executable": "${LABORATORY_ROOT}/meshing/bin/python",
+        "environment": {},
+        "probe_modules": [
+          "gmsh",
+          "meshio",
+          "numpy"
+        ],
+        "capabilities": [
+          "gmsh",
+          "meshio",
+          "numpy"
+        ],
+        "read_only_roots": [
+          "${LABORATORY_ROOT}/meshing"
+        ],
+        "lock_provenance": {
+          "kind": "pip-freeze",
+          "path": "${LABORATORY_ROOT}/provenance/meshing-pip-freeze.txt",
+          "note": "Installed versions captured at provisioning."
+        },
+        "limitations": [
+          "No continuum or electromagnetic solver shares this process."
+        ],
+        "resource_limits": {
+          "address_space_bytes": 8589934592,
+          "cpu_seconds": 900
+        }
+      }
+    ],
+    "assessment": {
+      "contribution_review": true,
+      "analytic_probes_first": true,
+      "manufacturability": true,
+      "mesh_solver_convergence": true,
+      "conservation_residual_checks": true,
+      "robustness_study": true,
+      "equal_constraint_comparison": true,
+      "required_coupling_disclosure": [
+        "finite_structure",
+        "homogenization",
+        "independent",
+        "one_way",
+        "two_way"
+      ]
+    },
+    "limits": {
+      "max_runtime_seconds": 900,
+      "max_wall_seconds": 3600,
+      "max_input_bytes": 268435456,
+      "max_output_bytes": 268435456,
+      "max_runtime_files": 256
+    }
+  }
+}

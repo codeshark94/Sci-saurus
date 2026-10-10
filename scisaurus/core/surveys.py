@@ -22,6 +22,7 @@ from scisaurus.runtime.operation_adapters import get_adapter
 from scisaurus.runtime.survey_records import (
     normalize_check_envelope, normalize_gap_assessment_envelope, authoritative_source, has_section_heading,
     validate_work_review, validate_survey_review, normalize_survey_review_envelope,
+    CURRENT_MAP_REVIEW_PROTOCOLS,
 )
 
 
@@ -517,7 +518,10 @@ class SurveyGate:
         execution, context, reply = self._execution(body.get("execution_ref"), review["author"], survey["artifact_ref"])
         reply = normalize_check_envelope(reply, SURVEY_CHECKS)
         _, _, prompt, _ = self._model_review_execution(body["execution_ref"], review["author"])
-        if prompt.get("review_contract", {}).get("context_protocol") == "literature-current-map-review-2":
+        protocol = prompt.get("review_contract", {}).get("context_protocol")
+        if protocol is not None and protocol not in CURRENT_MAP_REVIEW_PROTOCOLS:
+            raise ValidationError("survey review context protocol is unsupported")
+        if protocol in CURRENT_MAP_REVIEW_PROTOCOLS:
             reply = normalize_survey_review_envelope(reply, current_map=prompt["map"])
             validate_survey_review(reply, current_map=prompt["map"])
             canonical_body = normalize_survey_review_envelope(

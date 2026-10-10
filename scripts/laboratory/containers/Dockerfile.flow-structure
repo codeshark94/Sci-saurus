@@ -1,0 +1,19 @@
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+ARG OPENFOAM_VERSION=20261008
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL https://dl.openfoam.org/gpg.key | gpg --dearmor -o /usr/share/keyrings/openfoam.gpg \
+    && echo 'deb [signed-by=/usr/share/keyrings/openfoam.gpg] https://dl.openfoam.org/ubuntu noble main' > /etc/apt/sources.list.d/openfoam.list \
+    && echo 'Acquire::AllowDowngradeToInsecureRepositories "false";' > /etc/apt/apt.conf.d/solver-repositories \
+    && sed -i 's|https://dl.openfoam.org/ubuntu|http://dl.openfoam.org/ubuntu|' /etc/apt/sources.list.d/openfoam.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       openfoam14=${OPENFOAM_VERSION} calculix-ccx=2.21-1 python3 python3-numpy \
+       python3-scipy python3-meshio python3-h5py python3-netcdf4 python3-venv python3-vtk9 \
+    && dpkg-query -W > /opt/package-lock.tsv && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv --system-site-packages /opt/solver-python \
+    && /opt/solver-python/bin/pip install --no-cache-dir ccx2paraview==3.2.0 \
+    && /opt/solver-python/bin/pip freeze > /opt/python-package-lock.txt
+ENV OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2
+RUN mkdir -p /opt/solver-bin && for tool in foamRun blockMesh foamToVTK checkMesh; do \
+    printf '#!/bin/bash\nsource /opt/openfoam14/etc/bashrc\nexec %s "$@"\n' "$tool" > /opt/solver-bin/$tool; \
+    chmod 755 /opt/solver-bin/$tool; done
+WORKDIR /work

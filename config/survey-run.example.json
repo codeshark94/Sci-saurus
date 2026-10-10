@@ -11,7 +11,13 @@
     "model": "runtime_required",
     "timeout_seconds": 180,
     "max_output_tokens": 8192,
-    "auth_env": null
+    "auth_env": null,
+    "role_models": {
+      "methods.survey-reviewer": {
+        "max_output_tokens": 32768,
+        "reasoning_effort": "low"
+      }
+    }
   },
   "limits": {
     "max_rounds": 2,

@@ -1,24 +1,22 @@
 # Sci-whale — Concept SSOT
 
-> **Version:** v1.5 · **Date:** 2026-09-13 · **Status:** normative design; the project-scoped department runtime and Composer work-order loop are implemented, with operational capability use remaining explicitly configured.
+> **Version:** v2.0 · **Date:** 2026-10-10 · **Status:** normative design; the project-scoped department runtime and Composer work-order loop are implemented, with operational capability use remaining explicitly configured.
 > This is the normative source for purpose, authority, terminology, and design decisions. [System Concept](05-system-concept.md) explains the organizing model. Architecture and execution contracts implement these decisions.
 > Preserve prior decisions. Amend them with explicit superseding decisions rather than rewriting history. Historical decision entries below are retained; this checkout does not contain a separate historical document archive.
 
 ## 1. Definition and primary objective
 
-**Sci-whale is a Principal-directed, compute-rich, general-purpose project organization that pursues evidence-backed progress through flexible, rationally supervised activity.** Investigation, alternative construction, synthesis, criticism, verification, and replanning are complementary reasoning activities. Its reusable core organizes goals, tasks, evidence, artifact versions, tools, independent checks, and time. The mission selects the deliverable and domain requirements.
+**Sci-whale is a Principal-directed laboratory for concept-led metamaterial development, built on a reusable evidence-backed project organization.** The current application compares useful physical concepts, gathers implementation evidence, runs bounded CAD and simulation pilots, and revises designs against independent checks. A manuscript is a possible downstream deliverable rather than the admission condition for every exploratory design.
 
-The flagship mission is **a user-supplied results package + rough storyline → broad external intelligence gathering → defensible argument → English manuscript → LaTeX source and rendered PDF**. Research & Intelligence, Strategy & Writing, Methods & Validation, and the Editorial Office retain distinct responsibilities while collaborating through a shared workspace, an organization-wide Web Intelligence Fabric, and recorded, event-driven exchanges.
+The Principal owns objectives and authority. Composer owns scope, dependency routing and durable state. DSH performs technical production in isolated sessions. Reviewers own independent scientific checks. The runtime never supplies invented coefficients, observations or positive findings to force completion.
 
-The central design objective is **compute → verified progress toward the Principal's goal**. This is a hypothesis to test, not a guarantee that additional inference produces a better artifact. Spending more compute must buy useful search, stronger evidence, independently verified repairs, better candidates, or reduced decision-relevant uncertainty. Extra messages and additional versions are not, by themselves, progress.
-
-External GPU capacity is assumed plentiful. The default policy spends generously on capable reasoning, depth, diverse approaches, and verification. It optimizes useful outcomes over elapsed time rather than minimizing tokens. Actual backend capacity and authorization are configured and measured; abundant inference does not create missing external evidence or an infallible evaluator.
+The design objective remains **compute → verified progress**. Dispatch must produce new evidence, an executable candidate, a verified repair or reduced decision-relevant uncertainty. Additional messages or versions alone are not progress. All model clients and DSH batches share three host-wide dispatch slots; available disk, memory, solver capability and remaining mission time constrain execution. No assumption of plentiful GPUs supersedes measured resources.
 
 ## 2. Vision roadmap
 
 | Horizon | Capability | Boundary |
 |---|---|---|
-| v1 | General-purpose project organization with mission-specific Scores, elastic inference, functional departments, on-demand Operations Cell, selected web/tools, scoped revisions, time accounting, and human release approval | Paper is the flagship; non-paper artifacts must exercise the same runtime. No new experiments or substantive analysis of raw research data |
+| v1 | General-purpose project organization with mission-specific Scores, elastic inference, functional departments, on-demand Operations Cell, selected web/tools, scoped revisions, time accounting, and human release approval | Historical initial scope; current concept and experiment scope is defined by D68–D70 |
 | v1.5 | Broader deliverables and custom Score composition, reusing department contracts | Generality beyond the implemented bounded revision contract must be demonstrated on additional missions |
 | v2 | Explicitly authorized scientific analysis/experimental execution beyond supplied results | Bounded local-program execution, deterministic replay, result provenance, and independent calculation/review are implemented; broader remote experiments and expert validation remain open |
 | v3 | Reusable organizational experience and external-agent collaboration | Process improvements are versioned, evaluated, and approved; no self-amendment of the Principal's intent |
@@ -334,6 +332,26 @@ then a chief synthesis and an adversarial verdict authored by a different
 appointment. Specialist failure or unknown external outcome remains scoped to
 that assignment and is never collapsed into a false whole-workflow success.
 
+**D68 — Concept-led metamaterial development is the primary application.**
+Compare concepts against a useful physical function and available execution tools;
+use focused literature to implement and challenge them; start authorized bounded
+pilots before building a publication argument. Provisional novelty remains explicit.
+Physical inconsistency, missing critical inputs and invalid experiments remain
+blocking. Negative outcomes do not authorize forced positive findings.
+
+**D69 — DSH owns technical production within the shared dispatch boundary.**
+Concept comparison, definition repairs, software production, Methods repair plans,
+executor and separately blinded validator authoring use configured DSH sessions.
+Ordinary model routes coordinate and review. Scientific acceptance remains
+independent of the engineering worker. All clients share three host-wide slots.
+
+**D70 — Dependencies and recovery are bound to their actual execution scope.**
+Control, desktop build, DSH, meshing, continuum, waves and container solver
+runtimes remain separate. Installation requires an attested profile before agent
+use. Format recovery closes on an exact owned successful response even when
+science is held; scientific repair identity includes its source lineage.
+Completed same-topic literature is retained and revised only at affected scope.
+
 ### 3.3 Effective interpretation of earlier rules
 
 | Earlier wording | Effective interpretation |
@@ -350,7 +368,7 @@ that assignment and is never collapsed into a false whole-workflow success.
 | A department owns an artifact namespace | Ownership permits responsibility and scoped proposals; it does not confer unrestricted whole-document editing |
 | Every draft is an immutable artifact | Accepted document versions compose exact structural-unit versions and pinned references; generated files are derived views |
 | Resource-aware tool execution is long-term | Practical project-local OSS/API/MCP setup and use are v1; new scientific experiments/estimation remain separately scoped |
-| Project means research project; other deliverables follow later | The core serves all authorized projects. Paper is the flagship, and the first non-paper Score proof belongs to the initial shared runtime |
+| Project means research project; other deliverables follow later | The core serves all authorized projects. Metamaterial development is the primary current application; manuscript and other Scores retain their own contracts |
 | More time or an existing baseline implies progress | First-result and completion targets are explicit; only a newly independently accepted artifact fulfills the first verified-result target |
 
 ## 4. Organization and authority
@@ -421,7 +439,14 @@ Every substantive artifact is immutable, version-pinned, owned, hashed, and link
 
 Structured deliverables additionally use `ContentUnit`, `DocumentManifest`, `ChangeRequest`, and `ChangeSet` as ArtifactVersion types. Their exact contracts are in `45-artifact-change-control.md`. Each unit's purpose, claim/evidence links, revision history, and review coverage remain inspectable. New whole-document candidates cannot evade edit grants by changing artifact IDs, replacing a parent, or modifying shared macros and references.
 
-## 9. v1 scope and non-goals
+## 9. Historical v1 scope and current authorization
+
+The following v1 boundary records the original supplied-results application.
+D68–D70 supersede its exclusion of experiments for explicitly authorized
+metamaterial missions: local CAD, numerical simulation and statistical analysis
+are permitted within the pinned mission and execution profile. External publication
+still requires release authority. Installation never expands scientific scope.
+
 
 **Included:** per-project organization/environment/capabilities; on-demand practical operations; delegated project-local program installation/build/connection and execution; supplied-results ingestion; organization-wide task-scoped web discovery; active API/tool-backed search campaigns; multilingual/source-class search where configured; source acquisition; reference normalization; evidence promotion and mapping; method/argument critique; writing; stable paragraph/structure management; purpose-scoped changes and independent integration; rendering; human approval; bounded event-driven rework; durable storage; recovery; and progress/cost measurement.
 
@@ -449,6 +474,9 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | File | Responsibility |
 |---|---|
 | `00-SSOT.md` | Intent, authority, decisions, concepts, and scope |
+| `10-runtime-dependencies.md` | Runtime separation, installation recipes, dependency pins and readiness boundaries |
+| `140-metamaterial-laboratory.md` | Concept development, CAD, solver profiles, artifact handoff and operational probes |
+| `dsh-batch.md` | Technical production, blinded authoring, receipts and shared dispatch limits |
 | `05-system-concept.md` | Organizing model, compute-rich supervision, anytime progress, and research rationale |
 | `15-project-organization.md` | Project instances, case-activated Operations Cell, tool environments, real execution evidence, and isolation |
 | `20-architecture-v0.md` | Organization, event-driven execution, evidence, storage, gates, and operational policies |
@@ -488,3 +516,5 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | v1.7 | D64; topic-maturity admission, evidence-driven topic refinement, and lineage-preserving re-entry |
 | v1.8 | D65–D66; pre-composition scientific red-team gate and single-source functional routing with concrete agent roster |
 | v1.9 | D67; project-organization-2 bounded specialist pool, role-isolated Composer assignments, independent verdict artifacts, and v1 migration |
+
+| v2.0 | D68–D70; concept-led metamaterial development, DSH technical production, shared three-slot dispatch, isolated dependencies and scope-bound recovery |

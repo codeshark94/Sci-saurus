@@ -5,7 +5,9 @@
   "scripts": {
     "backend": "python3 build_backend.py",
     "dev": "tauri dev",
-    "build": "tauri build --bundles app"
+    "build": "tauri build --bundles app -- --locked"
   },
-  "devDependencies": {"@tauri-apps/cli": "^2.0.0"}
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1"
+  }
 }

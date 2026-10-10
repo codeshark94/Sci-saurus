@@ -933,6 +933,47 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(created["project"], "missions/fixture-run")
         self.assertTrue((root / "missions" / "fixture-run" / "workflow.json").is_file())
 
+    def test_laboratory_project_defaults_to_concept_comparison_and_preserves_explicit_portfolio(self):
+        from scisaurus.tests.test_laboratory import _profile
+        from scisaurus.runtime.laboratory import laboratory_identity
+        from scisaurus.runtime.topic_discovery import validate_topic_stage_config
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path).resolve()
+            model = root / "model.json"
+            model.write_text("{}")
+            laboratory = _profile()
+            lab_path = root / "laboratory.json"
+            lab_path.write_text(json.dumps(laboratory))
+            config = {"schema_version": "topic-discovery-config-1", "model_config_path": str(model),
+                      "output_path": str(root / "topic" / "output.json"), "candidate_count": 4,
+                      "max_attempts": 4, "maturity_review_rounds": 1}
+            config_path = root / "topic.json"
+            workflow = {"schema_version": "composer-workflow-1", "id": "lab-template", "revision": 1,
+                        "project_id": str(root / "composer"), "objective": "Develop architected materials",
+                        "laboratory_config_path": str(lab_path),
+                        "laboratory_config_sha256": laboratory_identity(laboratory),
+                        "stages": [{"id": "topic", "kind": "topic_discovery", "config_path": str(config_path),
+                            "project_dir": str(root / "topic"), "depends_on": [], "estimate_seconds": 1,
+                            "bindings": [], "deadline_seconds": 10, "reuse_completed": False,
+                            "reuse_output_path": None}],
+                        "time_policy": {"first_result_seconds": 1, "target_seconds": 10,
+                                        "hard_seconds": 3600, "checkpoint_seconds": 1},
+                        "completion": {"required_stage_ids": ["topic"], "release_requires_human": True}}
+            (root / "workflow.json").write_text(json.dumps(workflow))
+            service = DashboardService(root)
+            for explicit in (False, True):
+                descriptor = {**config, **({"intake_mode": "portfolio"} if explicit else {})}
+                config_path.write_text(json.dumps(descriptor))
+                slug = "portfolio-run" if explicit else "concept-run"
+                result = service.create_project({"template": ".", "slug": slug,
+                    "objective": "Develop a useful architected material", "hard_seconds": 3600})
+                created = json.loads((root / result["project"] / "topic.json").read_text())
+                validate_topic_stage_config(created)
+                self.assertEqual(created["intake_mode"], "portfolio" if explicit else "concept")
+                self.assertEqual(created["candidate_count"], 4 if explicit else 3)
+                self.assertEqual(created["maturity_review_rounds"], 1 if explicit else 0)
+                self.assertEqual(json.loads(config_path.read_text()), descriptor)
+
     def test_project_manager_creates_isolated_validated_workflow(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

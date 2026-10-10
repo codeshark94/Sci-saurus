@@ -155,11 +155,16 @@ class DiscoveryTests(unittest.TestCase):
         work,_=put('kb/works/example',1,{'work_id':'example','title':'Original title'})
         source,sha=put('kb/abstracts/example',1,{'work_id':'example','text':'Exact source','representation':'abstract'})
         put('kb/abstracts/example',2,{'work_id':'example','text':'New head','representation':'abstract'})
-        put('kb/surveys/current',1,{'schema_version':'literature-survey-3','source_refs':[source],'work_refs':[work]})
+        score,_=put('command/scores/current',1,{'schema_version':'literature-survey-score-1','survey':{'question':'Does the design work?'}})
+        put('kb/surveys/current',1,{'schema_version':'literature-survey-3','score_ref':score,'source_refs':[source],'work_refs':[work]})
         db.execute("INSERT INTO accepted_heads VALUES('kb/surveys/current',1)");db.commit();db.close()
-        result=accepted_survey_sources(self.root)
+        result=accepted_survey_sources(self.root, survey_ref='artifact:kb/surveys/current@1', question='Does the design work?')
         self.assertEqual(result['sources'][0]['text'],'Exact source')
         self.assertEqual(result['sources'][0]['origin_sha256'],sha)
+        with self.assertRaises(ValidationError):
+            accepted_survey_sources(self.root, survey_ref='artifact:kb/surveys/current@2')
+        with self.assertRaises(ValidationError):
+            accepted_survey_sources(self.root, question='Another question')
         (self.root/'objects/sha256'/sha).write_text('{}')
         with self.assertRaises(ValidationError):accepted_survey_sources(self.root)
 
@@ -176,11 +181,12 @@ class DiscoveryTests(unittest.TestCase):
                 'work_id':'example','title':'Scientific mechanism','doi':None,'url':None,
                 'representation':'abstract','identity_verified':True,'text':'Exact accepted source'}
         stage={'id':'experiment','kind':'experiment','depends_on':['bridge']}
-        runner=SimpleNamespace(root=self.root,context={},workflow={'stages':[
+        runner=SimpleNamespace(root=self.root,context={'survey':{'project_dir':'accepted-survey/continuations/cycle-11',
+                'survey_ref':source['bundle_ref']}},workflow={'stages':[
             {'id':'survey','kind':'survey','project_dir':'accepted-survey','depends_on':[]},
             {'id':'unrelated','kind':'survey','project_dir':'unrelated-survey','depends_on':[]},
             {'id':'bridge','kind':'argument','depends_on':['survey']},stage]},
-            store=SimpleNamespace(head=lambda _:None))
+            store=SimpleNamespace(head=lambda _:None), _software_author_backend_config=lambda:None)
         captured=[]
         def publish(logical,kind,body,actor):
             captured.append((logical,body))
@@ -190,8 +196,8 @@ class DiscoveryTests(unittest.TestCase):
                    return_value={'status':'available','bundle_ref':source['bundle_ref'],
                                  'bundle_sha256':source['bundle_sha256'],'sources':[source]}) as load:
             with self.assertRaises(Captured):
-                ComposerRunner._assess_scientific_software(runner,stage,{}, {'topic':{'id':'question'}})
-            load.assert_called_once_with('accepted-survey')
+                ComposerRunner._assess_scientific_software(runner,stage,{}, {'topic':{'id':'question','research_question':'Does the design work?'}})
+            load.assert_called_once_with('accepted-survey/continuations/cycle-11', survey_ref=source['bundle_ref'], question='Does the design work?')
             first=captured[-1]
             catalog=first[1]['evidence_catalog']
             self.assertEqual(catalog[0]['origin_ref'],source['origin_ref'])
@@ -201,7 +207,7 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(retained['text'],source['text'])
             source['text']='New accepted source'
             with self.assertRaises(Captured):
-                ComposerRunner._assess_scientific_software(runner,stage,{}, {'topic':{'id':'question'}})
+                ComposerRunner._assess_scientific_software(runner,stage,{}, {'topic':{'id':'question','research_question':'Does the design work?'}})
             self.assertNotEqual(first[0],captured[-1][0])
 
     def test_brave_key_not_in_output_and_redirect_not_followed(self):

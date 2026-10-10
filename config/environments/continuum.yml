@@ -1,0 +1,12 @@
+name: sciwhale-continuum
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.15
+  - sfepy=2026.3
+  - numpy=2.5.3
+  - scipy=1.18.1
+  - meshio=5.3.5
+  - h5py=3.16.0
+  - netcdf4=1.7.4
+  - matplotlib=3.11.2

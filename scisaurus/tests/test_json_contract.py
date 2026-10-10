@@ -9,6 +9,21 @@ from scisaurus.runtime.models import ModelResult
 
 
 class TestJSONContract(unittest.TestCase):
+    def test_invalid_escape_reports_location_without_rewriting_mathematics(self):
+        from scisaurus.runtime.execution import SYSTEM
+        import json
+        import re
+        sample = re.search(r'for example, (\{[^}]+\}) encodes', SYSTEM).group(1)
+        self.assertEqual(json.loads(sample), {"symbol": r"\omega"})
+        invalid = r'{"symbol":"\omega","rationale":"unchanged"}'
+        for text in (invalid, '```json\n' + invalid + '\n```'):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    ValidationError, r'valid JSON: Invalid.*escape at line 1, column'):
+                ModelResult(text, "fixture", {}, 0, "stop").json_object(allow_missing_closers=True)
+        valid = r'{"symbol":"\\omega","rationale":"unchanged"}'
+        self.assertEqual(ModelResult(valid, "fixture", {}, 0, "stop").json_object(),
+                         {"symbol": r"\omega", "rationale": "unchanged"})
+
     def test_model_wrappers_decode_identically_on_execution_and_replay(self):
         for text in ('{"ok":true}', '```json\n{"ok":true}\n```',
                      'reasoning</think>{"ok":true}',

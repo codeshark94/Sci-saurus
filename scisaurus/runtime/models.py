@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from copy import deepcopy
 from contextlib import closing
 from email.utils import parsedate_to_datetime
 import base64
@@ -889,6 +890,33 @@ def model_context_budget(config, *, system, prompt, image_count=0):
         "image_count": image_count,
         "fits": allowed is None or estimated <= allowed,
     }
+
+
+def resumed_model_execution_config(retained, requested):
+    """Update execution capacity without changing retained routes or quotas."""
+    controls = frozenset({"max_output_tokens", "max_input_tokens", "reasoning_effort"})
+
+    def without_controls(value):
+        if isinstance(value, dict):
+            return {key: without_controls(item) for key, item in value.items() if key not in controls}
+        if isinstance(value, list):
+            return [without_controls(item) for item in value]
+        return value
+
+    if not isinstance(retained, dict) or not isinstance(requested, dict):
+        raise ValidationError("resumed model execution configuration must be an object")
+    if without_controls(retained) != without_controls(requested):
+        raise ValidationError("resumed model execution controls cannot change provider routes or quotas")
+    roles = set().union(*(requested.get(key, {}) for key in (
+        "role_models", "role_model_fallbacks", "role_routes", "role_profiles")))
+    for role in sorted(roles):
+        for candidate in model_route_candidates(requested, role=role):
+            _validate_context_policy(candidate)
+        base = resolve_model_config(requested, role=role)
+        for route in role_routes_for(requested, role):
+            _validate_context_policy(merge_model_config(base, {
+                key: value for key, value in route.items() if key not in {"id", "pool"}}))
+    return deepcopy(requested)
 
 
 def resolve_model_config(model, *, role=None, overrides=None):
@@ -2170,7 +2198,7 @@ class ModelClient:
                 if reason not in {"stop", "length", "load", "unload", "unknown"}:
                     raise ValueError("unsupported completion state")
                 message = data.get("message", {}) if self.protocol == "ollama" else choice.get("message", {})
-                thinking = message.get("thinking", message.get("reasoning_content"))
+                thinking = message.get("thinking", message.get("reasoning_content", message.get("reasoning")))
                 metadata = {"reasoning_effort": self.reasoning_effort,
                             "wire_reasoning": body.get("think", body.get("reasoning_effort")),
                             "max_output_tokens": self.max_output_tokens, "answer_bytes": len(text.encode()),

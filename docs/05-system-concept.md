@@ -1,15 +1,25 @@
 # Sci-whale — System Concept
 
-> **Version:** v0.8 · **Date:** 2026-09-10 · **Status:** proposed system design, not measured runtime behavior.
-> Governing decisions: [Concept SSOT](00-SSOT.md), especially D25–D36. Field definitions: [Execution Contract](40-execution-contract.md).
+> **Version:** v1.0 · **Date:** 2026-10-10 · **Status:** current organizing contract; scientific outcomes require mission-specific validation.
+> Governing decisions: [Concept SSOT](00-SSOT.md), especially D68–D70. Field definitions: [Execution Contract](40-execution-contract.md).
 
 ## 1. Purpose
 
-Sci-whale is a research organization for turning abundant inference capacity into useful results over time. It can pursue multiple explanations, inspect difficult evidence, try competing constructions, and challenge its own choices. The human Principal sets the destination. The organization decides how to investigate and produce within that mandate.
+Sci-whale develops useful metamaterial concepts through focused evidence gathering,
+CAD and simulation, independent checks and design iteration. The human Principal
+sets objectives and constraints. Composer chooses dependency-ready actions; DSH
+performs technical production in isolated file-based sessions. Reviewers check the
+exact current source, inputs, observations and claims.
 
-The default resource premise is plentiful external GPU capacity. The design therefore favors capable models, substantial deliberation, broad parallel exploration, and strong independent verification when these can improve the result. Token minimization is not the objective. Attention to the right questions, external evidence, verifier reliability, coordination delay, and elapsed time remain constraints even with abundant GPUs.
+The first actionable target is a baseline and a small discriminating pilot.
+Unresolved publication novelty remains evidence debt and does not alone stop an
+authorized exploratory pilot. Essential physics, geometry, input availability and
+execution validity remain explicit gates. Paper production is a downstream option.
 
-The first application is paper production from supplied results. Paper stages are delivery milestones; they do not define the limits or order of internal thought. New experimental execution remains a later capability, distinct from inference running on remote GPUs.
+Compute is measured and bounded: all model routes and DSH sessions share three
+host-wide dispatch slots. Resource inspection, installation probes and runtime
+attestation precede scientific tool use. Repeated identical requests, rediscovered
+known failures and metadata-only revisions are not useful progress.
 
 ## 2. Organizing model
 
@@ -118,7 +128,7 @@ as decoration without a reader-facing job.
 
 The final assembly then projects the control plane into a reader-facing scientific surface. Operational labels, hashes, reservations, repair scopes, and reviewer bookkeeping remain queryable in the project archive and reproducibility note; the article describes the dataset, method, result, uncertainty, and implication in public academic language. An editorial compression gate checks that numeric facts and caveats are not repeated mechanically, that Results reports observations while Discussion explains them, that each figure makes an argument in the text, and that limitations are retained because they change the conclusion's scope.
 
-## 5. Generous compute with executable boundaries
+## 5. Measured compute with executable boundaries
 
 Separate three resource concepts:
 
@@ -130,7 +140,7 @@ An authorized capacity pool may be used through automatically renewable windows 
 
 The allocation order is intent-defined. As an initial policy, address validity and missing critical evidence, keep verification and integration moving, deepen promising work, and preserve capacity for materially different alternatives. Adapt this order when observed bottlenecks or mission priorities justify it. Do not invent fixed percentage weights for exploration versus verification.
 
-Remote GPU workers are an initial deployment target, behind the same runner contract as local inference. The control plane keeps durable state; workers receive scoped contexts and return candidate outputs. A cancelled or expired lease cannot later publish an authoritative result. More producers are admitted only when evidence acquisition, review, and integration can absorb their output.
+Configured model providers and local scientific runtimes have distinct capacities. The control plane keeps durable state; workers receive scoped contexts and return candidate outputs. All model clients and DSH sessions share three host-wide dispatch slots. A cancelled or expired lease cannot later publish an authoritative result. More producers are admitted only when evidence acquisition, review, and integration can absorb their output.
 
 Fixed review-round and message-count ceilings are replaced by checkpoints, causal deduplication, provider failure handling, and evidence-backed continuation decisions. Operational retries remain bounded. Window renewal preserves the complete causal history, cumulative usage, and stagnation state.
 
@@ -183,7 +193,7 @@ Build one durable, concurrent improvement loop before implementing the full role
 
 The first demonstration must show automatic lease renewal inside an existing delegation, redirection after unproductive work, preservation of valid coverage, correct rejection of a false criticism, and independent repair verification. It must also survive worker loss and resume without accepting stale outputs. Remote inference is exercised early; framework proliferation is deferred.
 
-Evaluate both equal-resource quality and equal-wall-clock usefulness. Compare a capable single-agent workflow, independent candidates with verification, and the supervised activity graph. Plot accepted quality and material discoveries over elapsed time, time to first usable result, stagnation duration, review backlog, and resource usage. Use held-out cases and external checks; supervisor scores are diagnostics. The question is whether abundant compute becomes earlier or better defensible results.
+Evaluate both equal-resource quality and equal-wall-clock usefulness. Compare a capable single-agent workflow, independent candidates with verification, and the supervised activity graph. Plot accepted quality and material discoveries over elapsed time, time to first usable result, stagnation duration, review backlog, and resource usage. Use held-out cases and external checks; supervisor scores are diagnostics. The question is whether measured computation produces earlier or better defensible results.
 
 ## 10. Research rationale and limits
 

@@ -2,6 +2,7 @@
 from copy import deepcopy
 import json
 import math
+import unicodedata
 from pathlib import Path
 
 from scisaurus.core.errors import ValidationError
@@ -14,6 +15,37 @@ from scisaurus.runtime.time_policy import validate_time_policy
 
 SEARCH_LIMITS = {"queries_per_role", "results_per_query", "max_works", "challenge_reserve", "expansion_rounds", "expansion_seed_count",
                  "references_per_work", "max_api_calls", "min_new_works", "saturation_rounds", "max_full_texts", "max_text_chars", "context_chars"}
+
+def query_identity(query):
+    return " ".join(unicodedata.normalize("NFC", query).split())
+
+
+def search_plan_response_contract(max_queries):
+    return {"schema_version": "literature-search-plan-1", "exact_fields": ["queries", "rationale"],
+            "queries": {"type": "array of unique nonempty search strings", "min_items": 1,
+                        "max_items": max_queries, "max_string_length": 2048},
+            "rationale": {"type": "nonempty string", "content":
+                "Explain the search strategy and retain any assumptions, limitations and scope notes here."},
+            "additional_fields": False,
+            "completion_boundary": "This response plans searches; it does not report executed searches or resolve downstream obligations."}
+
+
+def validate_search_plan(value, max_queries):
+    contract = search_plan_response_contract(max_queries)
+    fields = set(contract["exact_fields"])
+    if not isinstance(value, dict):
+        raise ValidationError("search plan must be an object with exactly queries and rationale")
+    if set(value) != fields:
+        raise ValidationError(f"search plan has invalid fields: missing {sorted(fields - set(value))}, "
+                              f"extra {sorted(set(value) - fields)}; retain scope notes in rationale")
+    queries = value["queries"]
+    if (not isinstance(queries, list) or not 1 <= len(queries) <= max_queries
+            or any(not isinstance(q, str) or not q.strip() or len(q) > 2048 for q in queries)
+            or len({query_identity(q) for q in queries}) != len(queries)
+            or not isinstance(value["rationale"], str) or not value["rationale"].strip()):
+        raise ValidationError("search plan requires unique bounded queries and a rationale")
+    for query in queries:
+        search_query(query)
 
 
 def validate_survey_work_orders(value):
@@ -74,6 +106,10 @@ def validate_survey_config(value):
         fields.add("provider_intervals")
     if isinstance(survey, dict) and "bibliography_fallback" in survey:
         fields.add("bibliography_fallback")
+    if isinstance(survey, dict) and "design_brief" in survey:
+        from scisaurus.runtime.material_development import validate_design_brief
+        validate_design_brief(survey["design_brief"])
+        fields.add("design_brief")
     exact(survey, fields, "survey")
     identifier(survey["id"])
     if type(survey["revision"]) is not int or survey["revision"] < 1:

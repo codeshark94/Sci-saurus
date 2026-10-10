@@ -21,6 +21,7 @@ from scisaurus.runtime.model_dispatch import model_dispatch_slot
 from scisaurus.runtime.models import ModelResult
 from scisaurus.runtime.program_sandbox import SANDBOX_EXEC, sandbox_profile
 from scisaurus.runtime.run_control import ensure_run_allowed, start_process
+from scisaurus.runtime.run_control import RunPausedError
 
 
 class DshBatchError(ModelWorkBlocked):
@@ -144,9 +145,29 @@ class DshBatchRunner:
                        time.monotonic() + self.config["timeout_seconds"])
         # One DSH session has sequential model steps. Keep its slot until the
         # process tree is reaped, including periods spent editing and executing.
-        with model_dispatch_slot(deadline=deadline) as slot:
-            return self._run(task, inputs=inputs, seed_files=seed_files,
-                             outputs=outputs, deadline=deadline, dispatch_slot=slot)
+        try:
+            with model_dispatch_slot(deadline=deadline) as slot:
+                return self._run(task, inputs=inputs, seed_files=seed_files,
+                                 outputs=outputs, deadline=deadline, dispatch_slot=slot)
+        except DshBatchError:
+            raise
+        except (ValidationError, TimeoutError, OSError) as exc:
+            if isinstance(exc, RunPausedError) and getattr(exc, "receipt", None):
+                raise
+            job = self.root / uuid.uuid4().hex
+            job.mkdir(parents=True)
+            receipt = job / "receipt.json"
+            usage = {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}
+            receipt.write_bytes(canonical_bytes({
+                "schema_version": "dsh-batch-receipt-1", "status": "not_dispatched",
+                "config_sha256": hashlib.sha256(canonical_bytes(self.config)).hexdigest(),
+                "provider": self.config["provider"], "model": self.config["model"],
+                "task_sha256": hashlib.sha256(task.encode()).hexdigest(),
+                "usage": usage, "error": f"{type(exc).__name__}: {exc}"}))
+            if isinstance(exc, RunPausedError):
+                exc.receipt, exc.usage, exc.dsh_not_dispatched = str(receipt), usage, True
+                raise
+            raise DshBatchError(str(exc), receipt=receipt, usage=usage) from exc
 
     def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot):
         ensure_run_allowed()
@@ -223,15 +244,16 @@ class DshBatchRunner:
         except BaseException as exc:
             state.update(status="not_dispatched", error=f"{type(exc).__name__}: {exc}")
             save()
-            raise
-        state.update(status="running", pid=process.pid)
-        save()
+            if isinstance(exc, RunPausedError):
+                exc.receipt, exc.usage, exc.dsh_not_dispatched = str(receipt), dict(state["usage"]), True
+                raise
+            raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"]) from exc
         start = time.monotonic()
         finish = None
         received = False
         message_id = None
         pending_events = []
-        selector = selectors.DefaultSelector()
+        selector = None
         buffers = {"stdout": bytearray()}
         calls_seen = set()
         step_usage = {}
@@ -284,6 +306,9 @@ class DshBatchRunner:
                 finish = event.get("data", {}).get("reason", {}).get("kind")
             return received and payload.get("method") == "session.status" and params.get("status") == "idle"
         try:
+            state.update(status="running", pid=process.pid)
+            save()
+            selector = selectors.DefaultSelector()
             for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
                 os.set_blocking(stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, name)
@@ -351,21 +376,51 @@ class DshBatchRunner:
             state.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}", finish_reason=finish)
             raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"]) from exc
         finally:
-            # Transport disposal may outlast the supervisor's grace period.
-            # Persist the known outcome and usage before any blocking cleanup.
+            # Persist the paid outcome before disposal; disposal failure must
+            # retain the same receipt and usage instead of replacing them.
+            cleanup_errors = []
+            state["elapsed_seconds"] = time.monotonic() - start
             try:
-                state["elapsed_seconds"] = time.monotonic() - start
                 save()
-            finally:
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            try:
+                terminate_tree(process)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                # TERM gives the DSH managed-group registry a final disposal
+                # opportunity even when process enumeration itself failed.
                 try:
-                    terminate_tree(process)
-                    state["process_reaped"] = process.poll() is not None
-                finally:
-                    selector.close()
-                    for stream in (process.stdin, process.stdout, process.stderr):
-                        stream.close()
-                    state["elapsed_seconds"] = time.monotonic() - start
-                    save()
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                except Exception as fallback_error:
+                    cleanup_errors.append(fallback_error)
+            state["process_reaped"] = process.poll() is not None
+            for resource in (selector, process.stdin, process.stdout, process.stderr):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except Exception as exc:
+                    cleanup_errors.append(exc)
+            state["elapsed_seconds"] = time.monotonic() - start
+            if cleanup_errors:
+                state["cleanup_error"] = "; ".join(
+                    f"{type(error).__name__}: {error}" for error in cleanup_errors)
+            try:
+                save()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            if cleanup_errors:
+                raise DshBatchError("DSH transport disposal failed: " + "; ".join(
+                    f"{type(error).__name__}: {error}" for error in cleanup_errors),
+                    receipt=receipt, usage=state["usage"]) from cleanup_errors[0]
+
 
 
 class DshAuthorClient:
@@ -449,6 +504,97 @@ class DshAuthorClient:
             self.model, result["usage"], result["elapsed_seconds"], "stop",
             response_metadata={"backend": "dsh-batch-1", "receipt": result["receipt"],
                                "configuration_sha256": hashlib.sha256(canonical_bytes(self.config)).hexdigest()})
+
+
+class DshStructuredProducerClient:
+    """Author a file-backed structured deliverable under the controller contract."""
+
+    deliverable_label = "structured producer"
+
+    def __init__(self, config, *, root, runtime_python):
+        self.config = validate_batch_config(config)
+        self.model = config["model"]
+        self.timeout_seconds = config["timeout_seconds"]
+        self.max_output_tokens = config["max_output_tokens"]
+        self.runtime_python = str(Path(runtime_python).absolute())
+        self.runner = DshBatchRunner(config, root=root,
+            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)])
+
+    def task(self, assignment):
+        return (
+            "Read the immutable assignment.json and system-contract.txt. Complete the assigned "
+            "research or engineering production task in this workspace. Use files, local checks "
+            "and revisions to satisfy the exact response contract before finishing. Write the "
+            "complete deliverable to response.json as one strict JSON object, with no markdown "
+            "or trailing text. output_contract describes the top-level deliverable; nested field "
+            "contracts remain nested. Preserve required candidate counts, identities, input and "
+            "evidence boundaries. Do not invent observations, citations, successful execution or "
+            "scientific validation. The controller validates and admits the deliverable separately. "
+            "Your final chat answer is not the deliverable; response.json is.")
+
+    def complete(self, *, system, prompt):
+        try:
+            assignment = json.loads(prompt)
+        except ValueError as exc:
+            raise ValidationError(
+                "DSH producer assignment must be a strict JSON object") from exc
+        if not isinstance(assignment, dict):
+            raise ValidationError("DSH producer assignment must be a JSON object")
+        # Preserve every scientific field.  Only controller-internal envelope
+        # keys are projected away; the response contract itself is delivered as
+        # a frozen input file so the producer can satisfy it without guessing.
+        projected = deepcopy(assignment)
+        for key in ("author_backend",):
+            projected.pop(key, None)
+        projected["runtime_python"] = self.runtime_python
+        result = self.runner.run(
+            self.task(projected),
+            inputs={"assignment.json": canonical_bytes(projected),
+                    "system-contract.txt": (system or "").encode("utf-8")},
+            outputs=["response.json"],
+            deadline=time.monotonic() + self.timeout_seconds)
+        try:
+            response = json_object(result["files"]["response.json"].decode("utf-8"),
+                                   "DSH " + self.deliverable_label + " response")
+        except (ValidationError, ValueError, UnicodeError) as exc:
+            raise DshBatchError(f"invalid {self.deliverable_label} deliverable: {exc}",
+                                receipt=result["receipt"], usage=result["usage"]) from exc
+        if not isinstance(response, dict) or not response:
+            raise DshBatchError("DSH " + self.deliverable_label + " response must be a nonempty JSON object",
+                                receipt=result["receipt"], usage=result["usage"])
+        return ModelResult(
+            json.dumps(response, ensure_ascii=False, sort_keys=True),
+            self.model, result["usage"], result["elapsed_seconds"], "stop",
+            response_metadata={"backend": "dsh-batch-1", "receipt": result["receipt"],
+                               "configuration_sha256": hashlib.sha256(
+                                   canonical_bytes(self.config)).hexdigest()})
+
+
+class DshSoftwareProducerClient(DshStructuredProducerClient):
+    """Produce controller operations; local diagnostic runs are not receipts."""
+
+    deliverable_label = "software producer"
+
+    def task(self, assignment):
+        task = (
+            "Read assignment.json and system-contract.txt. You are the scientific software "
+            "engineering producer. Develop and debug the scripts required by the declared "
+            "scientific operations by editing files and running them inside this workspace; "
+            "those local runs are diagnostic development evidence and are NEVER controller "
+            "receipts. The controller alone executes every declared operation and returns its "
+            "receipt-bound result on the next turn. Export response.json as exactly one strict "
+            "JSON object with no prose, markdown, fence, or trailing characters: either "
+            "{\"tool_action\": {\"operation\": <name>, \"arguments\": <object>}} to request one "
+            "controller operation, or the complete final producer response required by the "
+            "assignment and system contract. Do not invent observations, do not present a "
+            "shell command or its stdout as a scientific result, and do not name a host path "
+            "outside a declared runtime label. Experimental admission and independent "
+            "validation are owned by the controller. Your final chat answer is not the "
+            "deliverable; response.json is.")
+        if isinstance(assignment.get("scientific_software_tools"), dict):
+            task += (" The scientific_software_tools object in assignment.json declares the "
+                     "exact controller operations and argument schema you may request.")
+        return task
 
 
 class DshValidatorClient:

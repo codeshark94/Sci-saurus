@@ -37,6 +37,16 @@ No GUI is required. Multiple work orders can be
 submitted sequentially by an external batch queue; sessions never share writable
 files or conversation state.
 
+## Production responsibilities
+
+With a pinned laboratory author backend, DSH produces concept comparisons,
+source-definition repairs, scientific software and Methods repair plans as
+file-based assignments. Ordinary models coordinate and independently review.
+The controller validates returned files against the current assignment and retains
+its receipt; it does not fill missing scientific values or rewrite agent results.
+A definition repair preserves topic identity and existing literature. A completed
+response-format repair closes separately from any remaining scientific hold.
+
 ## Foundry integration
 
 Set `author_backend` in `capability-foundry-config-1` configuration to the generated JSON

@@ -1,0 +1,5 @@
+FROM simvia/code_aster:18.1.0@sha256:4629a21a109309bb97fbdc27d750445cc869e151e2e2ed6290f69539614e4435
+ENV PATH=/opt/spack/var/spack/environments/simvia_env/.spack-env/view/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/opt/spack/var/spack/environments/simvia_env/.spack-env/view/lib \
+    PYTHONPATH=/opt/spack/var/spack/environments/simvia_env/.spack-env/view/lib/python3.11/site-packages
+WORKDIR /work

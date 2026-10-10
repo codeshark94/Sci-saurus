@@ -15,6 +15,27 @@ from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
 
 
 SEARCH_PLANNERS = ("research.search-planner", "methods.blind-search-planner")
+PLAN_FIELDS = {"decision", "rationale", "branches"}
+BRANCH_FIELDS = {"parent_id", "question", "rationale", "operation", "query", "work_id", "evidence"}
+
+
+def exploration_response_contract():
+    """Expose the same branch envelope enforced by the local validator."""
+    return {
+        "required_fields": sorted(PLAN_FIELDS),
+        "decision_values": ["expand", "stop"],
+        "branches": {"required_fields": sorted(BRANCH_FIELDS),
+            "operation_values": ["search", "work", "citing"],
+            "inactive_parameters": {"search": {"work_id": None},
+                                    "work": {"query": None}, "citing": {"query": None}},
+            "work_id_binding": {
+                "root_parent": "For work, a canonical work ID from the scientific intake.",
+                "read_parent": "For work or citing, select a handle from this parent's citation_targets with the same operation. Work follows a reference; citing follows incoming citations. Neither operation re-reads the parent itself.",
+                "unlisted_target": "Do not reuse an unlisted ID or substitute an unrelated permitted target. Use a justified search with this parent's captured evidence, or close the inquiry with an explicit reason.",
+            },
+            "evidence": {"root_parent": "An explicitly empty list; no source evidence is available.",
+                         "read_parent": "A nonempty list of captured evidence owned by that parent."}},
+    }
 
 
 def node_id(value):
@@ -55,6 +76,40 @@ def planning_parent(node, alias, work=None, entry=None, review=None):
     return result
 
 
+def citation_targets(parents, parent_aliases):
+    """Expose acquisition handles bound to one reviewed parent and direction."""
+    targets = {}
+    for alias, parent_id in parent_aliases.items():
+        parent = parents[parent_id]
+        if parent["kind"] != "read":
+            continue
+        for index, wid in enumerate(dict.fromkeys(parent.get("referenced_works", []))):
+            work_id(wid)
+            targets[f"{alias}-reference-{index}"] = {
+                "parent_id": parent_id, "operation": "work", "work_id": wid}
+        work_id(parent["work_id"])
+        targets[f"{alias}-citing"] = {
+            "parent_id": parent_id, "operation": "citing", "work_id": parent["work_id"]}
+    return targets
+
+
+def bind_plan_citations(value, targets):
+    """Resolve exact handles; never infer a reference from prose or another parent."""
+    value = deepcopy(value)
+    for index, branch in enumerate(_plan_branches(value)):
+        handle = branch.get("work_id")
+        target = targets.get(handle) if isinstance(handle, str) else None
+        if target is None:
+            continue
+        if (branch["parent_id"] != target["parent_id"]
+                or branch["operation"] != target["operation"]):
+            raise ModelContractError(
+                f"branch {index} citation handle {handle!r} does not belong to "
+                "the assigned parent and acquisition direction")
+        branch["work_id"] = target["work_id"]
+    return value
+
+
 def bind_plan_parents(value, parent_aliases):
     """Bind assigned parents and canonicalize inactive acquisition parameters."""
     value = deepcopy(value)
@@ -75,18 +130,26 @@ def bind_plan_parents(value, parent_aliases):
 
 
 def _plan_branches(value, *, max_branches=None):
-    if not isinstance(value, dict) or set(value) != {"decision", "rationale", "branches"}:
-        raise ModelContractError("exploration plan requires decision, rationale, and branches")
+    if not isinstance(value, dict):
+        raise ModelContractError("exploration plan must be an object")
+    if set(value) != PLAN_FIELDS:
+        raise ModelContractError("exploration plan has invalid fields: "
+                                 f"missing {sorted(PLAN_FIELDS - set(value))}, "
+                                 f"extra {sorted(set(value) - PLAN_FIELDS)}")
     if value["decision"] not in ("expand", "stop"):
-        raise ModelContractError("exploration decision must be expand or stop")
+        raise ModelContractError("decision: must be expand or stop")
     if not isinstance(value["rationale"], str) or not value["rationale"].strip():
-        raise ModelContractError("exploration decision requires a rationale")
+        raise ModelContractError("rationale: requires a nonempty string")
     branches = value["branches"]
-    if (not isinstance(branches, list) or (max_branches is not None and len(branches) > max_branches)
-            or bool(branches) != (value["decision"] == "expand")):
-        raise ModelContractError("exploration branches must match the decision and declared bound")
+    if not isinstance(branches, list):
+        raise ModelContractError("branches: must be a list")
+    if max_branches is not None and len(branches) > max_branches:
+        raise ModelContractError(f"branches: received {len(branches)} items, exceeding declared bound {max_branches}")
+    if bool(branches) != (value["decision"] == "expand"):
+        raise ModelContractError(f"branches: decision={value['decision']!r} requires "
+                                 + ("a nonempty list" if value["decision"] == "expand" else "an empty list"))
     for index, branch in enumerate(branches):
-        fields = {"parent_id", "question", "rationale", "operation", "query", "work_id", "evidence"}
+        fields = BRANCH_FIELDS
         if not isinstance(branch, dict):
             raise ModelContractError(f"branch {index} must be an object")
         if set(branch) != fields:
@@ -120,6 +183,8 @@ def normalize_plan(value, parent_aliases, sources, *, windows=None, parents=None
     """Bind only exact assigned identifiers and captured evidence spans."""
     try:
         value = bind_plan_parents(value, parent_aliases)
+        if parents is not None:
+            value = bind_plan_citations(value, citation_targets(parents, parent_aliases))
         errors = []
         for index, branch in enumerate(_plan_branches(value)):
             evidence = branch.get("evidence")
@@ -158,10 +223,10 @@ def validate_plan(value, parents, sources, *, max_branches):
     for index, branch in enumerate(branches):
         parent = parents.get(branch["parent_id"])
         if parent is None:
-            raise ModelContractError("exploration branch identifies an unassigned parent")
+            raise ModelContractError(f"branches[{index}].parent_id: identifies an unassigned parent")
         for field in ("question", "rationale"):
             if not isinstance(branch[field], str) or not branch[field].strip():
-                raise ModelContractError("exploration branch requires a question and rationale")
+                raise ModelContractError(f"branches[{index}].{field}: requires a nonempty string")
         operation = branch["operation"]
         if operation == "search":
             try:
@@ -169,27 +234,29 @@ def validate_plan(value, parents, sources, *, max_branches):
             except ValidationError as exc:
                 raise ModelContractError(f"branch {index} query: {exc}") from exc
             if branch["work_id"] is not None:
-                raise ModelContractError("search branch cannot identify a work lookup")
+                raise ModelContractError(f"branches[{index}].work_id: search requires null")
         elif operation in ("work", "citing"):
             try:
                 work_id(branch["work_id"])
             except ValidationError as exc:
                 raise ModelContractError(f"branch {index} work_id: {exc}") from exc
             if branch["query"] is not None:
-                raise ModelContractError("work and citing branches cannot supply a search query")
+                raise ModelContractError(f"branches[{index}].query: work and citing require null")
             if parent["kind"] == "root":
                 if operation != "work":
-                    raise ModelContractError("citing branches require a concrete reviewed parent work")
+                    raise ModelContractError(f"branches[{index}].operation: citing requires a concrete reviewed parent work")
             else:
                 allowed = parent.get("referenced_works", []) if operation == "work" else [parent.get("work_id")]
                 if branch["work_id"] not in allowed:
                     raise ModelContractError(f"branch {index} {operation} work_id {branch['work_id']!r} must follow "
                                              f"its parent's actual citation metadata; allowed work_ids={allowed}")
         else:
-            raise ModelContractError("unsupported exploration acquisition operation")
+            raise ModelContractError(f"branches[{index}].operation: unsupported exploration acquisition operation")
         evidence = branch["evidence"]
         if not isinstance(evidence, list) or bool(evidence) != (parent["kind"] == "read"):
-            raise ModelContractError("a read-driven branch requires captured parent evidence")
+            requirement = "a nonempty list of captured evidence owned by this parent" if parent["kind"] == "read" else "an explicitly empty list"
+            raise ModelContractError(f"branches[{index}].evidence: parent {branch['parent_id']!r} "
+                f"(kind={parent['kind']}, work_id={parent.get('work_id')!r}) requires {requirement}")
         for proof in evidence:
             source = _plan_evidence_source(branch, index, proof, parent, sources)
             try:
@@ -198,7 +265,7 @@ def validate_plan(value, parents, sources, *, max_branches):
                 raise ModelContractError(f"branch {index} evidence: {exc}") from exc
         key = (branch["parent_id"], operation, branch["query"], branch["work_id"])
         if key in seen:
-            raise ModelContractError("exploration plan repeats the same parent acquisition")
+            raise ModelContractError(f"branches[{index}]: repeats the same parent acquisition")
         seen.add(key)
 
 
@@ -694,6 +761,15 @@ class LiteratureTree:
             field: self._body(self.store.get(node[ref])) for field, ref in (
                 ("work", "work_ref"), ("entry", "entry_ref"), ("review", "review_ref"))}
             if node["kind"] == "read" else {}) for alias, node in zip(parent_aliases, parents)]
+        targets = citation_targets(parent_map, parent_aliases)
+        reverse_parents = {identity: alias for alias, identity in parent_aliases.items()}
+        for parent in assignments:
+            if parent["kind"] == "read":
+                parent["citation_targets"] = [
+                    {"handle": handle, "operation": target["operation"], "work_id": target["work_id"]}
+                    for handle, target in targets.items()
+                    if reverse_parents[target["parent_id"]] == parent["id"]]
+                parent.pop("referenced_works", None)
         evidence = [proof for parent in assignments if parent["kind"] == "read"
                     for field in MAP_FIELDS for proof in parent["entry"][field]["evidence"]]
         for proof in evidence:
@@ -710,6 +786,7 @@ class LiteratureTree:
         branch_limit = None
         remaining, scopes = self._remaining_model_capacity(["research.search-planner", "research.literature-mapper", "methods.work-reviewer"])
         assignment = {"phase": "exploration_plan", "question": self.score["question"],
+            "response_contract": exploration_response_contract(),
             "parents": assignments, "sources": context, "evidence_catalog": evidence_catalog,
             "suggestions": suggestions,
             "max_branches": branch_limit, "search_syntax": self._tree_search_syntax(),
@@ -722,9 +799,9 @@ class LiteratureTree:
                                                                  "selection_ref", "selected_work_ids")}
                                     for node in self.exploration_tree["nodes"] if node["kind"] == "acquisition"],
             "instructions": "Choose prioritized inquiries that advance the declared research question. "
-                "Return exactly {decision:expand|stop,rationale:string,branches:[{parent_id,question,rationale,"
-                "operation:search|work|citing,query:string|null,work_id:string|null,"
-                "evidence:[{evidence_id:ID}]}]}. Copy parent_id exactly from the assigned parent's id handle. "
+                "Return exactly the fields and enum values in response_contract. Include every required branch field, "
+                "including evidence:[] for a root and null for an inactive query or work_id. "
+                "Copy parent_id exactly from the assigned parent's id handle. "
                 "These handles are local to this assignment; work IDs and acquisition history IDs are not parent handles. "
                 "For a root, choose initial searches or direct canonical OpenAlex work lookups from the scientific intake, with empty evidence. "
                 "For a read, explain what its checked findings suggest investigating next, with exact parent quotations. "
@@ -739,7 +816,10 @@ class LiteratureTree:
                 "describe how the work was found; they do not grant evidence ownership. Close irrelevant parents instead of using "
                 "them to carry another work's findings. Use each parent's entry for its checked findings. "
                 "An unresolved research question is not a source-stated limitation; abstract silence cannot prove absence. "
-                "For a read, work lookups follow actual parent references; citing uses the checked parent work ID. "
+                "For a read, copy work_id from the matching parent's citation_targets.handle for work or citing. "
+                "Each handle binds the parent, canonical work and acquisition direction; never use another parent's handle. "
+                "A work mentioned in prose but absent from citation_targets requires a justified search query, "
+                "not an invented citation link. Root direct lookups still use canonical work IDs from scientific intake. "
                 "Use diverse terminology or mechanism-specific searches when needed, not only citation neighbors. "
                 "Continue or close each parent's incoming inquiry using its question, inquiry_rationale and its own checked findings. "
                 "Branches are ordered by scientific priority. Stop closes only the assigned parents. "
@@ -747,6 +827,7 @@ class LiteratureTree:
                 "max_branches is null: prioritize scientifically justified inquiries. "
                 "Remaining calls bound actual uncached dispatch, while captured receipts can be reused. "
                 "Stop with a reason when further acquisition would not improve their evidence. No novelty verdict."}
+        assignment = self._follow_up_assignment(assignment)
         identity = node_id({"assignment": {key: value for key, value in assignment.items() if key != "resources"},
                             "parent_ids": list(parent_map)})
         retained_input = self.store.head("kb/exploration-inputs/" + identity)

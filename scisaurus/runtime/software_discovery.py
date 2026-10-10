@@ -36,7 +36,7 @@ def source_links(text, base_url=""):
     return list(dict.fromkeys(links))
 
 
-def accepted_survey_sources(project_dir):
+def accepted_survey_sources(project_dir, *, survey_ref=None, question=None):
     """Read only the exact work/source versions bound to an accepted survey."""
     root = Path(project_dir).resolve()
     database = root / "state/control.sqlite"
@@ -61,7 +61,15 @@ def accepted_survey_sources(project_dir):
         if row is None:
             return {"status":"unavailable", "sources":[], "reason":"survey has no accepted source bundle"}
         bundle_ref = f"artifact:kb/surveys/current@{row[0]}"
+        if survey_ref is not None and bundle_ref != survey_ref:
+            raise ValidationError("software discovery ancestor survey reference is not the accepted head")
         bundle_manifest, bundle = read(bundle_ref)
+        if question is not None:
+            if not isinstance(bundle.get("score_ref"), str):
+                raise ValidationError("software discovery ancestor survey lacks its score identity")
+            _, score = read(bundle["score_ref"])
+            if score.get("survey", {}).get("question") != question:
+                raise ValidationError("software discovery ancestor survey belongs to another question")
         if bundle.get("schema_version") not in {"literature-survey-2", "literature-survey-3"}:
             raise ValidationError("software discovery requires a versioned accepted survey bundle")
         works = {}

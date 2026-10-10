@@ -388,6 +388,23 @@ class TestGapAssessment(unittest.TestCase):
 
 
 class TestSurveyChecks(unittest.TestCase):
+    def test_indexed_assertion_catalog_keeps_exact_binding_without_repeating_text(self):
+        current, raw = self.quote_location_fixture()
+        before = deepcopy(current)
+        full = survey_review_response_contract(current)
+        indexed = survey_review_response_contract(current, indexed=True)
+        self.assertEqual([row["assertion_id"] for row in indexed["assertion_catalog"]],
+                         [row["assertion_id"] for row in full["assertion_catalog"]])
+        self.assertTrue(all("quote" not in row for row in indexed["assertion_catalog"]))
+        selected = next(row for row in indexed["assertion_catalog"] if row["field"] == "inclusion")
+        raw["findings"] = [{"check_id": "map-support", "assertion_id": selected["assertion_id"],
+                            "rationale": "Read the complete current screening rationale."}]
+        raw["checks"][2]["outcome"] = "failed"
+        bound = normalize_survey_review_envelope(raw, current_map=current)
+        validate_survey_review(bound, current_map=current)
+        self.assertEqual(bound["findings"][0]["quote"], current["entries"][0]["reason"])
+        self.assertEqual(current, before)
+
     def test_selection_and_legacy_response_schemas_have_distinct_fields(self):
         current, _ = self.quote_location_fixture()
         contract = survey_review_response_contract(current)

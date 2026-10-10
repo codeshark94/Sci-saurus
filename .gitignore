@@ -20,3 +20,6 @@ desktop/src-tauri/gen/
 output/playwright/
 .playwright-cli/
 desktop/ui/favicon.svg
+
+/local-private/
+/deployment-profile.json

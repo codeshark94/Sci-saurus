@@ -219,6 +219,10 @@ def build_research_program(topic_package):
         raise ValidationError("topic package refinement contract is unsupported")
     single_candidate_refinement = (
         package_contract == "single_candidate_parent_refinement")
+    intake_mode = topic_package.get("intake_mode", "portfolio")
+    if intake_mode not in {"portfolio", "concept"}:
+        raise ValidationError("research program has an unsupported topic intake mode")
+    concept_intake = intake_mode == "concept"
     candidate_records = package.get("candidates")
     candidate_records = candidate_records if isinstance(candidate_records, list) else []
     selected_candidate = next(
@@ -227,6 +231,9 @@ def build_research_program(topic_package):
          and candidate.get("id") == package.get("selected_id")),
         None,
     )
+    if concept_intake:
+        from scisaurus.runtime.material_development import validate_concept_candidates
+        validate_concept_candidates(candidate_records, package.get("selected_id"))
     if single_candidate_refinement:
         parent_topic_id = evolution.get("parent_topic_id")
         if (not isinstance(parent_topic_id, str)
@@ -250,7 +257,9 @@ def build_research_program(topic_package):
     validate_topic_package(
         validation_package,
         objective=validation_package.get("objective"),
-        candidate_count=1 if single_candidate_refinement else None,
+        candidate_count=(len(candidate_records) if concept_intake
+                         else 1 if single_candidate_refinement else None),
+        enforce_portfolio_diversity=not concept_intake,
         single_candidate_refinement=single_candidate_refinement,
         refinement_parent=(selected_candidate if single_candidate_refinement else None),
     )
@@ -306,10 +315,13 @@ def build_research_program(topic_package):
         })
     else:
         decision_log.append({
-            "id": "refinement-lineage",
-            "action": "continue_selected_lineage",
+            "id": "refinement-lineage" if single_candidate_refinement else "concept-selection",
+            "action": "continue_selected_lineage" if single_candidate_refinement else "retain_selected_concept",
             "branch_ids": [selected_id],
-            "rationale": "A parent-preserving refinement supplies one supported branch; alternatives are not fabricated.",
+            "rationale": (
+                "A parent-preserving refinement supplies one supported branch; alternatives are not fabricated."
+                if single_candidate_refinement else
+                "The recorded intake supplied one concept; no unrecorded alternatives are implied."),
         })
     decision_log.append({
         "id": "selection-provisional",
@@ -325,11 +337,15 @@ def build_research_program(topic_package):
         "selected_id": selected_id,
         "selection_mode": "provisional",
         "selection_rationale": package["selection_rationale"],
-        "selection_criteria": [
+        "selection_criteria": ([
+            "Compare useful functional differentiation and physical mechanisms against conventional alternatives; implementation convenience alone is insufficient.",
+            "Require a decisive small test within the currently attested laboratory; unusual wording does not establish novelty.",
+            "Treat the selected concept as provisional until implementation evidence, experiment and independent review resolve its scientific obligations.",
+        ] if concept_intake else [
             "Use the candidate's bounded question, disconfirmation test, feasibility, and resource plan as the intake criteria.",
             "Prefer a branch whose proposed comparison can produce interpretable positive, null, or boundary outcomes.",
             "Treat the selected branch as provisional until the survey, experiment, interpretation, and adversarial review agree.",
-        ],
+        ]),
         "decision_log": decision_log,
     }
     validate_research_program(program)

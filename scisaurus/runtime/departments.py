@@ -1413,7 +1413,7 @@ class DepartmentRuntime:
             resolved.append({"task_id": task_id, "state": task["state"], "request_id": request.get("id")})
         return resolved
 
-    def retire_superseded_work_orders(self, request_ids, *, actor="command.composer", reason):
+    def retire_superseded_work_orders(self, request_ids, *, actor="command.composer", reason, stage_ids=None):
         """Fence open work orders that are no longer in the active continuation.
 
         A hold intentionally keeps its current order open for the next
@@ -1437,6 +1437,8 @@ class DepartmentRuntime:
             except (TypeError, ValueError):
                 continue
             if not payload.get("work_order_ref"):
+                continue
+            if stage_ids is not None and not ({payload.get("source_stage_id"), payload.get("target_stage_id")} & set(stage_ids)):
                 continue
             order_id = payload.get("id")
             if isinstance(order_id, str) and order_id in keep:
@@ -1883,6 +1885,12 @@ class DepartmentRuntime:
                 + ", ".join(sorted(str(key) for key in unknown_quota_keys))
             )
         input_projection_ref = self._bounded_input_ref(input_ref, stage_id)
+        # Assignment identities are immutable across stage continuations.
+        # Check the entire pool before publishing or admitting any role.
+        for existing in self._assignment_task_rows(stage_id=stage_id, attempt_number=attempt_number):
+            if (existing.get("stage_kind") != stage_kind
+                    or existing.get("input_ref") != input_projection_ref):
+                raise StateError("specialist assignment identity is already owned by a different stage input")
         deadline_at_epoch = time.time() + float(deadline_seconds)
         assignment_rows = []
         resolved_quotas = {}

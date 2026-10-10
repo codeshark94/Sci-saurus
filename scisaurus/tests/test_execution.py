@@ -350,7 +350,7 @@ class TestExecutionRuntime(unittest.TestCase):
         })
 
     def test_model_worker_continues_truncated_json_and_journals_each_provider_call(self):
-        from types import SimpleNamespace
+        from scisaurus.runtime.models import ModelResult
 
         class Channel:
             def __init__(self):
@@ -362,12 +362,12 @@ class TestExecutionRuntime(unittest.TestCase):
         class StubClient:
             calls = []
             responses = [
-                SimpleNamespace(text='{"reviewer_id":"claims",', model="fixture",
+                ModelResult(text='{"reviewer_id":"claims",', model="fixture",
                                 usage={"model_calls": 1, "input_tokens": 20,
                                        "output_tokens": 10},
                                 elapsed_seconds=0.1, finish_reason="length",
                                 request_attempts=1),
-                SimpleNamespace(text='"decision":"accepted"}', model="fixture",
+                ModelResult(text='"decision":"accepted"}', model="fixture",
                                 usage={"model_calls": 1, "input_tokens": 25,
                                        "output_tokens": 8},
                                 elapsed_seconds=0.2, finish_reason="stop",
@@ -533,6 +533,42 @@ class TestExecutionRuntime(unittest.TestCase):
                                   or prefix.startswith('```json\n{"ok":true}')
                                   else "no JSON object prefix", journal["error"])
 
+    def test_continuation_preserves_provider_response_metadata(self):
+        from scisaurus.runtime.execution import _complete_model_with_continuation
+        from scisaurus.runtime.models import ModelResult
+
+        class Client:
+            model = "fixture"
+            output_format = "json_object"
+
+            def __init__(self, chunks):
+                self.chunks = iter(chunks)
+
+            def complete(self, **kwargs):
+                return next(self.chunks)
+
+        def result(text, finish, metadata):
+            return ModelResult(text=text, model="fixture", usage={"model_calls": 1},
+                               elapsed_seconds=0.01, finish_reason=finish, response_metadata=metadata)
+
+        first = {"wire_reasoning": "low", "thinking_bytes": 17, "max_output_tokens": 32768}
+        final = {"wire_reasoning": "low", "thinking_bytes": 0, "max_output_tokens": 32768}
+        cases = [
+            [result('{"ok":true}', "stop", first)],
+            [result('Let me analyze.', "length", first)],
+            [result('{"ok":', "length", first), result('true}', "stop", final)],
+        ]
+        for chunks in cases:
+            with self.subTest(chunks=len(chunks)), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "journal.json"
+                observed = _complete_model_with_continuation(Client(chunks), system="Return JSON.",
+                    prompt="Review.", journal_path=str(path))
+                journal = json.loads(path.read_text())
+                self.assertEqual(observed.response_metadata, chunks[-1].response_metadata)
+                self.assertEqual([row["response_metadata"] for row in journal["segments"]],
+                                 [chunk.response_metadata for chunk in chunks])
+                self.assertEqual(observed.usage["model_calls"], len(chunks))
+
     def test_resumed_structured_reasoning_is_rejected_before_provider_admission(self):
         from scisaurus.runtime.execution import _complete_model_with_continuation
         from types import SimpleNamespace
@@ -552,7 +588,7 @@ class TestExecutionRuntime(unittest.TestCase):
             self.assertEqual(journal["segments"], [])
 
     def test_rate_limit_during_continuation_preserves_prefix_and_does_not_retry(self):
-        from types import SimpleNamespace
+        from scisaurus.runtime.models import ModelResult
 
         class Channel:
             def __init__(self):
@@ -575,7 +611,7 @@ class TestExecutionRuntime(unittest.TestCase):
                         outcome_known=True, attempts=1, status_code=429,
                         retry_after_seconds=3600, provider_error_kind="quota_exhausted",
                     )
-                return SimpleNamespace(
+                return ModelResult(
                     text='{"decision":', model="fixture",
                     usage={"model_calls": 1, "input_tokens": 20, "output_tokens": 10},
                     elapsed_seconds=0.1, finish_reason="length", request_attempts=1,

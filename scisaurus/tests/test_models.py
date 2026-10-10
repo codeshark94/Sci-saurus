@@ -720,6 +720,18 @@ class TestModelClient(unittest.TestCase):
         self.assertEqual(result.json_object(), {'revised_text': 'Association observed.'})
         self.assertEqual(result.usage, {'model_calls': 1, 'input_tokens': 14, 'output_tokens': 28})
 
+    def test_compatible_reasoning_alias_is_preserved_as_response_metadata(self):
+        self.response = {
+            'choices': [{'message': {'content': '{"ok":true}', 'reasoning': 'Deliberate trace.'},
+                         'finish_reason': 'stop'}],
+            'usage': {'prompt_tokens': 12, 'completion_tokens': 4},
+        }
+        result = self.client('openai_compatible', reasoning_effort='low',
+                             output_format='json_object').complete(system='Return JSON.', prompt='Inspect.')
+        self.assertEqual(result.response_metadata['thinking_bytes'], len('Deliberate trace.'.encode()))
+        self.assertEqual(result.response_metadata['wire_reasoning'], 'low')
+        self.assertEqual(result.json_object(), {'ok': True})
+
     def test_role_fallback_dispatch_applies_json_mode_to_the_selected_route(self):
         calls = []
 

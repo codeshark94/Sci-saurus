@@ -28,7 +28,26 @@ from pathlib import Path
 from scisaurus.core.errors import ValidationError
 
 SANDBOX_EXEC = shutil.which("sandbox-exec")
-SAFE_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "PYTHONIOENCODING", "TMPDIR", "MPLCONFIGDIR")
+# Sandboxed children inherit no caller-selected execution environment.
+SAFE_ENV_KEYS = ()
+
+# Environment variables an operator-declared runtime may set for its own
+# process.  They are consumed only from a validated laboratory profile and are
+# kept separate from SAFE_ENV_KEYS, so caller inheritance can never smuggle a
+# module search path or a dynamic-loader path into a run.
+RUNTIME_ENV_KEYS = frozenset({
+    "PYTHONHOME", "PYTHONPATH", "DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH",
+    "CFFIXED_USER_HOME", "FONTCONFIG_PATH", "FONTCONFIG_FILE",
+    "SSL_CERT_FILE", "GIT_SSL_CAINFO",
+    "SCI_SOLVER_COMMANDS", "ELMER_HOME", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+})
+
+# Per-run directories forced under the throwaway workspace after any caller or
+# declared-runtime environment has been applied.  A runtime cannot redirect a
+# cache or configuration write into the operator's home directory.
+WORKSPACE_ENV_KEYS = ("HOME", "CFFIXED_USER_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+                      "XDG_DATA_HOME", "TMPDIR", "MPLCONFIGDIR")
+
 DEFAULT_CPU_SECONDS = 600
 DEFAULT_ADDRESS_SPACE = 4 * 1024 * 1024 * 1024
 DEFAULT_FILE_SIZE = 256 * 1024 * 1024
@@ -43,10 +62,78 @@ class SandboxResult:
     truncated: bool
     mode: str
 
+    @property
+    def completed(self):
+        cleanup = getattr(self, "cleanup", None)
+        return (self.returncode == 0 and not self.timed_out and not self.truncated
+                and (cleanup is None or cleanup.get("completed") is True))
+
 
 def sandbox_status():
     """Report the isolation strength available on this host."""
     return {"sandbox_exec": SANDBOX_EXEC, "mode": "sandbox-exec" if SANDBOX_EXEC else "rlimits-only"}
+
+
+def probe_sandbox(*, timeout_seconds=30.0):
+    """Test whether the deny-by-default profile can actually be applied.
+
+    ``sandbox_status`` reports the presence of the launcher.  A nested sandbox
+    (for example Seatbelt inside another Seatbelt) can expose the binary while
+    ``sandbox_apply`` is denied, so callers that require a real security
+    boundary must probe rather than trust the presence check.
+    """
+    import tempfile
+    if not SANDBOX_EXEC:
+        return {"available": False, "mode": "rlimits-only",
+                "reason": "sandbox-exec is not installed"}
+    with tempfile.TemporaryDirectory(prefix="sandbox-probe-") as workspace:
+        result = run_sandboxed(["/bin/sh", "-c", "printf probe-ok"], workspace=workspace,
+                               timeout_seconds=timeout_seconds)
+    available = (result.returncode == 0 and result.mode == "sandbox-exec"
+                 and b"probe-ok" in result.stdout)
+    return {"available": available, "mode": result.mode if available else "rlimits-only",
+            "returncode": result.returncode,
+            "stderr": result.stderr.decode("utf-8", errors="replace")[:2000]}
+
+
+def workspace_environment(workspace):
+    """Return the cache/config/temp variables forced under *workspace*."""
+    workspace = Path(workspace)
+    return {
+        "HOME": str(workspace),
+        "CFFIXED_USER_HOME": str(workspace),
+        "XDG_CONFIG_HOME": str(workspace / ".config"),
+        "XDG_CACHE_HOME": str(workspace / ".cache"),
+        "XDG_DATA_HOME": str(workspace / ".local" / "share"),
+        "TMPDIR": str(workspace),
+        "MPLCONFIGDIR": str(workspace / ".matplotlib"),
+    }
+
+
+def sandbox_environment(workspace, *, env=None):
+    """Build the exact child environment for one sandboxed or direct run.
+
+    Composition order is deliberate: fixed system PATH and locale first, then
+    the operator-declared runtime whitelist, then the forced workspace-private
+    directories.  A declared runtime can never override HOME or the XDG/temp
+    roots, and a caller can never inject PATH/PYTHONHOME/PYTHONPATH/DYLD_*/HOME.
+    """
+    workspace = Path(workspace)
+    process_env = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
+    process_env.update(PATH="/usr/bin:/bin", LANG="C", LC_ALL="C")
+    process_env["PYTHONIOENCODING"] = "utf-8"
+    process_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    if env:
+        process_env.update({key: value for key, value in env.items() if key in RUNTIME_ENV_KEYS})
+        # Package installers may resolve dependencies from an explicitly
+        # provisioned private R library, never from the caller's environment.
+        if "R_LIBS_USER" in env:
+            library = Path(env["R_LIBS_USER"]).resolve()
+            if not library.is_relative_to(workspace.resolve()):
+                raise ValidationError("R dependency library must belong to the sandbox workspace")
+            process_env["R_LIBS_USER"] = str(library)
+    process_env.update(workspace_environment(workspace))
+    return process_env
 
 
 def _macho_dependency_paths(executable):
@@ -204,20 +291,7 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
         raise ValidationError("sandbox timeout must be positive")
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValidationError("sandbox output limit must be a positive integer")
-    process_env = {key: os.environ[key] for key in SAFE_ENV_KEYS if key in os.environ}
-    process_env.setdefault("PATH", "/usr/bin:/bin")
-    process_env["PYTHONIOENCODING"] = "utf-8"
-    process_env["TMPDIR"] = str(workspace)
-    if env:
-        process_env.update({key: value for key, value in env.items() if key in SAFE_ENV_KEYS})
-        # Package installers may resolve dependencies from an explicitly
-        # provisioned private R library, never from the caller's environment.
-        if "R_LIBS_USER" in env:
-            library = Path(env["R_LIBS_USER"]).resolve()
-            if not library.is_relative_to(workspace.resolve()):
-                raise ValidationError("R dependency library must belong to the sandbox workspace")
-            process_env["R_LIBS_USER"] = str(library)
-    process_env["MPLCONFIGDIR"] = str(workspace / ".matplotlib")
+    process_env = sandbox_environment(workspace, env=env)
     mode = "sandbox-exec"
     if SANDBOX_EXEC:
         command = [SANDBOX_EXEC, "-p", sandbox_profile(
@@ -228,6 +302,12 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
     process = start_process(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                cwd=str(workspace), env=process_env, shell=False, bufsize=0,
                                preexec_fn=_limits(cpu_seconds, address_space_bytes, file_size_bytes))
+    return capture_process(process, input_bytes=input_bytes, timeout_seconds=timeout_seconds,
+                           max_bytes=max_bytes, mode=mode)
+
+
+def capture_process(process, *, input_bytes, timeout_seconds, max_bytes, mode, check_permission=None):
+    """Bound transport output and lifetime for an already isolated process group."""
     stdout, stderr = bytearray(), bytearray()
     truncated = timed_out = False
     deadline = time.monotonic() + float(timeout_seconds)
@@ -240,6 +320,8 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
         written = 0
         stdin_open = True
         while selector.get_map() or stdin_open:
+            if check_permission is not None:
+                check_permission()
             if stdin_open and written >= len(input_bytes):
                 try:
                     process.stdin.close()
@@ -285,6 +367,20 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:
                 process.kill()
+    except BaseException as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        try:
+            returncode = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            returncode = process.wait()
+        error.process_result = SandboxResult(returncode, bytes(stdout), bytes(stderr), timed_out, truncated, mode)
+        for stream in (process.stdout, process.stderr):
+            stream.close()
+        raise
     finally:
         selector.close()
         try:

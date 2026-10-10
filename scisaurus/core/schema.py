@@ -323,7 +323,9 @@ def json_object(raw, name="JSON", *, model_envelope=False,
         if not isinstance(value, dict):
             raise ValidationError(f"{name} must contain a JSON object")
         return value
-    raise ValidationError(f"{name} must contain valid JSON") from error
+    detail = (f": {error.msg} at line {error.lineno}, column {error.colno}"
+              if isinstance(error, json.JSONDecodeError) else "")
+    raise ValidationError(f"{name} must contain valid JSON{detail}") from error
 
 
 def sha256_hex(data: bytes) -> str:

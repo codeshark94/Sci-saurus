@@ -31,20 +31,37 @@ from scisaurus.runtime.program_sandbox import (
 )
 from scisaurus.runtime.programs import _parse_object
 
-REVISION = "scientific-software-tools-5"
+REVISION = "scientific-software-tools-6"
 SELECTION_CONTRACT_REVISION = "scientific-software-selection-3"
+ARTIFACT_REF_PREFIX = "software-artifact:sha256:"
+# The single public contract for declared run artifacts.  Validation, the model
+# tool contract and orchestration all use these exact field sets so a declared
+# input can never carry an extra sha256/size field that the contract omits.
+DECLARED_INPUT_FIELDS = ("artifact_ref", "name")
+DECLARED_INPUT_OPTIONAL = ("media_type",)
+DECLARED_OUTPUT_FIELDS = ("name",)
+DECLARED_OUTPUT_OPTIONAL = ("media_type",)
 DISCOVERY_OPERATIONS = frozenset({"search", "search_evidence", "search_web", "inspect"})
 _REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _PIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*==[A-Za-z0-9][A-Za-z0-9_.+!-]*\Z")
+_ARTIFACT_SHA = re.compile(r"[0-9a-f]{64}\Z")
+# A media type must be a real MIME type/subtype, not a bare token.  The
+# controller's production run declared application/step, application/octet-stream
+# and application/x-hdf5; rejecting those as "not a media token" was a real
+# launch blocker.
+_MEDIA_TOKEN = r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}"
+_MEDIA_TYPE = re.compile(_MEDIA_TOKEN + r"/" + _MEDIA_TOKEN + r"\Z")
 
 
 def tool_contract():
     return {
         "revision": REVISION,
-        "response": {"tool_action": {"operation": "check_environment | search_evidence | read_evidence | search_web | fetch_source | search | inspect | list_files | read | acquire | run", "arguments": {}}},
+        "response": {"tool_action": {"operation": "check_environment | list_runtimes | inspect_runtime | search_evidence | read_evidence | search_web | fetch_source | search | inspect | list_files | read | acquire | run", "arguments": {}}},
         "actions": {
             "check_environment": {},
+            "list_runtimes": {},
+            "inspect_runtime": {"runtime": "declared laboratory runtime label"},
             "search_evidence": {"terms": ["software", "code", "repository", "mechanism or citation terms"]},
             "read_evidence": {"source_ref": "software-evidence:sha256:...", "start": 0, "max_chars": 32000},
             "search_web": {"query": "concise source or mechanism query"},
@@ -56,9 +73,14 @@ def tool_contract():
             "acquire": {"inspection_ref": "software:sha256:...", "runtime": "python | r | native",
                         "license_ref": "software:sha256:...", "requirements": ["exact Python distribution==version"], "dependencies": [], "package_path": ".",
                         "build": {"system": "cmake | make | configure", "options": [], "executable": "install/bin/engine"}},
-            "run": {"environment_ref": "software:sha256:...", "source": "complete Python or R program",
+            "run": {"environment_ref": "software:sha256:... acquired environment, or null when runtime is used",
+                    "runtime": "optional declared laboratory runtime label (mutually exclusive with environment_ref)",
+                    "source": "complete Python or R program",
                     "input": {}, "purpose": "upstream_example | scientific_computation",
-                    "documentation_refs": ["software:sha256:..."], "expected": None},
+                    "documentation_refs": ["software:sha256:... acquired or laboratory source reference"],
+                    "inputs": [{"artifact_ref": "software-artifact:sha256:...", "name": "safe/relative/path.step"}],
+                    "outputs": [{"name": "safe/relative/result.vtk", "media_type": "optional MIME type/subtype"}],
+                    "expected": None},
         },
         "rules": [
             "Return either one tool_action or the assignment's final response, never both.",
@@ -71,6 +93,8 @@ def tool_contract():
             "Identify the mechanism's implementation separately from general numerical or serialization helpers. Read the selected runtime's build and import declarations before acquisition; helper installation alone is not scientific reuse. Exact Python requirements must include needed build backend wheels as well as runtime dependencies for the offline build.",
             "acquire.requirements is only for exact Python wheel requirements; use [] for R and native software. acquire.dependencies contains separately acquired environment receipt_refs, never package names or version strings. Host base R packages are part of the R runtime; optional suggested packages are not runtime dependencies unless the chosen execution needs them.",
             "build is supplied only for native software; executable is relative to the acquired environment. Native runs use a Python adapter and may invoke the pinned engine_path in the read-only environment; all child processes share the same sandbox.",
+            "When the controller binds a laboratory, list_runtimes reports the operator-provisioned runtimes and their attestation drift. A run may select one by declared label. The label, not a host path, is the only handle a specialist has; the controller resolves and re-verifies executable and package-lock identity before and after execution. A runtime is never ready merely because it exists or imports.",
+            "run.inputs names earlier receipt-bound artifacts by content-addressed reference and a safe relative name. The controller re-verifies every hash, rejects traversal, absolute paths, symlinks, directories, changed or missing files, and stages exact copies into the run workspace. run.outputs declares the files a later run may consume; only those regular files inside the workspace are retained, hashed and returned as artifact references. Preserve the declared coupling plan across sequential receipt-bound runs instead of assuming an automatic coupling engine.",
             "Run programs consume one JSON object on stdin and emit one JSON object on stdout. R programs may use base R for JSON literals or a pinned JSON dependency.",
             "For upstream_example, expected must be {value: <documented upstream JSON object>, absolute_tolerance: <nonnegative number>, relative_tolerance: <nonnegative number>}; it cannot be null. For scientific_computation, expected may be null. Tolerances must follow documented precision; a match checks reproduction, not scientific fitness.",
             "A successful installation is not scientific admission. Distinguish upstream examples, new computations and stored upstream results.",
@@ -159,7 +183,8 @@ def _runtime_identity():
 
 
 class SoftwareWorkbench:
-    def __init__(self, root, *, deadline, fetch=None, runner=None, evidence_refs=(), source_opener=None):
+    def __init__(self, root, *, deadline, fetch=None, runner=None, evidence_refs=(), source_opener=None,
+                 laboratory=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.deadline = deadline
@@ -167,6 +192,10 @@ class SoftwareWorkbench:
         self.runner = runner or run_sandboxed
         self.lock = threading.RLock()
         self.evidence_refs = frozenset(evidence_refs)
+        # A laboratory binding is an operator-provisioned allowlist.  It is the
+        # only way a run may select a pre-installed host runtime; a model never
+        # supplies a path.
+        self.laboratory = laboratory
         from scisaurus.runtime.software_discovery import PublicSourceClient
         self.sources = PublicSourceClient(self.root, deadline=deadline, opener=source_opener)
 
@@ -208,6 +237,344 @@ class SoftwareWorkbench:
             raise ValidationError(f"software receipt {ref} records operation {receipt['action']['operation']}; operation {operation} is required")
         return receipt
 
+    def validate_retained_results(self, results):
+        """Recheck receipt identity and mutable execution state before reuse."""
+        if not isinstance(results, list):
+            raise ValidationError("retained software results must be a list")
+        for row in results:
+            if not isinstance(row, dict):
+                raise ValidationError("retained software result must be an object")
+            retained = self._receipt(row.get("receipt_ref"), require_success=False)
+            if retained != {key: value for key, value in row.items()
+                            if key not in {"receipt_ref", "reused"}}:
+                raise ValidationError("retained software result does not match its exact receipt")
+            if retained.get("outcome") != "ok":
+                continue
+            operation = retained["action"]["operation"]
+            if operation == "run":
+                self._verify_run_state(retained["action"]["arguments"], retained.get("result"))
+            elif operation == "acquire":
+                self._environment(row["receipt_ref"])
+            elif operation == "read_evidence":
+                self._evidence(retained["action"]["arguments"]["source_ref"])
+
+    # -- laboratory runtime allowlist ---------------------------------------
+
+    def _lab_binding(self):
+        if self.laboratory is None:
+            raise ValidationError("this assessment has no bound laboratory runtime allowlist")
+        return self.laboratory
+
+    def _lab_runtime(self, label):
+        """Resolve one declared runtime and fail closed on any identity drift."""
+        runtime = self._lab_binding().runtime(label)
+        fingerprint = self._lab_binding().runtime_fingerprint(label)
+        if not fingerprint.get("matches_attestation"):
+            raise ValidationError(
+                f"laboratory runtime {label!r} does not match its trusted provisioning attestation; "
+                "re-run preparation instead of executing a changed runtime")
+        return runtime, fingerprint
+
+    def _lab_runtime_identity(self, label):
+        _, fingerprint = self._lab_runtime(label)
+        return {"config_sha256": self._lab_binding().identity, "label": label,
+                "executable_sha256": fingerprint["executable_sha256"],
+                "environment_sha256": fingerprint["environment_sha256"],
+                "read_roots_sha256": fingerprint["read_roots_sha256"],
+                "inventory_sha256": fingerprint["inventory_sha256"],
+                "content_manifest_sha256": fingerprint["content_manifest_sha256"]}
+
+    def _list_runtimes_result(self):
+        binding = self._lab_binding()
+        rows = []
+        for runtime in binding.laboratory["runtimes"]:
+            fingerprint = binding.runtime_fingerprint(runtime["label"])
+            attested = binding.attested(runtime["label"]) or {}
+            rows.append({
+                "label": runtime["label"], "kind": runtime["kind"],
+                "description": runtime["description"],
+                "capabilities": list(runtime["capabilities"]),
+                "limitations": list(runtime["limitations"]),
+                "probe_modules": list(runtime["probe_modules"]),
+                "commands": sorted(runtime.get("commands", {})),
+                "command_access": "json.loads(os.environ['SCI_SOLVER_COMMANDS']) maps declared tool names to executable paths inside this runtime.",
+                "execution_platform": (runtime.get("container") or {}).get("platform", platform.system()),
+                "controller_attested": attested.get("verified") is True,
+                "identity_current": fingerprint.get("matches_attestation") is True,
+                "probe_status": (attested.get("probe") or {}).get("status"),
+                "inventory_package_count": (attested.get("inventory") or {}).get("package_count"),
+            })
+        return {"laboratory_id": binding.laboratory["id"],
+                "config_sha256": binding.identity,
+                "runtimes": rows,
+                "semantics": "controller_attested and identity_current are controller facts derived from an "
+                             "executed provisioning probe and a recomputed executable/package-lock hash, "
+                             "not from a file's presence or an import statement."}
+
+    # -- generic run-artifact handoff ---------------------------------------
+
+    @staticmethod
+    def _artifact_name(value):
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise ValidationError("declared artifact name must be a nonempty relative POSIX path")
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            raise ValidationError("declared artifact name leaves the run workspace")
+        if any(part in {"", "."} for part in path.parts):
+            raise ValidationError("declared artifact name must not contain empty or '.' components")
+        return str(path)
+
+    def _safe_path(self, root, name, *, purpose):
+        """Resolve a declared relative path under *root* without symlink escape.
+
+        Every ancestor of the target, the target itself, and the resolved
+        location are checked.  A symlinked component or a resolved path that
+        leaves the workspace is rejected before any file is read or written.
+        """
+        root = Path(root).resolve()
+        target = root
+        for part in PurePosixPath(name).parts:
+            target = target / part
+            if target.is_symlink():
+                raise ValidationError(f"{purpose} {name!r} traverses a symlink component")
+        resolved = Path(os.path.realpath(target))
+        if resolved != target and not resolved.is_relative_to(root):
+            raise ValidationError(f"{purpose} {name!r} resolves outside the run workspace")
+        if not resolved.is_relative_to(root):
+            raise ValidationError(f"{purpose} {name!r} resolves outside the run workspace")
+        return target
+
+    @staticmethod
+    def _artifact_ref(digest):
+        if not isinstance(digest, str) or not _ARTIFACT_SHA.fullmatch(digest):
+            raise ValidationError("software artifact digest must be a sha256 hex digest")
+        return ARTIFACT_REF_PREFIX + digest
+
+    def _artifact_store(self):
+        """Return the artifact store, rejecting a symlinked store or parent."""
+        root = Path(self.root)
+        if root.is_symlink():
+            raise ValidationError("software artifact store root is a symlink")
+        store = root / "artifacts"
+        if store.is_symlink():
+            raise ValidationError("software artifact store is a symlink")
+        store.mkdir(parents=True, exist_ok=True)
+        resolved_root = Path(os.path.realpath(root))
+        resolved_store = Path(os.path.realpath(store))
+        if not resolved_store.is_relative_to(resolved_root):
+            raise ValidationError("software artifact store resolves outside the workbench root")
+        return store
+
+    def _read_artifact(self, ref):
+        if not isinstance(ref, str) or not ref.startswith(ARTIFACT_REF_PREFIX):
+            raise ValidationError("artifact reference is not a content-addressed software artifact")
+        digest = ref[len(ARTIFACT_REF_PREFIX):]
+        if not _ARTIFACT_SHA.fullmatch(digest):
+            raise ValidationError("artifact reference is malformed")
+        store = self._artifact_store()
+        path = store / digest
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError(f"software artifact {ref} is missing or not a regular file")
+        if not Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(store))):
+            raise ValidationError(f"software artifact {ref} resolves outside the artifact store")
+        data = path.read_bytes()
+        if _sha(data) != digest:
+            raise ValidationError(f"software artifact {ref} content changed")
+        return data
+
+    def _retain_artifact(self, data):
+        digest = _sha(data)
+        store = self._artifact_store()
+        path = store / digest
+        if path.exists():
+            if path.is_symlink() or _sha(path.read_bytes()) != digest:
+                raise ValidationError("retained software artifact content changed")
+        else:
+            temporary = path.with_suffix(".tmp")
+            if temporary.is_symlink():
+                raise ValidationError("retained software artifact staging path is a symlink")
+            temporary.write_bytes(data)
+            temporary.replace(path)
+        return self._artifact_ref(digest)
+
+    def _declared_inputs(self, value, limits):
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            raise ValidationError("software run inputs must be a list of declared artifacts")
+        declared, seen, total = [], set(), 0
+        for row in value:
+            _fields(row, DECLARED_INPUT_FIELDS, DECLARED_INPUT_OPTIONAL)
+            name = self._artifact_name(row["name"])
+            if name in seen:
+                raise ValidationError("software run declares duplicate input artifact names")
+            seen.add(name)
+            data = self._read_artifact(row["artifact_ref"])
+            total += len(data)
+            if total > limits["max_input_bytes"]:
+                raise ValidationError("declared software run inputs exceed the laboratory input byte limit")
+            declared.append({"artifact_ref": row["artifact_ref"], "name": name,
+                             "sha256": row["artifact_ref"][len(ARTIFACT_REF_PREFIX):],
+                             "size": len(data)})
+        return declared
+
+    def _declared_outputs(self, value, limits):
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            raise ValidationError("software run outputs must be a list of declared artifact names")
+        if len(value) > limits["max_runtime_files"]:
+            raise ValidationError("software run declares more output files than the laboratory allows")
+        declared, seen = [], set()
+        for row in value:
+            _fields(row, DECLARED_OUTPUT_FIELDS, DECLARED_OUTPUT_OPTIONAL)
+            name = self._artifact_name(row["name"])
+            if name in seen:
+                raise ValidationError("software run declares duplicate output artifact names")
+            seen.add(name)
+            entry = {"name": name}
+            if row.get("media_type") is not None:
+                if not isinstance(row["media_type"], str) or not _MEDIA_TYPE.fullmatch(row["media_type"]):
+                    raise ValidationError(
+                        "declared output media_type must be a MIME type/subtype such as "
+                        "application/octet-stream")
+                entry["media_type"] = row["media_type"]
+            declared.append(entry)
+        return declared
+
+    def _stage_inputs(self, declared, root):
+        staged = []
+        inputs_root = Path(root) / "inputs"
+        if inputs_root.is_symlink():
+            raise ValidationError("declared input staging parent is a symlink")
+        for row in declared:
+            target = self._safe_path(inputs_root, row["name"], purpose="declared input path")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise ValidationError("declared input target is a symlink")
+            data = self._read_artifact(row["artifact_ref"])
+            target.write_bytes(data)
+            if _sha(target.read_bytes()) != row["sha256"]:
+                raise ValidationError("staged input artifact changed during copy")
+            staged.append({**row, "staged_path": "inputs/" + row["name"]})
+        return staged
+
+    def _workspace_guard(self, root, limits):
+        total = count = 0
+        for parent, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+            for name in files:
+                path = Path(parent) / name
+                if path.is_symlink() or not path.is_file():
+                    continue
+                count += 1
+                total += path.stat().st_size
+                if count > limits["max_runtime_files"] or total > limits["max_input_bytes"] + limits["max_output_bytes"]:
+                    raise ValidationError("software workspace exceeds the monitored file or byte limit")
+
+    def _failure_snapshot(self, root, limits):
+        retained, omitted, total = [], [], 0
+        for parent, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(name for name in dirs if not (Path(parent) / name).is_symlink())
+            for name in sorted(files):
+                path = Path(parent) / name
+                relative = path.relative_to(root).as_posix()
+                if path.is_symlink() or not path.is_file():
+                    omitted.append({"name": relative, "reason": "not a regular file"})
+                    continue
+                size = path.stat().st_size
+                if len(retained) >= limits["max_runtime_files"] or total + size > limits["max_input_bytes"] + limits["max_output_bytes"]:
+                    omitted.append({"name": relative, "size": size, "reason": "retention limit"})
+                    continue
+                data = path.read_bytes()
+                total += len(data)
+                retained.append({"name": relative, "size": len(data), "sha256": _sha(data),
+                                 "artifact_ref": self._retain_artifact(data)})
+        return {"files": retained, "omitted": omitted, "complete": not omitted}
+
+    def _collect_outputs(self, declared, root, limits):
+        outputs, total = [], 0
+        root = Path(root)
+        if root.is_symlink():
+            raise ValidationError("run workspace is a symlink")
+        for row in declared:
+            target = self._safe_path(root, row["name"], purpose="declared output")
+            if target.is_symlink() or not target.is_file():
+                raise ValidationError(
+                    f"declared output {row['name']!r} is absent, a symlink, or not a regular file")
+            data = target.read_bytes()
+            if len(data) > limits["max_output_bytes"]:
+                raise ValidationError(f"declared output {row['name']!r} exceeds the laboratory output byte limit")
+            total += len(data)
+            if total > limits["max_output_bytes"]:
+                raise ValidationError("declared software run outputs exceed the laboratory output byte limit")
+            outputs.append({"name": row["name"], "sha256": _sha(data), "size": len(data),
+                            "artifact_ref": self._retain_artifact(data),
+                            **({"media_type": row["media_type"]} if row.get("media_type") else {})})
+        return outputs
+
+    def verify_run_outputs(self, result):
+        """Rehash every retained output of a successful run from its reference.
+
+        A cached success is only valid while its declared outputs still exist
+        and hash to their retained content address.  Missing or tampered bytes
+        fail closed and never trigger a silent re-execution.
+        """
+        for row in result.get("outputs") or []:
+            data = self._read_artifact(row.get("artifact_ref"))
+            if _sha(data) != row.get("sha256") or len(data) != row.get("size"):
+                raise ValidationError(
+                    f"retained run output {row.get('name')!r} no longer matches its receipt")
+
+    def _laboratory_limits(self):
+        return self._lab_binding().laboratory["limits"]
+
+    def _effective_limits(self):
+        if self.laboratory is not None:
+            return self._laboratory_limits()
+        return {"max_input_bytes": 1 << 62, "max_output_bytes": 1 << 62,
+                "max_runtime_files": 1 << 20, "max_runtime_seconds": None}
+
+    def _run_state_identity(self, arguments):
+        """Bind cache identity to the exact runtime and input artifact content.
+
+        Without this, a retained receipt could hide an environment or input
+        artifact drift that the cached result never observed.
+        """
+        state = {"purpose": arguments.get("purpose"), "inputs": [], "outputs": []}
+        runtime_label = arguments.get("runtime")
+        if runtime_label is not None:
+            state["runtime"] = self._lab_runtime_identity(runtime_label)
+        if arguments.get("environment_ref") is not None:
+            environment = self._environment(arguments["environment_ref"])
+            state["environment"] = {"runtime": environment["runtime"],
+                                    "executable_sha256": environment["executable_sha256"],
+                                    "files_sha256": _sha(canonical_bytes(environment["files"]))}
+        limits = self._effective_limits()
+        state["inputs"] = [
+            {"artifact_ref": row["artifact_ref"], "name": row["name"]}
+            for row in self._declared_inputs(arguments.get("inputs"), limits)
+        ]
+        state["outputs"] = self._declared_outputs(arguments.get("outputs"), limits)
+        return state
+
+    def _verify_run_state(self, arguments, result=None):
+        """Rehash the runtime, inputs and retained outputs of a successful run.
+
+        A cached receipt is only reusable while every identity it claims still
+        matches: the runtime attestation, the content-addressed inputs and the
+        retained output artifacts.  Any mismatch fails closed and never falls
+        back to re-executing the program.
+        """
+        if arguments.get("runtime") is not None:
+            self._lab_runtime(arguments["runtime"])
+        elif arguments.get("environment_ref") is not None:
+            self._environment(arguments["environment_ref"])
+        for row in arguments.get("inputs") or []:
+            self._read_artifact(row["artifact_ref"])
+        if result is not None:
+            self.verify_run_outputs(result)
+
     def execute(self, action):
         from scisaurus.runtime.run_control import ensure_run_allowed
         ensure_run_allowed()
@@ -226,13 +593,18 @@ class SoftwareWorkbench:
             identity["search_provider"] = "brave" if os.environ.get("BRAVE_SEARCH_API_KEY") else "duckduckgo"
         if action["operation"] == "acquire":
             identity["runtime_identity"] = _runtime_identity()
+        if action["operation"] == "run":
+            identity["run_state"] = self._run_state_identity(action["arguments"])
+        if self.laboratory is not None and action["operation"] in {"run", "list_runtimes", "inspect_runtime"}:
+            identity["laboratory"] = self.laboratory.identity
         key = _sha(canonical_bytes(identity))
+        always_run = {"check_environment", "list_runtimes", "inspect_runtime"}
         with self.lock:
             self._remaining()
             actions = self.root / "actions"
             actions.mkdir(exist_ok=True)
             index = actions / (key + ".json")
-            if index.exists() and action["operation"] != "check_environment":
+            if index.exists() and action["operation"] not in always_run:
                 retained = json.loads(index.read_text())
                 if retained.get("status") == "started":
                     return {"outcome": "result_unknown", "action": deepcopy(action),
@@ -248,7 +620,7 @@ class SoftwareWorkbench:
                     if result.get("outcome") == "ok" and action["operation"] == "acquire":
                         self._environment(ref)
                     if result.get("outcome") == "ok" and action["operation"] == "run":
-                        self._environment(action["arguments"]["environment_ref"])
+                        self._verify_run_state(action["arguments"], result.get("result"))
                     if result.get("outcome") == "ok" and action["operation"] in {"fetch_source","search_web"}:
                         capture_hash = result["result"]["capture_sha256"]
                         if _sha((self.root/"captures"/capture_hash).read_bytes()) != capture_hash:
@@ -260,7 +632,8 @@ class SoftwareWorkbench:
             try:
                 handler = {"check_environment": self._check_environment, "search": self._search, "inspect": self._inspect, "list_files": self._list_files, "read": self._read,
                            "acquire": self._acquire, "run": self._run, "search_evidence":self._search_evidence,
-                           "read_evidence":self._read_evidence, "fetch_source":self._fetch_source, "search_web":self._search_web}.get(action["operation"])
+                           "read_evidence":self._read_evidence, "fetch_source":self._fetch_source, "search_web":self._search_web,
+                           "list_runtimes":self._list_runtimes, "inspect_runtime":self._inspect_runtime}.get(action["operation"])
                 if handler is None:
                     raise ValidationError("unsupported scientific software operation")
                 result.update(outcome="ok", result=handler(action["arguments"], key))
@@ -278,7 +651,7 @@ class SoftwareWorkbench:
                 exc.close()
             except (OSError, ValueError, ValidationError, tarfile.TarError) as exc:
                 result.update(outcome="failed", error_type=type(exc).__name__, error=str(exc))
-                if isinstance(exc, SoftwareExecutionError):
+                if isinstance(getattr(exc, "execution", None), dict):
                     result["execution"] = exc.execution
                 from scisaurus.runtime.software_discovery import DiscoveryFailure
                 if isinstance(exc, DiscoveryFailure):
@@ -354,6 +727,45 @@ class SoftwareWorkbench:
         if not isinstance(args["query"],str) or not args["query"].strip():
             raise ValidationError("web search requires a nonempty query")
         return self.sources.search(args["query"])
+
+    def _list_runtimes(self, args, key):
+        _fields(args, set())
+        return self._list_runtimes_result()
+
+    def _inspect_runtime(self, args, key):
+        _fields(args, {"runtime"})
+        label = args["runtime"]
+        if not isinstance(label, str) or not label:
+            raise ValidationError("inspect_runtime requires a declared runtime label")
+        binding = self._lab_binding()
+        runtime = binding.runtime(label)
+        attested = binding.attested(label)
+        if attested is None:
+            raise ValidationError(
+                f"laboratory runtime {label!r} has no trusted provisioning attestation")
+        fingerprint = binding.runtime_fingerprint(label)
+        probe = attested.get("probe") or {}
+        return {"laboratory_id": binding.laboratory["id"], "config_sha256": binding.identity,
+                "runtime": {key: deepcopy(runtime[key]) for key in (
+                    "label", "kind", "description", "capabilities", "probe_modules", "limitations")},
+                "commands": sorted(runtime.get("commands", {})),
+                "command_access": "Read SCI_SOLVER_COMMANDS inside the selected runtime program; commands execute within the same isolation boundary.",
+                "attestation": {
+                    "verified": attested.get("verified") is True,
+                    "executable_sha256": attested.get("executable_sha256"),
+                    "inventory_sha256": (attested.get("inventory") or {}).get("sha256"),
+                    "inventory_package_count": (attested.get("inventory") or {}).get("package_count"),
+                    "probe_status": probe.get("status"),
+                    "probe_mode": probe.get("mode"),
+                    "probe_elapsed_seconds": probe.get("elapsed_seconds"),
+                },
+                "identity_current": fingerprint.get("matches_attestation") is True,
+                "execution_authorized": (attested.get("verified") is True
+                          and fingerprint.get("matches_attestation") is True),
+                "operational_readiness": "not_assessed",
+                "readiness_semantics": "Execution authorization requires matching installed content. "
+                                       "Presence or import alone is never readiness; solver-specific "
+                                       "operational checks and scientific admission are separate."}
 
     def _check_environment(self, args, key):
         _fields(args, set())
@@ -497,14 +909,25 @@ class SoftwareWorkbench:
         return {"inspection_ref": args["inspection_ref"], "path": path,
                 "sha256": _sha(data), "content": data.decode("utf-8"), "complete": True}
 
-    def _sandbox(self, command, workspace, *, stdin=b"", env=None, read_only_paths=()):
+    def _sandbox(self, command, workspace, *, stdin=b"", env=None, read_only_paths=(),
+                 timeout_seconds=None, cpu_seconds=None, address_space_bytes=None,
+                 file_size_bytes=None):
         if sandbox_status()["mode"] != "sandbox-exec":
             raise ValidationError("scientific software installation and execution require the deny-by-default sandbox")
         started=time.monotonic()
+        limits = {}
+        if cpu_seconds is not None:
+            limits["cpu_seconds"] = cpu_seconds
+        if address_space_bytes is not None:
+            limits["address_space_bytes"] = address_space_bytes
+        if file_size_bytes is not None:
+            limits["file_size_bytes"] = file_size_bytes
+        timeout = self._remaining() if timeout_seconds is None else min(self._remaining(), timeout_seconds)
         try:
             result = self.runner(command, workspace=str(workspace), input_bytes=stdin,
-                                 timeout_seconds=self._remaining(), allow_network=False,
-                                 env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", **(env or {})}, read_only_paths=read_only_paths)
+                                 timeout_seconds=timeout, allow_network=False,
+                                 env={"PATH": "/opt/homebrew/bin:/usr/bin:/bin", **(env or {})},
+                                 read_only_paths=read_only_paths, **limits)
         except OSError as exc:
             raise SoftwareExecutionError({"command":command,"elapsed_seconds":time.monotonic()-started,
                 "returncode":None,"stdout":"","stderr":"","timed_out":False,"truncated":False,
@@ -512,7 +935,8 @@ class SoftwareWorkbench:
                 "startup_error":{"type":type(exc).__name__,"errno":exc.errno,"message":str(exc)}}) from exc
         record = {"command": command, "elapsed_seconds":time.monotonic()-started,"returncode": result.returncode, "stdout": result.stdout.decode("utf-8", errors="replace"),
                   "stderr": result.stderr.decode("utf-8", errors="replace"), "timed_out": result.timed_out,
-                  "truncated": result.truncated, "sandbox_mode": result.mode, "stdin_sha256": _sha(stdin)}
+                  "truncated": result.truncated, "sandbox_mode": result.mode, "stdin_sha256": _sha(stdin),
+                  "timeout_seconds": timeout, **({"resource_limits_requested": limits} if limits else {})}
         if result.returncode != 0 or result.timed_out or result.truncated or result.mode != "sandbox-exec":
             raise SoftwareExecutionError(record)
         return record
@@ -692,41 +1116,135 @@ class SoftwareWorkbench:
         return tuple(dict.fromkeys(roots))
 
     def _run(self, args, key):
-        _fields(args, {"environment_ref", "source", "input", "purpose", "documentation_refs", "expected"})
-        environment = self._environment(args["environment_ref"])
+        _fields(args, {"source", "input", "purpose", "expected"},
+                {"environment_ref", "runtime", "documentation_refs", "inputs", "outputs"})
+        runtime_label, environment_ref = args.get("runtime"), args.get("environment_ref")
+        if (runtime_label is None) == (environment_ref is None):
+            raise ValidationError("software run requires exactly one of environment_ref or runtime")
         if not isinstance(args["source"], str) or not args["source"].strip() or not isinstance(args["input"], dict):
             raise ValidationError("software run requires complete source and JSON object input")
         if args["purpose"] not in {"upstream_example", "scientific_computation"}:
             raise ValidationError("software run must declare example reproduction or scientific computation")
-        if not isinstance(args["documentation_refs"], list) or not args["documentation_refs"]:
-            raise ValidationError("software run requires acquired documentation references")
-        for ref in args["documentation_refs"]:
-            read = self._receipt(ref, "read")["result"]
-            if read["inspection_ref"] != environment["inspection_ref"]:
-                raise ValidationError("software documentation belongs to another source revision")
         if args["expected"] is not None and not isinstance(args["expected"], dict):
             raise ValidationError("expected upstream output must be a JSON object or null")
         if args["purpose"] == "upstream_example" and args["expected"] is None:
             raise ValidationError("upstream_example requires a documented expected output and tolerances before execution; use scientific_computation for a new output without an upstream comparison")
+        limits = self._effective_limits()
+        declared_inputs = self._declared_inputs(args.get("inputs"), limits)
+        declared_outputs = self._declared_outputs(args.get("outputs"), limits)
+        documentation_refs = args.get("documentation_refs") or []
+        environment = None
+        env, read_roots, resource_limits = {}, (), {}
+        if runtime_label is not None:
+            runtime, fingerprint = self._lab_runtime(runtime_label)
+            from scisaurus.runtime.laboratory import resolve_runtime_environment, runtime_read_roots
+            executable, runtime_kind = runtime["executable"], runtime["kind"]
+            read_roots = runtime_read_roots(runtime)
+            resource_limits = runtime.get("resource_limits") or {}
+            if not isinstance(documentation_refs, list):
+                raise ValidationError("software run documentation_refs must be a list")
+            for ref in documentation_refs:
+                if not isinstance(ref, str) or not ref.startswith("software-evidence:"):
+                    raise ValidationError(
+                        "laboratory run documentation must reference accepted captured evidence, not an acquired environment")
+                self._evidence(ref)
+        else:
+            environment = self._environment(environment_ref)
+            if not isinstance(documentation_refs, list) or not documentation_refs:
+                raise ValidationError("software run requires acquired documentation references")
+            for ref in documentation_refs:
+                read = self._receipt(ref, "read")["result"]
+                if read["inspection_ref"] != environment["inspection_ref"]:
+                    raise ValidationError("software documentation belongs to another source revision")
+            executable, runtime_kind = environment["executable"], environment["runtime"]
+            read_roots = self._dependency_roots(environment)
         root = self.root / "runs" / key
         root.mkdir(parents=True, exist_ok=False)
-        source = root / ("program.R" if environment["runtime"] == "r" else "program.py")
+        staged = self._stage_inputs(declared_inputs, root) if declared_inputs else []
+        if runtime_label is not None:
+            from scisaurus.runtime.laboratory import resolve_runtime_environment
+            env = resolve_runtime_environment(runtime, root)
+        source = root / ("program.R" if runtime_kind == "r" else "program.py")
         text = args["source"]
-        if environment["runtime"] == "r":
+        if runtime_kind == "r":
+            if environment is None:
+                raise ValidationError("R laboratory runtimes are not supported; use an acquired R environment")
             text = ".libPaths(c(" + json.dumps(str(Path(environment["environment_path"]) / "library")) + ", .Library));\n" + text
         source.write_text(text)
-        command = [environment["executable"], *(["--vanilla"] if environment["runtime"] == "r" else ["-I"]), str(source)]
-        execution = self._sandbox(command, root, stdin=canonical_bytes(args["input"]),
-                                  read_only_paths=self._dependency_roots(environment))
+        # Acquired environments run their own interpreter with -I/-vanilla for
+        # isolation.  A laboratory runtime may rely on an operator-declared
+        # PYTHONHOME/PYTHONPATH (for example a bundled CAD interpreter), so it
+        # runs without an isolation flag; the sandbox remains the boundary.
+        if runtime_label is not None:
+            flags = []
+        else:
+            flags = ["--vanilla"] if runtime_kind == "r" else ["-I"]
+        command = [executable, *flags, str(source)]
+        try:
+            if runtime_kind == "container":
+                from scisaurus.runtime.container_runtime import run_container
+                started = time.monotonic()
+                stdin = canonical_bytes(args["input"])
+                timeout = min(self._remaining(), limits.get("max_runtime_seconds") or self._remaining())
+                result = run_container(runtime, source, workspace=root, input_bytes=stdin,
+                                       timeout_seconds=timeout, env=env,
+                                       file_size_bytes=resource_limits.get("file_size_bytes", DEFAULT_FILE_SIZE),
+                                       check_workspace=lambda: self._workspace_guard(root, limits))
+                execution = {"command": [runtime["container"]["interpreter"], "/work/program.py"],
+                             "image_id": runtime["container"]["image_id"],
+                             "platform": runtime["container"]["platform"],
+                             "elapsed_seconds": time.monotonic() - started,
+                             "returncode": result.returncode, "stdout": result.stdout.decode(errors="replace"),
+                             "stderr": result.stderr.decode(errors="replace"), "timed_out": result.timed_out,
+                             "truncated": result.truncated, "sandbox_mode": result.mode,
+                             "stdin_sha256": _sha(stdin), "timeout_seconds": timeout, "cleanup": result.cleanup}
+                if result.returncode != 0 or result.timed_out or result.truncated or result.mode != "container" or not result.cleanup["completed"]:
+                    raise SoftwareExecutionError(execution)
+            else:
+                execution = self._sandbox(
+                    command, root, stdin=canonical_bytes(args["input"]), env=env,
+                    read_only_paths=read_roots, timeout_seconds=limits.get("max_runtime_seconds"),
+                    cpu_seconds=resource_limits.get("cpu_seconds"),
+                    address_space_bytes=resource_limits.get("address_space_bytes"),
+                    file_size_bytes=resource_limits.get("file_size_bytes"))
+        except SoftwareExecutionError as exc:
+            raise SoftwareExecutionError({**exc.execution, "failure_artifacts": ({"files": [], "omitted": [{"reason": "container termination unconfirmed"}], "complete": False} if exc.execution.get("cleanup", {}).get("completed") is False else self._failure_snapshot(root, limits)), "source_sha256": _sha(text.encode()), "input_sha256": _sha(canonical_bytes(args["input"])), "inputs": staged,
+                                          "declared_outputs": declared_outputs,
+                                          "runtime": runtime_label})
+        except ValidationError as exc:
+            partial = getattr(exc, "process_result", None)
+            evidence = {"runtime": runtime_label, "source": text, "source_sha256": _sha(text.encode()),
+                        "input": args["input"], "input_sha256": _sha(canonical_bytes(args["input"])),
+                        "inputs": staged, "failure_artifacts": ({"files": [], "omitted": [{"reason": "container termination unconfirmed"}], "complete": False} if getattr(exc, "container_cleanup", {}).get("completed") is False else self._failure_snapshot(root, limits)),
+                        "error_type": type(exc).__name__, "error": str(exc)}
+            if partial is not None:
+                evidence.update(stdout=partial.stdout.decode(errors="replace"), stderr=partial.stderr.decode(errors="replace"),
+                                returncode=partial.returncode, sandbox_mode=partial.mode,
+                                cleanup=getattr(partial, "cleanup", None))
+            exc.execution = evidence
+            raise
         try:
             output = _parse_object(execution["stdout"].encode())
             expected_matches = _matches_expected(output, args["expected"]) if args["expected"] is not None else None
         except (ValueError, ValidationError) as exc:
-            raise SoftwareExecutionError({**execution, "output_error": str(exc)}) from exc
-        self._environment(args["environment_ref"])
-        result = {"environment_ref": args["environment_ref"], "source_sha256": _sha(text.encode()), "source": text,
+            raise SoftwareExecutionError({**execution, "output_error": str(exc),
+                                          "failure_artifacts": self._failure_snapshot(root, limits),
+                                          "inputs": staged, "runtime": runtime_label}) from exc
+        try:
+            outputs = self._collect_outputs(declared_outputs, root, limits)
+        except ValidationError as exc:
+            raise SoftwareExecutionError({**execution, "output_error": str(exc),
+                                          "failure_artifacts": self._failure_snapshot(root, limits),
+                                          "inputs": staged, "runtime": runtime_label}) from exc
+        if runtime_label is not None:
+            self._lab_runtime(runtime_label)
+        else:
+            self._environment(environment_ref)
+        result = {"environment_ref": environment_ref, "runtime": runtime_label,
+                "source_sha256": _sha(text.encode()), "source": text,
                 "input": args["input"], "input_sha256": _sha(canonical_bytes(args["input"])),
-                "purpose": args["purpose"], "documentation_refs": args["documentation_refs"], "execution": execution,
+                "purpose": args["purpose"], "documentation_refs": documentation_refs,
+                "inputs": staged, "outputs": outputs, "execution": execution,
                 "output": output, "stdout_sha256": _sha(execution["stdout"].encode()),
                 "expected": args["expected"], "expected_matches": expected_matches,
                 "scientific_admission": "not_assessed"}
@@ -791,14 +1309,18 @@ def software_assessment_prompt(request):
     return projected
 
 
-def selection_contract():
+def selection_contract(laboratory=None):
     from scisaurus.runtime.measurement_contract import model_definition_contract
+    selection = {
+        "strategy": "reuse | custom_model | unavailable", "rationale": "source-bound scientific fit assessment",
+        "environment_ref": None, "example_ref": None, "computation_refs": [],
+        "scientific_source_refs": [], "limitations": [],
+        "model_definition": model_definition_contract()}
+    if laboratory is not None:
+        from scisaurus.runtime.laboratory import laboratory_engineering_contract
+        selection["laboratory_engineering"] = laboratory_engineering_contract(laboratory)
     return {"decision": "pass | hold", "summary": "...", "findings": [], "evidence_gaps": [],
-            "requested_actions": [], "software_selection": {
-                "strategy": "reuse | custom_model | unavailable", "rationale": "source-bound scientific fit assessment",
-                "environment_ref": None, "example_ref": None, "computation_refs": [],
-                "scientific_source_refs": [], "limitations": [],
-                "model_definition": model_definition_contract()}}
+            "requested_actions": [], "software_selection": selection}
 
 
 def selection_reference_contract(workbench, results):
@@ -821,10 +1343,22 @@ def selection_reference_contract(workbench, results):
 def validate_selection(response, workbench, results):
     errors = _field_errors(response, {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "software_selection"})
     if isinstance(response, dict) and "software_selection" in response:
-        errors.extend(_field_errors(response["software_selection"], {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"}, {"model_definition"}, path="/software_selection"))
+        errors.extend(_field_errors(response["software_selection"], {"strategy", "rationale", "environment_ref", "example_ref", "computation_refs", "scientific_source_refs", "limitations"}, {"model_definition", "laboratory_engineering"}, path="/software_selection"))
     if errors:
         raise ValidationError("; ".join(errors))
     selection = response["software_selection"]
+    if (getattr(workbench, "laboratory", None) is not None and response["decision"] == "pass"
+            and "laboratory_engineering" not in selection):
+        raise ValidationError(
+            "/software_selection/laboratory_engineering is required when a laboratory is bound and "
+            "the decision is pass; the engineering obligations cannot be skipped")
+    if (getattr(workbench, "laboratory", None) is not None
+            and isinstance(selection.get("laboratory_engineering"), dict)):
+        from scisaurus.runtime.laboratory import validate_laboratory_engineering
+        validate_laboratory_engineering(selection["laboratory_engineering"], workbench.laboratory.laboratory)
+    elif "laboratory_engineering" in selection:
+        raise ValidationError(
+            "/software_selection/laboratory_engineering requires a bound laboratory")
     if response["decision"] not in {"pass", "hold"} or selection["strategy"] not in {"reuse", "custom_model", "unavailable"}:
         raise ValidationError("scientific software selection has an unsupported decision")
     if not isinstance(selection["rationale"], str) or not selection["rationale"].strip():
@@ -837,19 +1371,50 @@ def validate_selection(response, workbench, results):
         raise ValidationError("scientific software assessment has not checked the actual execution environment")
     if selection["strategy"] == "reuse":
         refs = [selection["environment_ref"], selection["example_ref"], *selection["computation_refs"]]
-        if not selection["computation_refs"] or any(ref not in available for ref in refs):
-            raise ValidationError("software reuse lacks this assessment's actual environment, example and computations")
-        workbench._environment(selection["environment_ref"])
-        example = workbench._receipt(selection["example_ref"], "run")["result"]
-        if (example["purpose"] != "upstream_example" or example["expected_matches"] is not True
-                or example["environment_ref"] != selection["environment_ref"]):
-            raise ValidationError("software reuse has no matching reproduced upstream example")
-        for ref in selection["computation_refs"]:
-            computation = workbench._receipt(ref, "run")["result"]
-            if computation["purpose"] != "scientific_computation" or computation["environment_ref"] != selection["environment_ref"]:
-                raise ValidationError("selected software computation has another environment or purpose")
+        laboratory = getattr(workbench, "laboratory", None)
+        if laboratory is not None and selection["environment_ref"] is None:
+            # Laboratory reuse selects an operator-provisioned runtime by label
+            # instead of an environment this assessment acquired.  The runs are
+            # still exact content-addressed receipts from this assessment.
+            if selection["example_ref"] is not None or not selection["computation_refs"]:
+                raise ValidationError(
+                    "laboratory reuse requires declared computation receipts and no acquired example")
+            if any(ref not in available for ref in selection["computation_refs"]):
+                raise ValidationError("laboratory reuse cites an unavailable computation receipt")
+            for ref in selection["computation_refs"]:
+                computation = workbench._receipt(ref, "run")["result"]
+                if computation.get("runtime") is None or computation.get("environment_ref") is not None:
+                    raise ValidationError(
+                        "laboratory reuse must cite a run of a declared laboratory runtime")
+                if computation.get("purpose") != "scientific_computation":
+                    raise ValidationError("laboratory reuse must cite a scientific computation")
+        else:
+            if not selection["computation_refs"] or any(ref not in available for ref in refs):
+                raise ValidationError("software reuse lacks this assessment's actual environment, example and computations")
+            workbench._environment(selection["environment_ref"])
+            example = workbench._receipt(selection["example_ref"], "run")["result"]
+            if (example["purpose"] != "upstream_example" or example["expected_matches"] is not True
+                    or example["environment_ref"] != selection["environment_ref"]):
+                raise ValidationError("software reuse has no matching reproduced upstream example")
+            for ref in selection["computation_refs"]:
+                computation = workbench._receipt(ref, "run")["result"]
+                if computation["purpose"] != "scientific_computation" or computation["environment_ref"] != selection["environment_ref"]:
+                    raise ValidationError("selected software computation has another environment or purpose")
     elif selection["environment_ref"] is not None or selection["example_ref"] is not None or selection["computation_refs"]:
         raise ValidationError("non-reuse selection must not claim an executed software capability")
+    if selection["strategy"] == "reuse":
+        # Accepted selection reuse rehashes the retained outputs and inputs and
+        # re-checks the current runtime, so a stale or tampered receipt can never
+        # be admitted as a successful reuse.
+        for ref in selection["computation_refs"]:
+            computation = workbench._receipt(ref, "run")["result"]
+            workbench.verify_run_outputs(computation)
+            for row in computation.get("inputs") or []:
+                workbench._read_artifact(row["artifact_ref"])
+            if computation.get("runtime") is not None:
+                workbench._lab_runtime(computation["runtime"])
+            elif computation.get("environment_ref") is not None:
+                workbench._environment(computation["environment_ref"])
     if selection["strategy"] == "custom_model":
         if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in DISCOVERY_OPERATIONS for row in results):
             raise ValidationError("custom modelling requires actual software discovery and nonempty "

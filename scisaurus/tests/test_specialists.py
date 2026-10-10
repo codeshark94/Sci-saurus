@@ -21,6 +21,7 @@ from scisaurus.runtime.specialists import (
     _normalise_report, _normalise_verdict,
     _specialist_repair_prompt, _verifier_repair_prompt,
     build_specialist_prompt, build_verifier_prompt, redact_sensitive_text,
+    changed_topic_review_fields,
 )
 
 
@@ -143,6 +144,45 @@ class _ProviderFallbackHandler(BaseHTTPRequestHandler):
 
 
 class SpecialistDispatcherTests(unittest.TestCase):
+    def test_exact_topic_peer_projection_invalidates_only_changed_scientific_fields(self):
+        assignment = {"role_id": "topic-maturity-reviewer", "stage_id": "topic",
+            "stage_kind": "topic_discovery", "input_projection": ["candidate_topics", "frontier_seeds"]}
+        packet = {"stage_result": {"topic": {"id": "x"}, "candidate_topics": [{"id": "x", "why_promising": "full source"}],
+            "frontier_seeds": [{"id": "s", "frequency": 20}]}}
+        prompt = build_specialist_prompt(assignment, packet)
+        report = {"request_inputs": [{"input": {"prompt": prompt}}]}
+        self.assertEqual(changed_topic_review_fields(assignment, packet, report), {})
+        historical = json.loads(prompt); historical["projected_input"]["candidate_topics"][0]["why_promising"] = "full..."
+        report["request_inputs"][0]["input"]["prompt"] = json.dumps(historical)
+        self.assertEqual(set(changed_topic_review_fields(assignment, packet, report)), {"candidate_topics"})
+        del historical["projected_input"]["frontier_seeds"]
+        report["request_inputs"][0]["input"]["prompt"] = json.dumps(historical)
+        self.assertEqual(set(changed_topic_review_fields(assignment, packet, report)), {"candidate_topics", "frontier_seeds"})
+        for invalid in ({}, {"request_inputs": [{"input": {"prompt": "[]"}}]}):
+            with self.assertRaisesRegex(ValidationError, "projection proof"):
+                changed_topic_review_fields(assignment, packet, invalid)
+
+    def test_topic_verifier_preserves_complete_authored_fields_at_every_detail(self):
+        from scisaurus.runtime.specialists import _verifier_chief_result
+        topic = {"id": "concept", "research_question": "Bounded mechanism comparison",
+                 "why_promising": "source-grounded rationale. " * 100 + "Novelty is unverified.",
+                 "feasibility_plan": {"constraints": [str(i) for i in range(20)],
+                                      "first_pilot": {"boundary": "declared termination. " * 100}}}
+        evidence = [{"work_id": str(i), "abstract": "captured passage. " * 100} for i in range(12)]
+        challenge = {"decision": "admit_to_survey", "history": [{"text": "retained response. " * 100}]}
+        chief = {"topic": topic, "candidates": [topic], "candidate_prior_work": evidence,
+                 "source_challenge": challenge}
+        for detail in ("full", "compact", "minimal", "focused"):
+            projected = _verifier_chief_result(chief, detail=detail)
+            self.assertEqual(projected["topic"], topic)
+            self.assertEqual(projected["candidates"], [topic])
+            self.assertEqual(projected["candidate_prior_work"], evidence)
+            self.assertEqual(projected["source_challenge"], challenge)
+            self.assertEqual(projected["topic_sha256"], hashlib.sha256(canonical_bytes(topic)).hexdigest())
+        with self.assertRaisesRegex(ValidationError, "input quota"):
+            build_verifier_prompt({"id": "topic", "kind": "topic_discovery"}, {}, [], chief,
+                                  max_input_tokens=300)
+
     def test_repair_evidence_preserves_complete_scope_and_rejects_unbound_sources(self):
         from scisaurus.runtime.specialists import REPAIR_EVIDENCE_SYSTEM, build_repair_evidence_prompt
         source = "def execute():\n    return 1\n" * 300
@@ -934,6 +974,77 @@ class SpecialistDispatcherTests(unittest.TestCase):
                 "topic": {"question": "A bounded question"},
             })
 
+    def test_topic_review_preserves_authored_text_and_scopes_prior_findings(self):
+        candidate = {"id": "c1", "research_question": "A fixed question",
+                     "why_promising": "Evidence-linked rationale. " * 400,
+                     "feasibility": "A bounded implementation. " * 150,
+                     "feasibility_plan": {"pilot": {"boundary": "Declared termination. " * 150}}}
+        seed = {"id": "s1", "domain": "Acoustics", "mechanism": "A discovery mechanism",
+                "unit_of_analysis": "Original discovery frequency range"}
+        order = {"id": "repair-1", "attempt_lineage": {
+            "verifier_execution_ref": "artifact:verifier/old@1", "topic_sha256": "old-digest",
+            "blocking_findings": ["The prior topic has incomplete rationale."]}}
+        result = {"topic": candidate, "candidate_topics": [candidate] * 9,
+                  "frontier_seeds": [seed], "topic_evolution": {"mode": "refinement"}}
+        packet = {"stage_id": "topic", "stage_kind": "topic_discovery",
+                  "stage_result": result, "work_orders": [order]}
+        assignment = {"role_id": "topic-maturity-reviewer", "stage_id": "topic",
+                      "stage_kind": "topic_discovery", "input_projection": ["candidate_topics", "frontier_seeds"],
+                      "quota": {"max_input_tokens": 245760}}
+        prompt = json.loads(build_specialist_prompt(assignment, packet))
+        self.assertEqual(prompt["projected_input"]["candidate_topics"], result["candidate_topics"])
+        self.assertEqual(prompt["projected_input"]["frontier_seeds"], [seed])
+        scope = prompt["shared_stage_context"]["stage_evidence_scope"]
+        self.assertEqual(scope["current_authored_fields"]["topic"], {
+            "complete": True, "sha256": hashlib.sha256(canonical_bytes(candidate)).hexdigest()})
+        self.assertEqual(scope["supplied_current_fields"], ["candidate_topics", "frontier_seeds"])
+        self.assertEqual(scope["incoming_review_requirements"][0]["attempt_lineage"], order["attempt_lineage"])
+        self.assertEqual(scope["incoming_review_requirements"][0]["temporal_scope"], "prior_review_requirements_to_reassess")
+        self.assertEqual(scope["discovery_input_scope"]["temporal_scope"], "before_candidate_authoring")
+        self.assertEqual(packet["work_orders"], [order])
+        assignment["quota"]["max_input_tokens"] = 3000
+        with self.assertRaisesRegex(ValidationError, "cannot preserve"):
+            build_specialist_prompt(assignment, packet)
+
+    def test_verifier_preserves_discovery_seed_semantics_and_peer_input_scope(self):
+        from scisaurus.runtime.specialists import _verifier_chief_result
+        seed = {"id": "s1", "domain": "Acoustics", "phenomenon": "Refraction",
+                "mechanism": "Resonant delay", "unit_of_analysis": "Original sweep. " * 200,
+                "search_queries": ["Prior literature"]}
+        chief = {"topic": {"id": "c1", "measurement": "Current sweep."},
+                 "candidates": [], "frontier_seed_plan": {"seeds": [seed]}}
+        for detail in ("full", "compact", "minimal", "focused"):
+            self.assertEqual(_verifier_chief_result(chief, detail=detail)["frontier_seed_plan"],
+                             chief["frontier_seed_plan"])
+        peer_scope = {"prompt_sha256": "digest", "projected_fields": {"candidate_topics": "candidate-digest"}}
+        prompt = json.loads(build_verifier_prompt(
+            {"id": "topic", "kind": "topic_discovery"}, {"stage_id": "topic", "work_orders": []},
+            [{"role_id": "topic-maturity-reviewer", "input_scope": peer_scope}], chief))
+        self.assertEqual(prompt["specialist_reports"][0]["input_scope"], peer_scope)
+        self.assertEqual(prompt["stage_evidence_scope"]["current_authored_fields"]["topic"]["sha256"],
+                         hashlib.sha256(canonical_bytes(chief["topic"])).hexdigest())
+        from scisaurus.runtime.specialists import _verifier_report, _review_input_scope
+        actual = json.dumps({"projected_input": {"candidate_topics": [{"id": "c1", "why_promising": "Short projection"}]}})
+        restored = _verifier_report({"input_scope": {"prompt_sha256": "incorrect", "execution_ref": "immutable-execution"},
+                                     "request_inputs": [{"input": {"prompt": actual}}]})["input_scope"]
+        self.assertEqual(restored["prompt_sha256"], hashlib.sha256(actual.encode()).hexdigest())
+        self.assertNotIn("execution_ref", restored)
+        report = {"role_id": "topic-maturity-reviewer", "response": {"decision": "hold", "summary": "Source check."},
+                  "input_scope": {"assignment_plan_ref": "plan-1", "execution_ref": "execution-1", "contract_state": "original"},
+                  "request_inputs": [{"input": {"prompt": actual}}]}
+        first = _verifier_report(report)
+        reconciled = deepcopy(report)
+        reconciled["input_scope"].update(assignment_plan_ref="plan-2", execution_ref="execution-2", contract_state="replayed")
+        self.assertEqual(first, _verifier_report(reconciled))
+        self.assertEqual(report["input_scope"]["execution_ref"], "execution-1")
+        reconciled["response"]["summary"] = "New scientific finding."
+        self.assertNotEqual(first, _verifier_report(reconciled))
+        reconciled = deepcopy(report)
+        reconciled["request_inputs"][0]["input"]["prompt"] = actual + " "
+        self.assertNotEqual(first, _verifier_report(reconciled))
+        for raw in ("plain prompt", json.dumps({"projected_input": {}, "shared_stage_context": []}), "null", "[]"):
+            self.assertEqual(_review_input_scope(raw)["prompt_sha256"], hashlib.sha256(raw.encode()).hexdigest())
+
     def test_topic_maturity_prompt_preserves_scientific_records_under_role_quota(self):
         assignment = {
             "assigned_role": "research.topic-maturity-reviewer",
@@ -1020,8 +1131,8 @@ class SpecialistDispatcherTests(unittest.TestCase):
         prompt = build_verifier_prompt(
             {"id": "survey", "kind": "survey"},
             {"objective": "Study the declared question."}, reports, chief_result,
-            max_input_tokens=16000)
-        self.assertLessEqual(estimate_input_tokens(VERIFIER_SYSTEM, prompt), 16000)
+            max_input_tokens=32000)
+        self.assertLessEqual(estimate_input_tokens(VERIFIER_SYSTEM, prompt), 32000)
         parsed = json.loads(prompt)
         self.assertNotIn("runtime_context", parsed["chief_result"])
         self.assertNotIn("raw", parsed["specialist_reports"][0]["response"])
@@ -1029,6 +1140,7 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(
             parsed["chief_result"]["source_challenge"]["decision"], "admit_to_survey")
         self.assertNotIn("[truncated]", prompt)
+        self.assertEqual(parsed["chief_result"]["candidates"], chief_result["candidates"])
         self.assertIn("f" * 900, prompt)
 
     def test_repair_verifier_compacts_duplicate_failure_dossier_before_dispatch(self):

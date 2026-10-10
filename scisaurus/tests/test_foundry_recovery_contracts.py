@@ -9,6 +9,7 @@ from scisaurus.runtime.capability_foundry import IndependentValidatorContractErr
 from scisaurus.runtime.capability_foundry import CapabilityDeadlineError, CapabilityModelBudgetExceeded
 from scisaurus.runtime.composer import ComposerRunner
 from scisaurus.runtime.failure_recovery import classify_failure
+from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.specialists import research_question_alignment, build_repair_adjudication_prompt
 from scisaurus.tests import test_capability_foundry as foundry_fixtures
@@ -82,6 +83,10 @@ class FoundryRecoveryContractTests(unittest.TestCase):
                         runner.context[stage['id']]['failure_dossier_ref'] = new_ref
                         runner.stage_records[stage['id']]['attempts'][1]['failure_dossier_ref'] = new_ref
                     context = runner.context[stage['id']]
+                    if case == 'current_native':
+                        with self.assertRaisesRegex(ValidationError, 'invalid dossier identity'):
+                            runner._unresolved_response_owner(request, context)
+                        continue
                     self.assertEqual(runner._unresolved_response_owner(request, context) is not None, case == 'same')
                     self.assertEqual(runner._recovery_input_matches(stage, request, context, 'b' * 64), case == 'same')
                     self.assertFalse(runner._recovery_input_matches(stage, request, context, 'f' * 64))

@@ -7,7 +7,7 @@ from scisaurus.core.errors import ModelContractError, ValidationError, StateErro
 from scisaurus.core.source_spans import bind
 from scisaurus.runtime.literature_tree import (validate_plan, validate_reading_selection,
                                              reading_selection_parts, bind_plan_parents, normalize_plan, bind_reading_candidates,
-                                             planning_parent, selection_basis)
+                                             planning_parent, selection_basis, citation_targets, exploration_response_contract)
 from scisaurus.tests import test_survey as fixtures
 from scisaurus.tests.test_survey import simulated_survey_worker, source_quote, survey_config
 
@@ -26,6 +26,8 @@ def chain_worker(kind, params, channel):
         return
     if assignment.get("phase") != "exploration_plan":
         return simulated_survey_worker(kind, params, channel)
+    if assignment.get("response_contract") != exploration_response_contract():
+        raise AssertionError("fresh exploration assignments must expose the strict validator contract")
     parent = assignment["parents"][0]
     if any(item["id"] != f"parent-{index}" or "parent_id" in item
            for index, item in enumerate(assignment["parents"])):
@@ -57,7 +59,7 @@ def chain_worker(kind, params, channel):
     elif parent["work_id"] in {"W101", "W102"}:
         # Citation metadata is supplied by the actual fixture work response.
         source = next(s for s in assignment["sources"] if s["work_id"] == parent["work_id"])
-        target = parent["referenced_works"][0]
+        target = next(item["handle"] for item in parent["citation_targets"] if item["operation"] == "work")
         branches = [{"parent_id": parent["id"], "question": "How does the referenced study treat recall timing?",
             "rationale": "Follow a checked study's reference.", "operation": "work",
             "query": None, "work_id": target, "evidence": [source_quote(source)]}]
@@ -82,6 +84,83 @@ class TestExplorationContract(unittest.TestCase):
 
     def validate(self, value):
         validate_plan(bind(value, self.sources), self.parents, self.sources, max_branches=2)
+
+    def test_plan_field_error_separates_missing_and_extra_fields(self):
+        proposal = deepcopy(self.plan)
+        proposal["sources"] = []
+        with self.assertRaisesRegex(ModelContractError, r"invalid fields: missing \[\], extra \['sources'\]"):
+            self.validate(proposal)
+        self.assertIn("sources", proposal)
+        proposal.pop("sources")
+        proposal.pop("rationale")
+        with self.assertRaisesRegex(ModelContractError, r"invalid fields: missing \['rationale'\], extra \[\]"):
+            self.validate(proposal)
+
+    def test_plan_envelope_errors_identify_the_failed_constraint(self):
+        cases = [
+            ({**self.plan, "decision": "unknown"}, "decision:"),
+            ({**self.plan, "rationale": ""}, "rationale:"),
+            ({**self.plan, "branches": {}}, "branches: must be a list"),
+            ({**self.plan, "branches": []}, "requires a nonempty list"),
+            ({**self.plan, "decision": "stop"}, "requires an empty list"),
+            ({**self.plan, "branches": self.plan["branches"] * 3}, "exceeding declared bound 2"),
+        ]
+        for proposal, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaisesRegex(ModelContractError, diagnostic):
+                    validate_plan(proposal, self.parents, self.sources, max_branches=2)
+
+    def test_evidence_failure_identifies_exact_branch_field_and_parent(self):
+        plan = deepcopy(self.plan)
+        second = deepcopy(plan["branches"][0])
+        second.update(operation="search", work_id=None, query="mechanism boundary", evidence=[])
+        plan["branches"].append(second)
+        with self.assertRaisesRegex(ModelContractError, r"branches\[1\]\.evidence:.*kind=read, work_id='W1'.*nonempty"):
+            self.validate(plan)
+        self.assertEqual(plan["branches"][1]["evidence"], [])
+
+    def test_root_evidence_failure_requires_empty_list_with_precise_location(self):
+        plan = deepcopy(self.plan)
+        with self.assertRaisesRegex(ModelContractError, r"branches\[0\]\.evidence:.*kind=root.*empty list"):
+            validate_plan(bind(plan, self.sources), {"parent": {"kind": "root"}}, self.sources, max_branches=None)
+
+    def test_citation_handle_binds_exact_parent_work_and_direction(self):
+        targets = citation_targets(self.parents, {"parent-0": "parent"})
+        self.assertEqual(targets["parent-0-reference-0"],
+                         {"parent_id": "parent", "operation": "work", "work_id": "W2"})
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0].update(parent_id="parent-0", work_id="parent-0-reference-0")
+        original = deepcopy(proposal)
+        normalized = normalize_plan(proposal, {"parent-0": "parent"}, self.sources, parents=self.parents)
+        self.assertEqual(normalized, bind(self.plan, self.sources))
+        self.assertEqual(proposal, original)
+        validate_plan(normalized, self.parents, self.sources, max_branches=2)
+        proposal["branches"][0].update(operation="citing", work_id="parent-0-citing")
+        normalized = normalize_plan(proposal, {"parent-0": "parent"}, self.sources, parents=self.parents)
+        self.assertEqual(normalized["branches"][0]["work_id"], "W1")
+        validate_plan(normalized, self.parents, self.sources, max_branches=2)
+
+    def test_citation_handle_rejects_wrong_owner_direction_and_unknown_target(self):
+        parents = {**self.parents, "other": {**self.parents["parent"], "work_id": "W3",
+                                             "referenced_works": ["W4"]}}
+        aliases = {"parent-0": "parent", "parent-1": "other"}
+        for handle, operation in (("parent-1-reference-0", "work"),
+                                  ("parent-0-reference-0", "citing"),
+                                  ("parent-0-citing", "work"),
+                                  ("parent-0-reference-999", "work")):
+            proposal = deepcopy(self.plan)
+            proposal["branches"][0].update(parent_id="parent-0", work_id=handle, operation=operation)
+            with self.subTest(handle=handle), self.assertRaises(ValidationError):
+                normalized = normalize_plan(proposal, aliases, self.sources, parents=parents)
+                validate_plan(normalized, parents, self.sources, max_branches=2)
+
+    def test_citation_handles_do_not_repair_an_unrecorded_canonical_reference(self):
+        proposal = deepcopy(self.plan)
+        proposal["branches"][0].update(parent_id="parent-0", work_id="W999")
+        normalized = normalize_plan(proposal, {"parent-0": "parent"}, self.sources, parents=self.parents)
+        self.assertEqual(normalized["branches"][0]["work_id"], "W999")
+        with self.assertRaisesRegex(ValidationError, "actual citation metadata"):
+            validate_plan(normalized, self.parents, self.sources, max_branches=2)
 
     def test_grounded_reference_branch(self):
         self.validate(self.plan)
@@ -212,7 +291,7 @@ class TestExplorationContract(unittest.TestCase):
             normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
         proposal = deepcopy(self.plan)
         proposal["extra"] = {"work_id": "W1", "source_ref": [], "quote": "invalid"}
-        with self.assertRaisesRegex(ModelContractError, "requires decision"):
+        with self.assertRaisesRegex(ModelContractError, r"invalid fields: missing \[\], extra \['extra'\]"):
             normalize_plan(proposal, {"parent-0": "parent"}, self.sources)
 
     def test_arbitrary_model_values_are_not_traversed_as_evidence(self):
@@ -523,6 +602,7 @@ class TestExplorationExecution(unittest.TestCase):
         captured = []
         def check(name, role, assignment, validator, *, normalizer, **kwargs):
             captured.append((name, deepcopy(assignment)))
+            self.assertEqual(assignment["response_contract"], exploration_response_contract())
             displayed = assignment["sources"][0]
             self.assertIn(quote, displayed["text"])
             start, end = displayed["window"]["start"], displayed["window"]["end"]
