@@ -3203,8 +3203,10 @@ class SpecialistDispatcher:
                     if type(value) is int and value >= 0:
                         accumulated_usage[key] = accumulated_usage.get(key, 0) + value
                 try:
-                    receipt = json.loads(Path(exc.receipt).read_text())
+                    receipt_body = Path(exc.receipt).read_bytes()
+                    receipt = json.loads(receipt_body)
                 except (OSError, ValueError, TypeError):
+                    receipt_body = None
                     receipt = {}
                 known = receipt.get("status") == "completed" or receipt.get("outcome_known") is True
                 if request_input is not None:
@@ -3216,6 +3218,7 @@ class SpecialistDispatcher:
                           "model": self.software_author_backend["model"], "error": str(exc),
                           "failure": {"kind": "operational_recovery", "outcome_known": known},
                           "dsh_receipt": exc.receipt, "dsh_backend_terminal": True,
+                          "dsh_receipt_sha256": hashlib.sha256(receipt_body).hexdigest() if receipt_body is not None else None,
                           "usage": deepcopy(accumulated_usage),
                           "elapsed_seconds": time.monotonic() - started,
                           "route_id": route["route_id"] if route else None, "provider_pool": None}
