@@ -14744,11 +14744,37 @@ class ComposerRunner:
         digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         logical = f"command/scientific-software-assessments/{digest}"
         previous = self.store.head(logical + "/receipt")
+        carried_failure = None
+        if previous is None:
+            carried = self.context.get(stage["id"], {}).get("scientific_software_assessment", {})
+            if isinstance(carried, dict) and carried.get("status") in {"accepted", "blocked"} and carried.get("artifact_ref"):
+                manifest, _, retained = self._read_verified_artifact_json(carried["artifact_ref"])
+                original_identity = retained.get("identity")
+                if isinstance(original_identity, dict):
+                    canonical_identity = {**original_identity,
+                        "computation_scope": software_computation_identity(original_identity.get("computation_scope", {}))}
+                    if canonical_identity == identity:
+                        if retained.get("status") != carried["status"]:
+                            raise ValidationError("carried software assessment changed its recorded outcome")
+                        _, _, execution = self._read_verified_artifact_json(retained["producer_execution_ref"])
+                        original_digest = hashlib.sha256(canonical_bytes(original_identity)).hexdigest()
+                        if (execution.get("project_id") != self.workflow["project_id"]
+                                or execution.get("input_ref", {}).get("kind") != "scientific_software_assessment"
+                                or execution.get("input_ref", {}).get("stage_id") != stage["id"]
+                                or execution.get("input_ref", {}).get("digest") != original_digest):
+                            raise ValidationError("carried software assessment lost its original producer ownership")
+                        if retained["status"] == "accepted":
+                            previous = manifest
+                        else:
+                            carried_failure = manifest
         if previous:
             _, _, retained = self._read_verified_artifact_json(previous["artifact_ref"])
             _, _, producer = self._read_verified_artifact_json(retained["producer_execution_ref"])
             _, _, reviewer = self._read_verified_artifact_json(retained["verifier_execution_ref"])
-            if (retained.get("identity") != identity or retained.get("status") != "accepted"
+            retained_identity = retained.get("identity", {})
+            canonical_identity = {**retained_identity,
+                "computation_scope": software_computation_identity(retained_identity.get("computation_scope", {}))}
+            if (canonical_identity != identity or retained.get("status") != "accepted"
                     or producer.get("report", {}).get("response", {}).get("software_selection") != retained.get("selection")
                     or reviewer.get("report", {}).get("response") != retained.get("review")
                     or reviewer.get("chief_result", {}).get("software_assessment") != retained.get("evidence")):
@@ -14797,10 +14823,13 @@ class ComposerRunner:
         request_record = self._publish(logical + "/request", "note", request, "command.composer")
         response_repair = None
         retained_producer = None
-        failed = self.store.head(logical + "/failure")
+        failed = self.store.head(logical + "/failure") or carried_failure
         if failed:
             _, _, prior = self._read_verified_artifact_json(failed["artifact_ref"])
-            if prior.get("identity") != identity or prior.get("status") != "blocked":
+            prior_identity = prior.get("identity", {})
+            canonical_identity = {**prior_identity,
+                "computation_scope": software_computation_identity(prior_identity.get("computation_scope", {}))}
+            if canonical_identity != identity or prior.get("status") != "blocked":
                 raise ValidationError("software response recovery lost its scientific assignment")
             _, _, old_request = self._read_verified_artifact_json(prior["evidence"]["request_ref"])
             if (prior["evidence"].get("request") != old_request
@@ -14813,7 +14842,7 @@ class ComposerRunner:
             if (execution.get("project_id") != self.workflow["project_id"]
                     or execution.get("input_ref", {}).get("kind") != "scientific_software_assessment"
                     or execution.get("input_ref", {}).get("stage_id") != stage["id"]
-                    or execution.get("input_ref", {}).get("digest") != digest):
+                    or execution.get("input_ref", {}).get("digest") != hashlib.sha256(canonical_bytes(prior_identity)).hexdigest()):
                 raise ValidationError("software response recovery belongs to another assignment")
             failure = report.get("failure", {})
             if report.get("status") == "failed" and failure.get("kind") == "output_contract":

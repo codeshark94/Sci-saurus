@@ -372,6 +372,27 @@ class ResponseOwnedCodegenTests(unittest.TestCase):
         self.assertNotIn("lineage", projection["evidence_catalog"][0])
         self.assertIn("lineage", request["evidence_catalog"][0])
 
+    def test_software_identity_excludes_nested_reconciliation_but_preserves_plan(self):
+        scope = {"work_orders": [{"kind": "analysis_repair", "objective": "Measure contrast",
+                 "experiment_repair_plan": {"schema_version": "experiment-repair-plan-1",
+                     "required_changes": ["Use the declared solver"],
+                     "lineage": {"continuation_cycle": 1, "failure_input_sha256": "a" * 64,
+                         "prior_attempt_reconciliation": {"records": [{"state": "started"}]}}}}]}
+        original = deepcopy(scope)
+        changed = deepcopy(scope)
+        changed["work_orders"][0]["experiment_repair_plan"]["lineage"] = {
+            "continuation_cycle": 2, "failure_input_sha256": "b" * 64,
+            "prior_attempt_reconciliation": {"records": [{"state": "unknown"}]}}
+        self.assertEqual(software_computation_identity(scope), software_computation_identity(changed))
+        self.assertEqual(scope, original)
+        request = {"computation_scope": scope, "evidence_catalog": []}
+        self.assertNotIn("lineage", software_assessment_prompt(request)["computation_scope"]["work_orders"][0]["experiment_repair_plan"])
+        self.assertEqual(request["computation_scope"], original)
+        for key in ("required_changes", "diagnostic_hypotheses", "must_verify", "source_refs"):
+            altered = deepcopy(changed)
+            altered["work_orders"][0]["experiment_repair_plan"][key] = ["Different scientific evidence"]
+            self.assertNotEqual(software_computation_identity(scope), software_computation_identity(altered))
+
     def test_review_receives_current_threshold_outcome_without_forcing_success(self):
         helper = measurement_fixtures.MeasurementContractTests()
         intent = helper.intent()

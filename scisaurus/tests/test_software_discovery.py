@@ -1,3 +1,4 @@
+from copy import deepcopy
 import io
 import http.client
 import json
@@ -19,6 +20,110 @@ from scisaurus.runtime.software_workbench import SoftwareWorkbench
 from scisaurus.runtime.software_workbench import selection_contract
 from scisaurus.runtime.specialists import SpecialistDispatcher
 from scisaurus.runtime.models import ModelResult
+
+
+class CarriedAssessmentTests(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+        from scisaurus.runtime.composer import study_evidence_contract
+        from scisaurus.runtime.software_workbench import REVISION, SELECTION_CONTRACT_REVISION
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.stage = {'id':'experiment','kind':'experiment','depends_on':[]}
+        self.topic = {'topic':{'id':'concept','research_question':'Does the design work?'}}
+        self.scope = {'work_orders':[{'kind':'experiment_repair','experiment_repair_plan':{
+            'required_changes':['Repair the observed boundary residual'],
+            'lineage':{'continuation_cycle':1,'failure_input_sha256':'a'*64}}}]}
+        identity = {'revision':REVISION,'response_contract_revision':SELECTION_CONTRACT_REVISION,
+            'topic':deepcopy(self.topic['topic']),'prior_work':[],'source_challenge':None,
+            'evidence_catalog':[],'evidence_availability':[],
+            'computation_scope':deepcopy(self.scope),'study_evidence_contract':study_evidence_contract()}
+        self.receipt = {'status':'accepted','identity':identity,
+            'selection':{'strategy':'reuse','environment_ref':'environment'},
+            'review':{'decision':'accept'},'evidence':{'request_ref':'request','request':deepcopy(identity)},
+            'producer_execution_ref':'producer','verifier_execution_ref':'reviewer',
+            'ledger':{'assignment_plan_ref':'original-plan'},'usage_invoice_ref':'original-invoice'}
+        self.rows = {'receipt':self.receipt,'request':deepcopy(identity),
+            'producer':{'project_id':'project','input_ref':{'kind':'scientific_software_assessment',
+                'stage_id':'experiment','digest':digest(canonical_bytes(identity))},
+                'report':{'status':'succeeded','response':{'software_selection':deepcopy(self.receipt['selection'])}}},
+            'reviewer':{'report':{'response':deepcopy(self.receipt['review'])},
+                'chief_result':{'software_assessment':deepcopy(self.receipt['evidence'])}}}
+        class FreshAssessment(Exception):
+            pass
+        self.FreshAssessment = FreshAssessment
+        self.assignments = []
+        def pool(stage, assignment, *args, **kwargs):
+            self.assignments.append(deepcopy(assignment))
+            raise FreshAssessment()
+        self.runner = SimpleNamespace(root=Path(self.temp.name),workflow={'project_id':'project','stages':[self.stage]},
+            context={'experiment':{'scientific_software_assessment':{'status':'accepted','artifact_ref':'receipt'}}},
+            store=SimpleNamespace(head=lambda _:None),_software_author_backend_config=lambda:None,
+            _stage_remaining=lambda _:10,_read_verified_artifact_json=lambda ref:({'artifact_ref':ref},'hash',deepcopy(self.rows[ref])),
+            _publish=lambda *args:{'artifact_ref':'new-request'},continuation_cycles=2,
+            _capability_repair_panel_stage_id=lambda *args,**kwargs:'panel',
+            _next_capability_repair_assignment_attempt=lambda _:1,_software_producer_quota=lambda _: {},
+            departments=SimpleNamespace(begin_stage=lambda *args,**kwargs:{'assignments':[
+                {'assignment_phase':'specialist','role_id':'methodologist'}],'plan_ref':'new-plan'}),
+            _run_specialist_pool=pool)
+        self.scope['work_orders'][0]['experiment_repair_plan']['lineage']['continuation_cycle']=2
+
+    def assess(self):
+        from scisaurus.runtime.composer import ComposerRunner
+        with patch('scisaurus.runtime.software_discovery.retain_sources',return_value=[]), \
+                patch('scisaurus.runtime.software_workbench.SoftwareWorkbench') as workbench:
+            result=ComposerRunner._assess_scientific_software(self.runner,self.stage,{},self.topic,computation_scope=self.scope)
+            workbench.return_value._environment.assert_called_once_with('environment')
+            return result
+
+    def test_carried_acceptance_preserves_receipt_and_revalidates_environment(self):
+        self.assertEqual(self.assess(),{**self.receipt,'artifact_ref':'receipt','dispatch_usage':{}})
+        self.assertEqual(self.receipt['identity']['computation_scope']['work_orders'][0]['experiment_repair_plan']['lineage']['continuation_cycle'],1)
+
+    def test_carried_acceptance_rejects_changed_binding(self):
+        original=deepcopy(self.rows)
+        cases=[('producer',('project_id',),'foreign'),('producer',('input_ref','stage_id'),'foreign'),
+            ('producer',('input_ref','kind'),'foreign'),('producer',('input_ref','digest'),'0'*64),
+            ('receipt',('status',),'blocked'),('producer',('report','response','software_selection'),{}),
+            ('reviewer',('report','response'),{}),('reviewer',('chief_result','software_assessment'),{})]
+        for name,keys,value in cases:
+            with self.subTest(name=name,keys=keys):
+                self.rows=deepcopy(original)
+                target=self.rows[name]
+                for key in keys[:-1]:target=target[key]
+                target[keys[-1]]=value
+                with self.assertRaises(ValidationError):self.assess()
+
+    def block(self, *, failure_kind='output_contract', status='failed'):
+        self.receipt['status']='blocked'
+        self.runner.context['experiment']['scientific_software_assessment']['status']='blocked'
+        self.rows['producer']['report']={'status':status,'failure':{'kind':failure_kind},
+            'partial_response':'{"decision":"hold"}','error':'Invalid environment reference',
+            'software_tool_results':[{'receipt_ref':'paid-tool-receipt'}]}
+
+    def test_carried_format_failure_retains_paid_response_and_receipts(self):
+        self.block()
+        with self.assertRaises(self.FreshAssessment):self.assess()
+        producer=self.assignments[-1]['assignments'][0]
+        self.assertEqual(producer['_software_receipt_refs'],['paid-tool-receipt'])
+        self.assertEqual(producer['_response_format_recovery']['previous_text'],'{"decision":"hold"}')
+        self.assertEqual(producer['_response_format_recovery']['execution_ref'],'producer')
+        self.assertEqual(self.receipt['status'],'blocked')
+
+    def test_scientific_or_unknown_failures_are_not_format_recovery(self):
+        for status,kind in [('failed','scientific_definition'),('result_unknown','output_contract')]:
+            with self.subTest(status=status,kind=kind):
+                self.block(status=status,failure_kind=kind)
+                with self.assertRaises(self.FreshAssessment):self.assess()
+                self.assertNotIn('_response_format_recovery',self.assignments[-1]['assignments'][0])
+
+    def test_changed_science_does_not_carry_acceptance_or_format_recovery(self):
+        for blocked in [False,True]:
+            with self.subTest(blocked=blocked):
+                if blocked:self.block()
+                self.scope['work_orders'][0]['experiment_repair_plan']['required_changes']=['Different scientific repair']
+                with self.assertRaises(self.FreshAssessment):self.assess()
+                self.assertNotIn('_response_format_recovery',self.assignments[-1]['assignments'][0])
 
 
 class Response(io.BytesIO):

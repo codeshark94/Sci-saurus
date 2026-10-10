@@ -1290,10 +1290,17 @@ def software_computation_identity(scope):
     ownership = {"id", "owner", "failure_dossier_ref", "failure_input_sha256", "attempt_lineage",
                  "target_stage_id", "target_stage_kind", "source_stage_id", "repair_priority",
                  "topic_cycle", "recovery_mode"}
-    projected["work_orders"] = [
-        {key: deepcopy(value) for key, value in row.items() if key not in ownership}
-        for row in orders if row.get("kind") != "recovery"
-    ]
+    projected["work_orders"] = []
+    for row in orders:
+        if row.get("kind") == "recovery":
+            continue
+        order = {key: deepcopy(value) for key, value in row.items() if key not in ownership}
+        plan = order.get("experiment_repair_plan")
+        if isinstance(plan, dict):
+            # The original order retains controller reconciliation provenance;
+            # scientific plan fields define the software computation identity.
+            plan.pop("lineage", None)
+        projected["work_orders"].append(order)
     return projected
 
 
