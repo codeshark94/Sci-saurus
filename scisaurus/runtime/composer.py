@@ -6750,6 +6750,23 @@ class ComposerRunner:
                 context.get("topic_cycle") or lineage.get("topic_cycle"),
                 None,
             ))
+        context_storage_anchor = None
+        context_project = context.get("project_dir") if isinstance(context, dict) else None
+        if isinstance(context_project, str) and isinstance(topic_identity, dict):
+            retained = self._survey_checkpoint(context_project, include_completed=True)
+            durable = self._durable_stage_config(context_project)
+            topic_stage = self._topic_stage_for_survey(stage)
+            question = (self.context.get(topic_stage["id"], {}).get("topic", {}).get("research_question")
+                        if topic_stage is not None else None)
+            if (isinstance(retained, dict) and retained.get("status") == "completed"
+                    and context.get("topic_id") == topic_identity["topic_id"]
+                    and context.get("topic_cycle") == topic_identity["topic_cycle"]
+                    and all(context.get(key) == retained.get(key)
+                            for key in ("survey_ref", "assessment_ref"))
+                    and isinstance(durable, dict) and isinstance(question, str)
+                    and durable.get("survey", {}).get("question") == question
+                    and self._survey_storage_frontier(context_project, retained) is not None):
+                context_storage_anchor = str(Path(context_project).resolve())
         record = self.stage_records.get(stage.get("id"), {})
         attempts = record.get("attempts", []) if isinstance(record, dict) else []
         preferred_partial = None
@@ -6774,7 +6791,11 @@ class ComposerRunner:
                 preferred_partial = attempt_candidates[0][0]
                 if isinstance(preferred_partial, str):
                     preferred_partial = str(Path(preferred_partial).resolve())
-                candidates = attempt_candidates + candidates
+                if context_storage_anchor is not None:
+                    preferred_partial = context_storage_anchor
+                    candidates.extend(attempt_candidates)
+                else:
+                    candidates = attempt_candidates + candidates
             else:
                 candidates.extend(attempt_candidates)
         candidates.append((stage.get("project_dir"), None, None, None))
@@ -6811,9 +6832,11 @@ class ComposerRunner:
                                      if topic_stage is not None else
                                      self._read_json_object(stage["config_path"]).get("survey", {}).get("question"))
                 question = durable.get("survey", {}).get("question") if isinstance(durable, dict) else None
-                if (not isinstance(expected_question, str) or question != expected_question
-                        or not self._survey_references_are_current(resolved, checkpoint)):
+                if not isinstance(expected_question, str) or question != expected_question:
                     checkpoint = None
+                    completed = False
+                elif not self._survey_references_are_current(resolved, checkpoint):
+                    checkpoint = self._survey_storage_frontier(resolved, checkpoint)
                     completed = False
             if checkpoint is None and revalidation:
                 output = Path(resolved) / "output/run.json"
@@ -6826,7 +6849,7 @@ class ComposerRunner:
                     checkpoint = {**retained, "nomination": durable.get("survey", {}).get("proposed_gap")}
             if checkpoint is None and aggregate_review_repair:
                 checkpoint = self._survey_review_repair_checkpoint(resolved)
-            partial = checkpoint is None
+            partial = checkpoint is None or isinstance(checkpoint.get("producer_checkpoint"), dict)
             if partial:
                 checkpoint = self._survey_partial_checkpoint(resolved)
             if checkpoint is None:
@@ -6895,6 +6918,68 @@ class ComposerRunner:
         return max(partials, key=lambda item: item[0])[1] if partials else None
 
     @classmethod
+    def _survey_storage_frontier(cls, project_dir, prior):
+        """Retain newer producer work when an older completed report is stale.
+
+        Storage continuation does not confer survey or assessment admission.
+        The immutable progress receipt supplies the frontier; the historical
+        accepted references supply integrity and ownership evidence only.
+        """
+        if (not isinstance(prior, dict) or prior.get("status") != "completed"
+                or prior.get("survey_current") is not True
+                or prior.get("assessment_current") is not True
+                or cls._survey_references_are_current(project_dir, prior)):
+            return None
+        root = Path(project_dir).resolve()
+        try:
+            snapshot = json.loads((root / "output/progress.json").read_text())
+        except (OSError, ValueError):
+            return None
+        if (not isinstance(snapshot, dict) or snapshot.get("phase") == "completed"
+                or snapshot.get("project_dir") != str(root)):
+            return None
+        proof = cls._producer_checkpoint_evidence(root, snapshot)
+        if proof is None:
+            raise StateError("stale survey workspace has no verified producer checkpoint")
+        from scisaurus.core.surveys import SurveyGate
+        try:
+            with closing(sqlite3.connect((root / "state/control.sqlite").as_uri()
+                                         + "?mode=ro", uri=True)) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA query_only=ON")
+                control = SimpleNamespace(dir=str(root), _conn=connection)
+                store = ArtifactStore(control)
+                gate = SurveyGate(control, store)
+                manifests = []
+                bodies = []
+                for key, logical_id in (("survey_ref", "kb/surveys/current"),
+                                        ("assessment_ref", "kb/gap-assessments/current")):
+                    manifest, raw = gate._artifact(prior[key], current=False)
+                    accepted = store.accepted(logical_id)
+                    if (manifest["artifact_id"] != logical_id
+                            or manifest["artifact_type"] != "note"
+                            or accepted is None or accepted["artifact_ref"] != prior[key]):
+                        raise StateError("stale survey frontier has foreign accepted references")
+                    manifests.append(manifest)
+                    bodies.append(json.loads(raw))
+                if (bodies[1].get("survey_ref") != prior["survey_ref"]
+                        or manifests[0]["author"] == manifests[1]["author"]):
+                    raise StateError("stale survey frontier has mismatched independent assessment")
+                if proof["created_at"] <= max(item["created_at"] for item in manifests):
+                    return None
+        except (sqlite3.Error, OSError, KeyError, ValueError, NotFoundError, ValidationError) as exc:
+            raise StateError(f"stale survey frontier integrity failed: {exc}") from exc
+        config = cls._durable_stage_config(root)
+        if not isinstance(config, dict):
+            raise StateError("stale survey frontier has no immutable runner input")
+        return {**{key: prior[key] for key in ("topic_id", "selected_topic_id", "topic_cycle",
+                                              "topic_lineage", "topic_admission") if key in prior},
+                "status": "paused" if snapshot["phase"] == "paused" else "running",
+                "producer_checkpoint": proof,
+                "nomination": config.get("survey", {}).get("proposed_gap"),
+                "question": config.get("survey", {}).get("question")}
+
+    @classmethod
     def _survey_partial_checkpoint(cls, project_dir):
         """Retain captured sources and checked work before aggregate acceptance."""
         root = Path(project_dir)
@@ -6902,6 +6987,9 @@ class ComposerRunner:
         try:
             if output.is_file():
                 payload = json.loads(output.read_text())
+                frontier = cls._survey_storage_frontier(root, payload)
+                if frontier is not None:
+                    return frontier
             else:
                 snapshot = json.loads((root / "output" / "progress.json").read_text())
                 if (not isinstance(snapshot, dict)
@@ -26379,6 +26467,7 @@ class ComposerRunner:
                     if project_has_checkpoint else None
                 )
                 producer_orders = self._survey_producer_work_orders(stage)
+                storage_frontier = self._survey_storage_frontier(project_dir, prior)
                 completed_resume = (
                     prior.get("status") == "completed"
                     and prior.get("survey_current") is True
@@ -26401,7 +26490,7 @@ class ComposerRunner:
                     and durable_config is not None
                     and (bool(revalidation_scopes) or not prior_run.is_file()
                          or prior.get("status") in {"blocked", "paused", "running"}
-                         or completed_resume)
+                         or completed_resume or storage_frontier is not None)
                 )
                 if revalidation_scopes and not resumable_checkpoint:
                     raise StateError("survey revalidation requires the retained immutable runner input")
@@ -26417,7 +26506,8 @@ class ComposerRunner:
                     if (isinstance(fallback, dict)
                             and fallback.get("mode") == "crossref_metadata"):
                         provider_fallback = "crossref_metadata"
-                    scopes = revalidation_scopes or (["integrated_review", "gap_assessment"]
+                    scopes = revalidation_scopes or (["operations"] if storage_frontier is not None else
+                        ["integrated_review", "gap_assessment"]
                         if completed_resume and not producer_orders else ["follow_up"]
                         if prior.get("survey_current") is True and prior.get("assessment_current") is True
                         and producer_orders else [self._survey_resume_scope(
