@@ -44,7 +44,7 @@ from scisaurus.runtime.scientific_surface import find_control_leaks, project_int
 
 
 SCHEMA_VERSION = "topic-discovery-1"
-TOPIC_RESPONSE_CONTRACT_REVISION = "topic-review-owned-routes-13"
+TOPIC_RESPONSE_CONTRACT_REVISION = "topic-execution-surface-boundary-14"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
 TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4
@@ -563,8 +563,10 @@ _MISSION_BOILERPLATE = {
 def _text(value, name, *, public=True):
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{name} must be a nonempty string")
-    if public and find_control_leaks(value):
-        raise ValidationError(f"{name} exposes control-plane vocabulary")
+    leaks = find_control_leaks(value) if public else []
+    if leaks:
+        terms = ", ".join(sorted({item["text"] for item in leaks}))
+        raise ValidationError(f"{name} exposes control-plane vocabulary: {terms}")
     return value
 
 
@@ -1600,6 +1602,24 @@ def _materialize_seed_bindings(package, frontier_seeds, recent_papers, *,
     return repairs
 
 
+_CANDIDATE_EXECUTION_TEXT_CONTRACT = {
+    "feasibility": "execution feasibility, including runtime availability, verification needs and operating limits",
+    "resource_plan": "operational inventory of data, programs, tools, compute and execution dependencies",
+}
+_CANDIDATE_LANGUAGE_CONTRACT = (
+    "Scientific prose is reader-facing: do not expose workflow state, artifacts, validators, "
+    "hashes, acceptance, model calls or internal control terms; use prespecified or independent "
+    "recalculation where scientifically appropriate. "
+    + ", ".join(_CANDIDATE_EXECUTION_TEXT_CONTRACT)
+    + " are operational inventories and may state exact execution dependencies, verification "
+    "records and resource limits."
+)
+
+def _candidate_text(value, field):
+    return _text(value, f"topic candidate {field}",
+                 public=field not in _CANDIDATE_EXECUTION_TEXT_CONTRACT)
+
+
 _TOPIC_REPAIRABLE_TEXT_FIELDS = (
     "title", "domain", "research_question", "scope", "why_promising",
     "disconfirmation_test", "feasibility", "resource_plan",
@@ -2547,7 +2567,7 @@ def validate_topic_package(value, *, objective=None, candidate_count=None,
         ids.add(candidate["id"])
         for key in ("title", "domain", "research_question", "scope", "why_promising",
                     "disconfirmation_test", "feasibility", "resource_plan"):
-            _text(candidate[key], f"topic candidate {key}")
+            _candidate_text(candidate[key], key)
         for key in CANDIDATE_DIMENSION_FIELDS.intersection(candidate):
             _text(candidate[key], f"topic candidate {key}")
         for key, values in (
@@ -3958,8 +3978,8 @@ SYSTEM = (
     "For a substantive refinement_context, preserve useful evidence but do not preserve the parent's central question automatically: "
     "materially change at least two dimensions and prefer a different research form or comparison type. "
     "Keep scope explicit, include a way the idea could be disproved, and select one candidate only after "
-    "comparing the alternatives. Use reader-facing scientific language; do not mention workflow state, "
-    "artifacts, validators, hashes, acceptance, or internal control terms. Return JSON only. "
+    "comparing the alternatives. "
+    + _CANDIDATE_LANGUAGE_CONTRACT + " Return JSON only. "
     "For capability_requirements, copy exact names from the supplied runtime inventory and leave a list empty "
     "when a requirement is unnecessary. This field is optional on portfolio alternatives; for a selected "
     "candidate in a foundry-backed mission, the runtime supplies only the deterministic Python/experiment "
@@ -4413,9 +4433,9 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "why_promising": "why this is worth investigating without claiming novelty",
         "disconfirmation_test": "what result or prior work would make this direction unhelpful",
         "disconfirmation_test_note": "optional detail about how the disconfirmation test separates explanations",
-        "feasibility": "why the declared runtime can execute the study within the mission budget",
+        "feasibility": _CANDIDATE_EXECUTION_TEXT_CONTRACT["feasibility"],
         "feasibility_plan": feasibility_plan_contract(runtime_context),
-        "resource_plan": "data, programs, tools, and compute the study would use",
+        "resource_plan": _CANDIDATE_EXECUTION_TEXT_CONTRACT["resource_plan"],
     }
     candidate_constraints = [
         "use recent_papers as inspiration and retain their provided source identifiers in the candidate rationale when relevant",
@@ -4438,7 +4458,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "emit every required field described by the candidate contract; research_question is mandatory",
         "use only literal candidate keys listed in output_contract.candidates.items; do not invent aliases such as mechanism_boundary or disconfirmation_test_note_optional; express a boundary in data_regime or theory_target",
         "return only the JSON object with no preface, commentary, markdown, or trailing explanation",
-        "candidate prose is reader-facing: do not use the words frozen, validator, accepted artifact, model calls, release candidate, or SHA-256; say prespecified or independent recalculation where scientifically appropriate",
+        _CANDIDATE_LANGUAGE_CONTRACT,
     ]
     constraints = list(candidate_constraints)
     if intake_mode == "concept":
@@ -5113,9 +5133,9 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "why_promising": "why the question is worth investigating without claiming novelty",
         "disconfirmation_test": "result or prior evidence that would disconfirm the direction",
         "disconfirmation_test_note": "optional operational detail for the disconfirmation test",
-        "feasibility": "why the declared runtime can execute this bounded study",
+        "feasibility": _CANDIDATE_EXECUTION_TEXT_CONTRACT["feasibility"],
         "feasibility_plan": feasibility_plan_contract(runtime_context),
-        "resource_plan": "data, programs, tools, and compute used",
+        "resource_plan": _CANDIDATE_EXECUTION_TEXT_CONTRACT["resource_plan"],
         "frontier_seed_id": "copy target_frontier_seed_id exactly",
         "prior_work_ids": "one to three work_id values from target_seed_records only",
     }
@@ -5709,7 +5729,7 @@ class TopicDiscoveryRunner:
                             })
                         fields[field] = value
                     else:
-                        _text(value, f"topic candidate {field}")
+                        _candidate_text(value, field)
                 by_id[identifier] = fields
             if set(by_id) != set(target_ids):
                 raise ValidationError(

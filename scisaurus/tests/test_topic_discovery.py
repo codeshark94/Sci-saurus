@@ -709,6 +709,60 @@ class RefinementValidationRepairModel(FakeModel):
 
 
 class TopicDiscoveryTests(unittest.TestCase):
+    def test_execution_inventory_is_not_manuscript_prose(self):
+        value = package("objective")
+        for candidate in value["candidates"]:
+            candidate["feasibility"] = (
+                "No model calls are required by the deterministic solver; an independent validator "
+                "will check the frozen input and SHA256 source binding.")
+            candidate["resource_plan"] = (
+                "Reserve compute for the solver and validator; preserve artifact:inputs/run@1.")
+        original = deepcopy(value)
+        validate_topic_package(value)
+        self.assertEqual(value, original)
+
+    def test_scientific_prose_still_rejects_operational_terms_precisely(self):
+        for field in ("title", "domain", "research_question", "scope", "why_promising",
+                      "disconfirmation_test", "measurement"):
+            value = package("objective")
+            value["candidates"][0][field] = "Independent validator checks model calls."
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    ValidationError, "control-plane vocabulary: .*model calls"):
+                validate_topic_package(value)
+
+    def test_execution_inventory_still_requires_nonempty_text(self):
+        for field in ("feasibility", "resource_plan"):
+            for invalid in ("", "  ", None, 3):
+                value = package("objective")
+                value["candidates"][0][field] = invalid
+                with self.subTest(field=field, invalid=invalid), self.assertRaisesRegex(
+                        ValidationError, "must be a nonempty string"):
+                    validate_topic_package(value)
+
+    def test_missing_field_repair_uses_the_same_execution_boundary(self):
+        for field in ("feasibility", "resource_plan", "research_question"):
+            value = package("objective")
+            value["candidates"][0].pop(field)
+            original = deepcopy(value)
+            runner = TopicDiscoveryRunner({"model": "fake", "protocol": "ollama"})
+            text = "No model calls; retain validator input artifact:inputs/run@1 and SHA256."
+            with patch.object(runner, "_client") as client:
+                client.return_value.complete.return_value = ModelResult(
+                    text=json.dumps({"candidate_patches": [{
+                        "id": value["candidates"][0]["id"], "fields": {field: text}}]}),
+                    model="fake", usage={"model_calls": 1}, elapsed_seconds=.01,
+                    finish_reason="stop")
+                if field == "research_question":
+                    with self.assertRaisesRegex(ValidationError, "control-plane vocabulary"):
+                        runner._repair_missing_topic_fields(
+                            value, deadline=None, budget=TopicBudget(None, {}))
+                    self.assertEqual(value, original)
+                else:
+                    runner._repair_missing_topic_fields(
+                        value, deadline=None, budget=TopicBudget(None, {}))
+                    original["candidates"][0][field] = text
+                    self.assertEqual(value, original)
+
     def test_topic_clients_preserve_route_generation_capacity(self):
         runner = TopicDiscoveryRunner({
             "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",

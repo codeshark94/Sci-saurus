@@ -65,6 +65,12 @@ before the implementation literature stage or force a different evidence mode
 merely to satisfy portfolio diversity. Reviewers receive every candidate's design
 brief and execution plan together with the attested laboratory's limitations.
 
+Candidate feasibility and resource plans are operational inventories. They retain
+exact solver dependencies, verification records and resource limits without
+manuscript language screening. Scientific claims and publication projections
+retain their separate reader-facing language checks; execution availability and
+input validity still require the structured feasibility contract.
+
 Concept intake checks the scientific definition and declared runtime feasibility.
 The agent supplies a structured `design_brief`: use case, differentiation hypothesis,
 declared design and physics families, editable parameter ranges, target response,
