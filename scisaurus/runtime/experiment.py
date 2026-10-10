@@ -1853,6 +1853,10 @@ class ExperimentRunner(ExecutionRuntime):
                 failure = {"kind": "process_interrupted"}
             elif isinstance(exc, ModelCallError):
                 failure = exc.failure_details()
+            else:
+                from scisaurus.runtime.dsh_batch import DshBatchError
+                if isinstance(exc, DshBatchError):
+                    failure = exc.failure_details()
         finally:
             for row in self.control._conn.execute("SELECT task_id FROM tasks WHERE state='awaiting_review'").fetchall():
                 self.tasks.transition(row[0], "blocked", "command.controller",

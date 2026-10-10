@@ -1468,7 +1468,7 @@ class ModelCallError(RuntimeError):
     """
     def __init__(self, message, *, outcome_known=False, attempts=0,
                  elapsed_seconds=None, status_code=None,
-                 retry_after_seconds=None, provider_error_kind=None):
+                 retry_after_seconds=None, provider_error_kind=None, provider_response=None):
         super().__init__(message)
         self.outcome_known = outcome_known
         self.attempts = attempts if type(attempts) is int and attempts >= 0 else 0
@@ -1491,6 +1491,7 @@ class ModelCallError(RuntimeError):
                 "quota_exhausted", "rate_limited", "model_unavailable",
             } else None
         )
+        self.provider_response = deepcopy(provider_response) if isinstance(provider_response, dict) else None
 
     def failure_details(self):
         """Serialize admission and provider facts across runner boundaries."""
@@ -1500,6 +1501,8 @@ class ModelCallError(RuntimeError):
                    "retry_after_seconds": self.retry_after_seconds,
                    "provider_error_kind": self.provider_error_kind,
                    "usage": dict(getattr(self, "usage", {}))}
+        if self.provider_response is not None:
+            failure["provider_response"] = deepcopy(self.provider_response)
         if getattr(self, "budget_admission", None) is not None:
             failure["budget_admission"] = dict(self.budget_admission)
         return failure
@@ -1523,6 +1526,7 @@ class ModelCallError(RuntimeError):
             status_code=failure.get("status_code"),
             retry_after_seconds=failure.get("retry_after_seconds"),
             provider_error_kind=failure.get("provider_error_kind"),
+            provider_response=failure.get("provider_response"),
             **({"budget_admission": admission} if admission is not None else {}))
         error.usage = dict(failure.get("usage", {}))
         return error
@@ -1604,10 +1608,15 @@ class ModelContextBudgetError(ValidationError):
 
 class _ProviderHTTPError(RuntimeError):
     """A provider response with an HTTP status other than 200."""
-    def __init__(self, code, retry_after=None, provider_error_kind=None):
+    def __init__(self, code, retry_after=None, provider_error_kind=None, body=b""):
         super().__init__(f"model HTTP request failed with status {code}")
         self.code = code
         self.provider_error_kind = provider_error_kind
+        self.provider_response = {
+            "body_prefix_base64": base64.b64encode(body).decode("ascii"),
+            "body_prefix_sha256": hashlib.sha256(body).hexdigest(),
+            "captured_bytes": len(body),
+        }
         try:
             delay = float(retry_after)
         except (TypeError, ValueError):
@@ -1640,6 +1649,8 @@ def _provider_http_error_kind(body):
             "insufficient_quota", "insufficient quota", "quota exceeded",
             "quota_exceeded", "weekly limit", "daily limit", "credits exhausted",
             "credit balance", "billing limit", "out of cloud credits")):
+        return "quota_exhausted"
+    if re.search(r"\b(?:daily|weekly|monthly)\s+(?:[\w-]+\s+){0,3}limit\b", text):
         return "quota_exhausted"
     if any(marker in text for marker in (
             "rate limit", "rate_limit", "too many requests", "throttl",
@@ -2021,7 +2032,7 @@ class ModelClient:
                 raise error from exc
 
         def failure(message, *, outcome_known=False, status_code=None,
-                    retry_after_seconds=None, provider_error_kind=None, budget_admission=None):
+                    retry_after_seconds=None, provider_error_kind=None, provider_response=None, budget_admission=None):
             settle(reported_usage or None)
             error_type = ModelBudgetExceededError if budget_admission is not None else ModelCallError
             error = error_type(
@@ -2030,6 +2041,7 @@ class ModelClient:
                 status_code=status_code,
                 retry_after_seconds=retry_after_seconds,
                 provider_error_kind=provider_error_kind,
+                provider_response=provider_response,
                 **({"budget_admission": budget_admission} if budget_admission is not None else {}),
             )
             error.usage = {"model_calls": attempts_made, **reported_usage} if attempts_made else {}
@@ -2057,6 +2069,7 @@ class ModelClient:
                 raise failure(str(exc), outcome_known=exc.outcome_known,
                     status_code=exc.status_code, retry_after_seconds=exc.retry_after_seconds,
                     provider_error_kind=exc.provider_error_kind,
+                    provider_response=exc.provider_response,
                     budget_admission=getattr(exc, "budget_admission", None)) from exc
             connection = connection_type(parsed_base.hostname, parsed_base.port,
                                          timeout=max(0.1, remaining))
@@ -2112,6 +2125,7 @@ class ModelClient:
                     raise _ProviderHTTPError(
                         code, response.getheader("Retry-After"),
                         provider_error_kind=_provider_http_error_kind(error_body),
+                        body=error_body,
                     )
                 # ``HTTPResponse.read(n)`` can legally wait for the full
                 # requested amount (or for EOF) when a provider sends a
@@ -2157,7 +2171,8 @@ class ModelClient:
             except _ProviderHTTPError as exc:
                 code = exc.code
                 retry_after = exc.retry_after
-                if code in retryable_statuses and attempt < self.max_retries:
+                if (exc.provider_error_kind != "quota_exhausted"
+                        and code in retryable_statuses and attempt < self.max_retries):
                     settle(None)
                     delay = self.retry_backoff_seconds * (2 ** attempt)
                     try:
@@ -2170,7 +2185,8 @@ class ModelClient:
                                       outcome_known=400 <= code < 500,
                                       status_code=code,
                                       retry_after_seconds=retry_after,
-                                      provider_error_kind=exc.provider_error_kind) from None
+                                      provider_error_kind=exc.provider_error_kind,
+                                      provider_response=exc.provider_response) from None
                     time.sleep(delay)
                     attempt += 1
                     continue
@@ -2178,13 +2194,15 @@ class ModelClient:
                               outcome_known=400 <= code < 500,
                               status_code=code,
                               retry_after_seconds=retry_after,
-                              provider_error_kind=exc.provider_error_kind) from None
+                              provider_error_kind=exc.provider_error_kind,
+                              provider_response=exc.provider_response) from None
             except ModelCallError as exc:
                 raise failure(
                     str(exc), outcome_known=exc.outcome_known,
                     status_code=exc.status_code,
                     retry_after_seconds=exc.retry_after_seconds,
                     provider_error_kind=exc.provider_error_kind,
+                    provider_response=exc.provider_response,
                     budget_admission=getattr(exc, "budget_admission", None),
                 ) from None
             except (http.client.HTTPException, TimeoutError, OSError, ValueError, AttributeError) as exc:

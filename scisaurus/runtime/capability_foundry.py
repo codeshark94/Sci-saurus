@@ -3389,6 +3389,8 @@ class CapabilityFoundry:
         def record_batch_failure(request, error, *, retained=None):
             request.update(status="result_unknown", error=str(error), usage=deepcopy_config(error.usage),
                            batch_receipt=error.receipt)
+            if error.provider_failure is not None:
+                request["provider_failure"] = deepcopy_config(error.provider_failure)
             for dimension, amount in error.usage.items():
                 state["usage"][dimension] = state["usage"].get(dimension, 0) + amount - (
                     1 if dimension == "model_calls" else 0)
@@ -4728,7 +4730,8 @@ class CapabilityFoundry:
             save("delegated_batch_unknown_retained")
             owner = client if last_request.get("role", author_role) == author_role else self.validator_client
             raise DshBatchError(error, receipt=last_request.get("batch_receipt") or owner.runner.root,
-                                usage=state.get("usage", {}))
+                                usage=state.get("usage", {}),
+                                provider_failure=last_request.get("provider_failure"))
         if state["status"] == "blocked" and isinstance(
                 state.get("repair_budget_exhausted"), dict):
             ledger = state.get("repair_ledger", [])

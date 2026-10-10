@@ -2989,6 +2989,25 @@ class ComposerRunner:
         )
 
     @staticmethod
+    def _provider_quota_stop(error):
+        """Keep account exhaustion outside transient cooldown and science repair."""
+        if isinstance(error, ModelCallError) and error.provider_error_kind == "quota_exhausted":
+            details = error.failure_details()
+        else:
+            from scisaurus.runtime.dsh_batch import DshBatchError
+            if not isinstance(error, DshBatchError):
+                return error
+            failure = error.failure_details()
+            if failure.get("kind") != "provider_rate_limit":
+                return error
+            details = failure["details"]
+        stopped = ProviderRateLimitError(
+            "model provider account quota exhausted; credits or a confirmed reset are required",
+            provider="model", details=details)
+        ComposerRunner._copy_error_accounting(error, stopped)
+        return stopped
+
+    @staticmethod
     def _normalize_topic_intake_failure(error, stage):
         """Preserve topic-repair classification across every runner boundary.
 
@@ -15008,6 +15027,9 @@ class ComposerRunner:
             failure = next((row for row in [produced, verifier] if isinstance(row, dict) and isinstance(row.get("failure"), dict)), None)
             if failure and failure.get("failure", {}).get("kind") == "model_call":
                 error = ModelCallError.from_failure(failure.get("error") or "software assessment unavailable", {**failure["failure"], "usage": {}})
+            elif failure and failure.get("failure", {}).get("kind") == "provider_rate_limit":
+                error = ProviderRateLimitError(failure.get("error") or "software provider quota exhausted",
+                    provider=failure["failure"].get("provider"), details=failure["failure"].get("details"))
             elif failure and failure.get("failure", {}).get("kind") == "output_contract":
                 error = ModelWorkBlocked(failure.get("error") or "scientific software assessment response violates its contract",
                                          failure_class="model_contract")
@@ -15432,7 +15454,7 @@ class ComposerRunner:
             return next((report for report in reports if isinstance(report, dict)
                          and report.get("status") != "succeeded"
                          and isinstance(report.get("failure"), dict)
-                         and report["failure"].get("kind") in {"model_call", "output_contract"}), None)
+                         and report["failure"].get("kind") in {"model_call", "output_contract", "provider_rate_limit"}), None)
         reviewer_failure = model_failure_report(reviewer_bundle.get("reports", []))
         if reviewer_failure is not None:
             plan_validation_error = str(reviewer_failure.get("error") or "required Methods role is unavailable")
@@ -16295,7 +16317,10 @@ class ComposerRunner:
                 self._checkpoint(f"{stage['id']}:capability_repair_usage_charged", force=True)
             model_failure = repair_context.get("model_failure")
             if isinstance(model_failure, dict):
-                if model_failure.get("failure", {}).get("kind") == "output_contract":
+                if model_failure.get("failure", {}).get("kind") == "provider_rate_limit":
+                    fenced = ProviderRateLimitError(model_failure.get("error") or "Methods provider quota exhausted",
+                        provider=model_failure["failure"].get("provider"), details=model_failure["failure"].get("details"))
+                elif model_failure.get("failure", {}).get("kind") == "output_contract":
                     fenced = ModelWorkBlocked(model_failure.get("error") or "Methods repair response contract failed")
                     fenced.failure_class = "model_contract"
                     fenced.recovery_mode = "format_repair_then_rerun"
@@ -24127,6 +24152,9 @@ class ComposerRunner:
             # A provider reset is a time boundary, not a failed scientific
             # revision. Scoped research holds likewise return work orders.
             from scisaurus.runtime.capability_foundry import CapabilityDeadlineError, CapabilityModelBudgetExceeded
+            normalized_provider_error = self._provider_quota_stop(exc)
+            if normalized_provider_error is not exc:
+                raise normalized_provider_error from exc
             if self._is_operational_stage_failure(exc):
                 raise
             if isinstance(exc, (ModelCallError, QuotaExceededError, *PROVIDER_OPERATOR_STOP_ERRORS, ProviderCooldownError,
@@ -31865,6 +31893,17 @@ class ComposerRunner:
                             specialist_bundle = self._publish_specialist_reports(
                                 attempt_stage, stage_assignment, specialist_bundle)
                             specialist_reports = specialist_bundle.get("reports", [])
+                            account_limits = [report["failure"] for report in specialist_reports
+                                if report.get("status") != "succeeded"
+                                and isinstance(report.get("failure"), dict)
+                                and (report["failure"].get("provider_error_kind") == "quota_exhausted"
+                                     or report["failure"].get("kind") == "provider_rate_limit")]
+                            if account_limits:
+                                raise ProviderRateLimitError(
+                                    "specialist provider account quota exhausted",
+                                    provider="model", details={"provider_error_kind": "quota_exhausted",
+                                        "status_code": 429, "retry_after_known": False,
+                                        "failures": deepcopy(account_limits)})
                             limited = [report for report in specialist_reports
                                        if report.get("status") != "succeeded" and report.get("status_code") == 429]
                             if limited:
@@ -32121,6 +32160,7 @@ class ComposerRunner:
                             stage_succeeded = True
                             break
                         except Exception as exc:
+                            exc = self._provider_quota_stop(exc)
                             if isinstance(exc, ModelCallError) and exc.status_code == 429:
                                 provider_error = exc
                                 retry_after_known = (
@@ -32584,6 +32624,10 @@ class ComposerRunner:
                                     "provider": exc.provider,
                                     **({"details": deepcopy(exc.details)} if provider_rate_limited
                                        else {"credential_env": exc.credential_env}),
+                                    **({"rate_limit": {"provider": exc.provider, "status_code": 429,
+                                        "provider_error_kind": "quota_exhausted", "retry_after_known": False}}
+                                       if provider_rate_limited and exc.details.get("provider_error_kind") == "quota_exhausted"
+                                       else {}),
                                     "model_calls_dispatched": failure_usage.get("model_calls", 0),
                                 })
                                 self.status = "paused"

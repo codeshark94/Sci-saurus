@@ -3265,7 +3265,7 @@ class SpecialistDispatcher:
                           "execution_mode": backend_mode, "assigned_role": assigned_role,
                           "role_id": assignment.get("role_id"), "model_role": model_role,
                           "model": self.software_author_backend["model"], "error": str(exc),
-                          "failure": {"kind": "operational_recovery", "outcome_known": known},
+                          "failure": {**exc.failure_details(), "outcome_known": known},
                           "dsh_receipt": exc.receipt, "dsh_backend_terminal": True,
                           "dsh_receipt_sha256": hashlib.sha256(receipt_body).hexdigest() if receipt_body is not None else None,
                           "usage": deepcopy(accumulated_usage),

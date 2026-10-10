@@ -19,7 +19,7 @@ from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.runtime.model_work import ModelWorkBlocked
 from scisaurus.runtime.model_dispatch import model_dispatch_slot
-from scisaurus.runtime.models import ModelResult
+from scisaurus.runtime.models import ModelResult, _provider_http_error_kind
 from scisaurus.runtime.program_sandbox import SANDBOX_EXEC, sandbox_profile
 from scisaurus.runtime.run_control import ensure_run_allowed, start_process
 from scisaurus.runtime.run_control import RunPausedError
@@ -28,10 +28,33 @@ from scisaurus.runtime.run_control import RunPausedError
 class DshBatchError(ModelWorkBlocked):
     """A batch outcome is retained without starting another authoring loop."""
 
-    def __init__(self, message, *, receipt, usage):
+    def __init__(self, message, *, receipt, usage, provider_failure=None):
         super().__init__(message, failure_class="operational_recovery")
         self.receipt = str(receipt)
         self.usage = dict(usage)
+        self.provider_failure = deepcopy(provider_failure) if isinstance(provider_failure, dict) else None
+
+    def failure_details(self):
+        if self.provider_failure and self.provider_failure.get("provider_error_kind") == "quota_exhausted":
+            return {"kind": "provider_rate_limit", "provider": "model",
+                    "details": {**deepcopy(self.provider_failure), "backend_receipt": self.receipt}}
+        return {"kind": "operational_recovery", "outcome_known": False,
+                **({"provider_failure": deepcopy(self.provider_failure)} if self.provider_failure else {})}
+
+
+def dsh_provider_failure(reason):
+    """Interpret a typed provider failure from an owned terminal DSH turn."""
+    if not isinstance(reason, dict) or reason.get("kind") != "error":
+        return None
+    error = reason.get("error")
+    if not isinstance(error, dict) or error.get("code") != "RATE_LIMIT":
+        return None
+    message = error.get("message")
+    if not isinstance(message, str) or not message:
+        return None
+    return {"provider_error_kind": _provider_http_error_kind(message.encode()),
+            "status_code": 429, "retry_after_known": False,
+            "terminal_reason": deepcopy(reason)}
 
 
 def sha256(path):
@@ -366,7 +389,11 @@ class DshBatchRunner:
                 received |= any(item.get("id") == message_id for item in inserted if isinstance(item, dict))
             if (received and event.get("type") == "turn/end"
                     and event.get("data", {}).get("turn") not in completed_turns):
-                finish = event.get("data", {}).get("reason", {}).get("kind")
+                reason = event.get("data", {}).get("reason", {})
+                finish = reason.get("kind")
+                failure = dsh_provider_failure(reason)
+                if failure is not None:
+                    state["provider_failure"] = failure
             return (received and finish is not None and payload.get("method") == "session.status"
                     and params.get("status") == "idle")
         def read_outputs():
@@ -493,6 +520,7 @@ class DshBatchRunner:
                         pending_events.clear()
                         prompt_id += 1
                         state.update(status="running", outputs={}, outcome_known=False)
+                        state.pop("provider_failure", None)
                         save()
                         send(prompt_id, "session/prompt", {"sessionId": state["session_id"],
                             "contentBlocks": [{"type": "text", "text":
@@ -521,7 +549,8 @@ class DshBatchRunner:
         except BaseException as exc:
             state.update(status="failed" if exchange is not None and state.get("outcome_known") is True
                          else "result_unknown", error=f"{type(exc).__name__}: {exc}", finish_reason=finish)
-            raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"]) from exc
+            raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"],
+                                provider_failure=state.get("provider_failure")) from exc
         finally:
             # Persist the paid outcome before disposal; disposal failure must
             # retain the same receipt and usage instead of replacing them.
