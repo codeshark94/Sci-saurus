@@ -148,6 +148,62 @@ class ComposerWorkflowTests(unittest.TestCase):
                 runner.workflow["progression_policy"] = "evidence_first"
                 self.assertFalse(runner._implementation_reference_stage(stage))
 
+    def test_reference_requirements_reach_capability_author_without_literature_closure(self):
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            topic_stage = {**workflow["stages"][0], "id": "topic", "kind": "topic_discovery"}
+            workflow["stages"].insert(0, topic_stage)
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            with closing(ComposerRunner(workflow)) as runner:
+                result = {"topic": {"id": "concept"}}
+                runner.context["topic"] = result
+                with patch.object(runner, "_survey_context_for_topic", return_value={}), \
+                     patch.object(runner, "_validated_implementation_reference_handoff", return_value={"open_work_orders": ["unfulfilled"]}), \
+                     patch.object(runner, "_topic_review_obligation", side_effect=AssertionError("retired literature closure")), \
+                     patch.object(runner, "_retained_capability_evidence_actions", return_value=[]):
+                    self.assertIsNone(runner._require_capability_evidence_before_authoring(workflow["stages"][-1], result, {}))
+
+    def test_reference_pilot_repairs_go_to_author_before_observations(self):
+        with tempfile.TemporaryDirectory() as path:
+            with closing(ComposerRunner(self._workflow(Path(path)))) as runner:
+                stage = runner.workflow["stages"][-1]
+                runner.workflow["capability_foundry_config_path"] = "foundry-config.json"
+                runner.continuation_cycles = 1
+                topic = {"topic": {"id": "concept"}}
+                runner.context[stage["id"]] = {"status": "candidate_needs_review",
+                    "review_status": "scientific_assignment_blocked", "error": "capability foundry admission",
+                    "failure_recovery": {"requires_capability_repair": True}}
+                pilot = {"implementation_reference_handoff": {"ref": "artifact:handoff@1"}}
+                with patch.object(runner, "_topic_context_for_stage", return_value=("topic", topic)), \
+                     patch.object(runner, "_experiment_pilot_survey", return_value=pilot), \
+                     patch.object(runner, "_requests_for_stage", return_value=[{"kind": "additional_experiment"}]), \
+                     patch.object(runner, "_format_recovery_requires_methods_panel", return_value=False), \
+                     patch.object(runner, "_is_pre_execution_capability_failure", return_value=True), \
+                     patch.object(runner, "_reference_implementation_authoring", side_effect=lambda stage, has_observed_experiment: not has_observed_experiment), \
+                     patch.object(runner, "_has_executed_experiment_result", return_value=False) as observed, \
+                     patch.object(runner, "_run_capability_repair_panel", side_effect=RuntimeError("observed result review")) as panel, \
+                     patch.object(runner, "_materialize_topic_capability", side_effect=RuntimeError("source author reached")) as author:
+                    with self.assertRaisesRegex(RuntimeError, "source author reached"):
+                        runner._apply_topic_to_experiment_config(stage, {"experiment": {"revision": 1}})
+                    panel.assert_not_called()
+                    self.assertIsNone(author.call_args.kwargs["repair_context"])
+                    observed.return_value = True
+                    with self.assertRaisesRegex(RuntimeError, "observed result review"):
+                        runner._apply_topic_to_experiment_config(stage, {"experiment": {"revision": 1}})
+                    panel.assert_called_once()
+
+    def test_reference_author_capacity_excludes_retired_panel_reservation(self):
+        with tempfile.TemporaryDirectory() as path:
+            with closing(ComposerRunner(self._workflow(Path(path)))) as runner:
+                stage = runner.workflow["stages"][-1]
+                runner.workflow["capability_foundry_config_path"] = "foundry-config.json"
+                with patch.object(runner, "_reference_implementation_authoring", return_value=True), \
+                     patch.object(runner, "_capability_repair_panel_model_call_reserve", side_effect=AssertionError("retired reservation")), \
+                     patch("scisaurus.runtime.composer.enforce_model_cost_limits", return_value=True):
+                    self.assertFalse(runner._capability_repair_panel_required(stage))
+                    self.assertEqual(runner._experiment_model_call_capacity(stage),
+                                     runner._experiment_model_call_capacity(stage, repair_panel_usage={}))
+
     def test_review_recovery_distinguishes_scheduled_retry_from_dispatched_producer(self):
         with tempfile.TemporaryDirectory() as path:
             control = ControlStore(path); self.addCleanup(control.close)

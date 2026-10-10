@@ -2659,6 +2659,8 @@ class ComposerRunner:
         """Return whether a fresh capability needs an upper-model design panel."""
         if not isinstance(stage, dict) or stage.get("kind") != "experiment":
             return False
+        if self._reference_implementation_authoring(stage):
+            return False
         context = self.context.get(stage.get("id"), {})
         context = context if isinstance(context, dict) else {}
         recovery = context.get("failure_recovery")
@@ -2688,6 +2690,25 @@ class ComposerRunner:
             or isinstance(context.get("failure_debt"), dict)
             or context.get("backfill_required") is True
         )
+
+    def _reference_implementation_authoring(self, stage, *, has_observed_experiment=None):
+        """Route unobserved concept implementation to its executable author."""
+        if not isinstance(stage, dict) or stage.get("kind") != "experiment":
+            return False
+        if has_observed_experiment is None:
+            has_observed_experiment = self._has_executed_experiment_result(
+                self.context.get(stage["id"], {}), self._stage_experiment_capability_id(stage))
+        if has_observed_experiment:
+            return False
+        ancestors = self._stage_ancestor_ids(stage)
+        for survey_stage in self.workflow["stages"]:
+            if survey_stage["kind"] != "survey" or survey_stage["id"] not in ancestors:
+                continue
+            context = self.context.get(survey_stage["id"], {})
+            if (isinstance(context.get("implementation_reference_handoff"), dict)
+                    and self._validated_implementation_reference_handoff(survey_stage, context) is not None):
+                return True
+        return False
 
     def _foundry_progress(self, stage_id, phase, state):
         self._sync_foundry_usage()
@@ -10503,6 +10524,10 @@ class ComposerRunner:
         project = Path(result.get("project_dir") or stage["project_dir"]).resolve()
         owner_paths = {Path(path).resolve() for path in (stage.get("project_dir"),
             self.stage_records.get(stage["id"], {}).get("project_dir")) if isinstance(path, str)}
+        owner_paths.update(Path(attempt["project_dir"]).resolve()
+            for attempt in self.stage_records.get(stage["id"], {}).get("attempts", [])
+            if isinstance(attempt, dict) and attempt.get("state") in {"succeeded", "completed"}
+            and attempt.get("topic_id") == topic.get("id") and isinstance(attempt.get("project_dir"), str))
         if (result.get("status") not in {"completed", "accepted"}
                 or result.get("survey_current") is not True
                 or result.get("assessment_current") is not True
@@ -14541,9 +14566,11 @@ class ComposerRunner:
             ancestor = self._topic_stage_for_survey(survey_stage)
             if ancestor is None or self.context.get(ancestor["id"], {}).get("topic") != topic_result.get("topic"):
                 continue
+            survey = self._survey_context_for_topic(ancestor)
+            if self._validated_implementation_reference_handoff(survey_stage, survey) is not None:
+                continue
             obligation = self._topic_review_obligation(survey_stage)
             if obligation is not None:
-                survey = self._survey_context_for_topic(ancestor)
                 project = survey.get("project_dir") or survey_stage["project_dir"]
                 if not self._topic_review_obligation_is_closed({**survey_stage, "project_dir": project}, survey, obligation, require_independent=True):
                     raise ModelWorkBlocked("carried topic review obligations require independent evidence closure before source authoring")
@@ -16160,6 +16187,8 @@ class ComposerRunner:
         repair_context = None
         repair_panel_required = (fresh_pre_execution_repair or observed_experiment_repair
                                  or methods_response_repair)
+        if self._reference_implementation_authoring(stage, has_observed_experiment=has_observed_experiment):
+            repair_panel_required = False
         if needs_fresh_capability and repair_panel_required:
             available = self._foundry_model_call_budget(stage, repair_panel_usage={})
             if available is not None and available < 1:
@@ -16265,8 +16294,8 @@ class ComposerRunner:
                 if self._capability_repair_panel_completed(repair_context):
                     exc.capability_repair_panel_completed = True
                 self._merge_incremental_error_usage(
-                    exc, repair_context.get("dispatch_usage"))
-                exc.repair_panel_usage = deepcopy(repair_context.get("dispatch_usage", {}))
+                    exc, (repair_context or {}).get("dispatch_usage"))
+                exc.repair_panel_usage = deepcopy((repair_context or {}).get("dispatch_usage", {}))
                 raise
             generated = topic_context.get("generated_capability")
         elif self.workflow.get("capability_foundry_config_path"):
