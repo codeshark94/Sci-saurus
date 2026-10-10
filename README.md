@@ -144,6 +144,7 @@ using live providers.
 | [Completion runtime](docs/80-completion-runtime.md) · [Critical review articles](docs/115-review-articles.md) | Manuscript assembly, evaluation, rendered review, and delivery boundaries |
 | [Local dashboard](docs/120-local-dashboard.md) · [Desktop app](docs/130-desktop-app.md) · [Roadmap](docs/30-roadmap.md) | Workspace operation, desktop controls, and remaining work |
 | [Metamaterial laboratory](docs/140-metamaterial-laboratory.md) | Concept development, CAD/multiphysics scope, provisioned runtimes, artifact handoff, and operational probes |
+| [Solver selection](docs/145-metamaterial-solvers.md) | Physical question, minimum solver stack, conditional extensions and model limitations |
 
 ## Current status
 

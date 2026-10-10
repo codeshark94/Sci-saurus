@@ -913,6 +913,12 @@ class LiteratureTree:
             frontier = [node for node in tree["nodes"] if node["kind"] in {"root", "read"}
                         and node["state"] == "pending"
                         and node.get("follow_up_ref") == self.follow_up_ref]
+            if self.score.get("design_brief") is not None:
+                for node in frontier:
+                    if node["depth"] > self.bounds["expansion_rounds"]:
+                        node.update(state="deferred", reason="declared implementation evidence expansion depth reached")
+                frontier = [node for node in frontier if node["state"] == "pending"]
+                self._tree_save()
             queued = any(node["kind"] == "acquisition" and node["state"] == "pending" for node in tree["nodes"])
             if not frontier and any(node["kind"] == "acquisition" and node["state"] == "pending" for node in tree["nodes"]):
                 if self._tree_catalog_capacity() > 0 and self.api_calls < self.bounds["max_api_calls"]:
@@ -936,7 +942,7 @@ class LiteratureTree:
             suggestions = []
             if parents[0]["kind"] == "root":
                 planning_calls = sum(self.store.head("kb/search-plans/" + self._initial_plan_id(role)) is None
-                                     for role in SEARCH_PLANNERS)
+                                     for role in self._initial_search_roles())
                 if remaining is not None and remaining < len(self._required_model_work()) + planning_calls + 4:
                     self._tree_stop("model capacity reserved for initial planning and checked reading")
                     return

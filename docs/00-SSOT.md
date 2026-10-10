@@ -476,6 +476,7 @@ These defaults make the blueprint internally concrete; they do not falsely mark 
 | `00-SSOT.md` | Intent, authority, decisions, concepts, and scope |
 | `10-runtime-dependencies.md` | Runtime separation, installation recipes, dependency pins and readiness boundaries |
 | `140-metamaterial-laboratory.md` | Concept development, CAD, solver profiles, artifact handoff and operational probes |
+| `145-metamaterial-solvers.md` | Required and optional solvers by physical question and first-pilot verification boundaries |
 | `dsh-batch.md` | Technical production, blinded authoring, receipts and shared dispatch limits |
 | `05-system-concept.md` | Organizing model, compute-rich supervision, anytime progress, and research rationale |
 | `15-project-organization.md` | Project instances, case-activated Operations Cell, tool environments, real execution evidence, and isolation |

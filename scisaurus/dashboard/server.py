@@ -3698,11 +3698,18 @@ class DashboardService:
                                     limits["max_rounds"] = bounded_rounds
                                     changed = True
                             if isinstance(search, dict):
+                                reserve = search.get("challenge_reserve", 0)
+                                analysis_ceiling = max(12, reserve + 1) if type(reserve) is int else 12
+                                # Older templates omit the deep-reading budget;
+                                # omission otherwise inherits the entire catalog.
+                                if "max_analyzed_works" not in search and type(search.get("max_works")) is int:
+                                    search["max_analyzed_works"] = min(search["max_works"], analysis_ceiling)
+                                    changed = True
                                 # Keep the first survey pass useful but finite.
                                 # Discovery remains broad; deep model analysis
                                 # is intentionally reserved for a compact
                                 # decision-relevant slice.
-                                for key, ceiling in (("max_analyzed_works", 12),
+                                for key, ceiling in (("max_analyzed_works", analysis_ceiling),
                                                      ("max_full_texts", 12),
                                                      ("expansion_rounds", 1),
                                                      ("saturation_rounds", 1)):
@@ -3721,6 +3728,17 @@ class DashboardService:
                                 finally:
                                     if temporary_config.exists():
                                         temporary_config.unlink()
+                # A concept laboratory's first mission ends at real experiments.
+                # Manuscript stages remain available in the source template.
+                concept_intake = any(
+                    stage.get("kind") == "topic_discovery"
+                    and _read_json(Path(stage["config_path"])).get("intake_mode") == "concept"
+                    for stage in workflow["stages"]
+                )
+                if (workflow.get("laboratory_config_path") and concept_intake
+                        and any(stage.get("kind") == "experiment" for stage in workflow["stages"])):
+                    from scisaurus.runtime.material_development import scope_workflow_to_experiments
+                    workflow = scope_workflow_to_experiments(workflow)
                 from scisaurus.runtime.composer import validate_workflow
                 workflow = validate_workflow(workflow)
                 workflow_path = target / "workflow.json"

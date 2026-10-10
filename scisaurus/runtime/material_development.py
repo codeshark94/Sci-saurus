@@ -8,6 +8,27 @@ DESIGN_BRIEF_REVISION = "material-design-brief-1"
 CONCEPT_CANDIDATE_COUNT = 3
 
 
+def scope_workflow_to_experiments(workflow):
+    """Retain experiment goals and their declared prerequisite closure."""
+    scoped = deepcopy(workflow)
+    by_id = {stage["id"]: stage for stage in scoped["stages"]}
+    goals = [stage["id"] for stage in scoped["stages"] if stage["kind"] == "experiment"]
+    if not goals:
+        raise ValidationError("material development requires an experiment stage")
+    retained, pending = set(), list(goals)
+    while pending:
+        identity = pending.pop()
+        if identity in retained:
+            continue
+        if identity not in by_id:
+            raise ValidationError("experiment prerequisite is not a declared stage: " + identity)
+        retained.add(identity)
+        pending.extend(by_id[identity]["depends_on"])
+    scoped["stages"] = [stage for stage in scoped["stages"] if stage["id"] in retained]
+    scoped["completion"]["required_stage_ids"] = goals
+    return scoped
+
+
 def design_brief_contract():
     return {
         "schema_version": DESIGN_BRIEF_REVISION,
@@ -133,6 +154,12 @@ def implementation_evidence_scope(brief):
             "Do not demand final optimized performance, convergence studies or proven novelty before implementation. "
             "Missing critical physical inputs remain blockers; source integrity and evidence review remain required. "
             "Literature completion does not establish novelty or validate the proposed performance."),
+        "acquisition_boundary": (
+            "Prioritize the physical model, material inputs, solver formulation, baseline and verification case "
+            "needed for first_pilot. Follow citation neighbors only for a specific missing implementation input "
+            "or a direct competing mechanism. The declared expansion_rounds bounds read-to-read expansion depth; "
+            "deferred reads and unresolved critical inputs remain visible. Do not create a new research-gap "
+            "hypothesis or expand a publication bibliography instead of implementing the selected design."),
     }
 
 

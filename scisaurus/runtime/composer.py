@@ -10523,6 +10523,10 @@ class ComposerRunner:
         if topic_context.get("intake_mode") == "concept":
             from scisaurus.runtime.material_development import validate_design_brief
             survey["design_brief"] = deepcopy(validate_design_brief(topic.get("design_brief")))
+            survey["proposed_gap"] = {
+                "id": survey["id"][:48] + "-differentiation",
+                "statement": survey["design_brief"]["differentiation_hypothesis"],
+            }
         # The discovery sampler is intentionally broad: it gives the topic
         # selector a current landscape, but those records are not evidence
         # for the selected question.  Carrying their IDs into the survey
@@ -21533,7 +21537,7 @@ class ComposerRunner:
         return retired
 
     @staticmethod
-    def _active_stage_role_ids(stage, *, stage_context=None):
+    def _active_stage_role_ids(stage, *, stage_context=None, descriptor=None):
         """Select the smallest useful preflight pool for the stage.
 
         The organization manifest describes the complete bounded capability
@@ -21546,6 +21550,12 @@ class ComposerRunner:
         """
         if not isinstance(stage, dict):
             return None
+        if (stage.get("kind") == "topic_discovery" and isinstance(descriptor, dict)
+                and descriptor.get("intake_mode") == "concept"):
+            # The producer compares concepts, checks declared feasibility and
+            # performs the closest-design challenge. The stage verifier remains
+            # independent; portfolio scouts do not supply a second selection.
+            return []
         if stage.get("kind") == "survey":
             context = stage_context if isinstance(stage_context, dict) else {}
             if (
@@ -30838,7 +30848,8 @@ class ComposerRunner:
                                 },
                                 deadline_seconds=self._stage_remaining(attempt_stage),
                                 active_role_ids=self._active_stage_role_ids(
-                                    stage, stage_context=self.context.get(stage_id)),
+                                    stage, stage_context=self.context.get(stage_id),
+                                    descriptor=json.loads(Path(stage["config_path"]).read_text())),
                             )
                             stage_admitted = True
                             self.stage_records[stage_id].update(

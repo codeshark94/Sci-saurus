@@ -722,6 +722,60 @@ class TestExplorationExecution(unittest.TestCase):
             self.assertEqual(child["inquiry_evidence"], acquisition["evidence"])
         self.assertFalse(tree["termination"]["exhaustive_coverage"])
 
+    def test_implementation_evidence_stops_at_declared_expansion_depth(self):
+        from scisaurus.tests.test_material_development import brief
+        from unittest.mock import patch
+        self.config["survey"]["design_brief"] = brief()
+        self.config["survey"]["search"]["expansion_rounds"] = 0
+        runner = self.runner()
+        with patch.object(runner, "_initial_plans", wraps=runner._initial_plans) as initial:
+            result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(runner._initial_search_roles(), ())
+        tree = json.loads((runner.dir / "output/exploration-tree.json").read_text())
+        deferred = [node for node in tree["nodes"] if node["kind"] == "read" and node["state"] == "deferred"]
+        self.assertTrue(deferred)
+        self.assertTrue(all(node["depth"] == 1 and "implementation evidence" in node["reason"] for node in deferred))
+        self.assertFalse(any(node["depth"] > 1 for node in tree["nodes"]))
+        self.assertFalse(tree["termination"]["exhaustive_coverage"])
+        self.assertEqual(initial.call_count, 1)
+        control, store = self.fixture.open_store()
+        self.assertIsNone(store.head("kb/search-plans/research-search-planner"))
+        self.assertIsNone(store.head("kb/search-plans/methods-blind-search-planner"))
+
+    def test_implementation_evidence_retains_checked_one_hop_sources(self):
+        from scisaurus.tests.test_material_development import brief
+        self.config["survey"]["design_brief"] = brief()
+        self.config["survey"]["search"]["expansion_rounds"] = 1
+        runner = self.runner()
+        result = runner.run()
+        self.assertEqual(result["status"], "completed", result["error"])
+        tree = json.loads((runner.dir / "output/exploration-tree.json").read_text())
+        self.assertTrue(any(node["kind"] == "read" and node["depth"] == 2 for node in tree["nodes"]))
+        self.assertFalse(any(node["depth"] > 2 for node in tree["nodes"]))
+        self.assertTrue(result["survey_current"])
+        self.assertTrue(result["assessment_current"])
+
+    def test_implementation_follow_up_without_tree_uses_owned_acquisition(self):
+        from scisaurus.tests.test_material_development import brief
+        from unittest.mock import patch
+        self.config["survey"]["design_brief"] = brief()
+        first = self.runner()
+        with patch.object(first, "_explore", side_effect=KeyboardInterrupt("before tree initialization")):
+            result = first.run()
+        self.assertEqual(result["status"], "paused")
+        second = self.runner(resume_policy=self.policy())
+        second.work_orders = [{"id": "missing-implementation-input", "kind": "literature_expansion",
+                               "owner": "research.intelligence", "objective": "Find required model evidence",
+                               "why": "Pilot input remains unresolved", "success_condition": "Captured evidence",
+                               "evidence_needed": "Model reference"}]
+        second.follow_up_ref = "owned-follow-up"
+        # Exercise routing separately from publishing a complete follow-up receipt.
+        with patch.object(second, "_explore") as explore, patch.object(second, "_accept_survey"), \
+             patch.object(second, "_initial_plans", side_effect=AssertionError("no legacy blind-planning branch")):
+            second._prepare_follow_up()
+        explore.assert_called_once_with()
+
     def test_durable_critique_refreshes_read_basis_before_resumed_branching(self):
         from unittest.mock import patch
         first = self.runner()

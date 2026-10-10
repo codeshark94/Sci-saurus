@@ -792,7 +792,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         self.counter_queries_complete = False
         self.countersearch_complete = False
         retained_tree = self.store.head("kb/exploration-tree")
-        if retained_tree is not None:
+        if retained_tree is not None or self.score.get("design_brief") is not None:
             self._explore()
         else:
             plans = self._initial_plans()
@@ -2879,7 +2879,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
 
     def _initial_plans(self):
         plans, jobs = [], []
-        for role in SEARCH_PLANNERS:
+        for role in self._initial_search_roles():
             plan_id = self._initial_plan_id(role)
             retained = self.store.head(f"kb/search-plans/{plan_id}") if self.resume_session else None
             if retained is not None:
@@ -2905,6 +2905,11 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             return plans
         self._models_checked(jobs, stage="supervision", task_kind="service")
         return plans
+
+    def _initial_search_roles(self):
+        # Concept queries are authored with the design. The evidence-tree
+        # planner still prioritizes actual acquisition and checked-source gaps.
+        return () if self.score.get("design_brief") is not None else SEARCH_PLANNERS
 
     def _ingest(self, works, execution, *, admission):
         if admission not in {"discovery", "challenge"}:

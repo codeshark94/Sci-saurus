@@ -54,6 +54,11 @@ attestation and resource checks, including candidates that omit the controller's
 deterministic execution inventory. Capability slots do not prescribe concept
 functions or require coverage of every installed solver.
 
+Fresh concept laboratory projects retain the experiment stages and their declared
+prerequisite closure as their completion graph. Downstream manuscript stages stay
+in the source template and are not dispatched by that development mission.
+Existing projects and portfolio workflows retain their declared graphs.
+
 A scoped concept repair retains its parent phenomenon and identity. It consumes
 the existing evidence when available; it does not require a frontier bibliography
 before the implementation literature stage or force a different evidence mode
@@ -85,6 +90,25 @@ convergence, fair comparison, uncertainty, robustness and contribution obligatio
 remain outstanding. Composer does not add a publication maturity screen to this
 mode merely because a paper stage exists.
 
+The concept producer and its closest-design challenge supply the comparison;
+the independent stage verifier checks the resulting package. Portfolio scout
+preflights do not run again for concept intake. Implementation literature uses
+the design's authored search terms and differentiation hypothesis, rather than
+commissioning a second set of blind search plans or nominating a new question.
+Its evidence-tree planner still chooses acquisition and checks source ownership.
+For a design brief, `expansion_rounds` limits additional read-to-read traversal:
+zero permits initial acquisition, one permits one further citation/search level.
+Reads beyond that scope are retained as deferred, not silently treated as reviewed
+or irrelevant. A specific missing critical input can require a separately scoped
+follow-up. Ordinary literature surveys keep their broader exploration policy.
+
+Fresh project creation explicitly supplies a deep-analysis budget even when a
+template omits `max_analyzed_works`: the default decision slice is 12 works or
+the declared challenge reserve plus one discovery slot, whichever is larger,
+within the declared catalog. Catalog size is not an instruction to read
+every returned paper. These settings govern the first evidence pass, not a claim
+of exhaustive coverage, validated novelty or completed experiment.
+
 The engineering sequence is a baseline and small pilot, diagnosis from retained
 fields and metrics, design revision and fresh execution, comparison, and final
 validation. A pilot may use one regime; broader sweeps and validation follow when
@@ -114,6 +138,9 @@ producer results revalidate their receipts and current execution state before
 review, including native inputs, retained outputs and runtime fingerprints.
 
 ## CAD and FEM roles
+
+The [solver selection guide](145-metamaterial-solvers.md) maps physical questions
+to required and optional tools, including the limits of the installed profiles.
 
 **FreeCAD 1.1.4** is the parametric CAD front end. The headless entry points in
 `/Applications/FreeCAD.app/Contents/Resources` expose the `Part`, `Import`,

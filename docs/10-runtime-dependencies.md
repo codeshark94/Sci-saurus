@@ -5,6 +5,9 @@ Installing the desktop app does not install every solver. A tool becomes agent-u
 only through its declared profile, immutable runtime identity and operational probes.
 An installation check does not establish scientific validity or material performance.
 
+For the required solver by physical question and the minimum first-pilot stack,
+see [solver selection](145-metamaterial-solvers.md).
+
 ## Dependency ownership
 
 | Environment | Specification | Purpose and boundary |
