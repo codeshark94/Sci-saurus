@@ -111,6 +111,71 @@ class DshSoftwareProducerTests(unittest.TestCase):
         self.assertEqual(len(report["software_tool_results"]), 2)
         direct.assert_not_called()
 
+    def test_owned_history_files_follow_controller_and_format_repair_turns(self):
+        workbench = SoftwareWorkbench(self.root / "software", deadline=time.monotonic() + 30)
+        retained = workbench.execute({"operation": "search_evidence", "arguments": {"terms": ["solver"]}})
+        assignment = deepcopy(self.assignment)
+        assignment["_software_history_refs"] = [retained["receipt_ref"]]
+        seen = []
+        def run(task, **kwargs):
+            seen.append(kwargs["inputs"])
+            index = json.loads(kwargs["inputs"]["engineering-receipts.json"])
+            entry, = index["entries"]
+            self.assertEqual(entry["receipt_ref"], retained["receipt_ref"])
+            self.assertEqual(hashlib.sha256(kwargs["inputs"][entry["path"]]).hexdigest(), entry["body_sha256"])
+            self.assertIn("Parse those JSON files locally", task)
+            correction = kwargs["exchange"]({"response.json": json.dumps({"response": self.final_response()}).encode()},
+                                              {"model_calls": 1, "output_tokens": 10})
+            seen.append(correction["inputs"])
+            action = {"tool_action": {"operation": "search_evidence", "arguments": {"terms": ["different"]}}}
+            continuation = kwargs["exchange"]({"response.json": json.dumps(action).encode()},
+                                                {"model_calls": 2, "output_tokens": 20})
+            seen.append(continuation["inputs"])
+            self.assertIsNone(kwargs["exchange"]({"response.json": json.dumps(self.final_response()).encode()},
+                                                  {"model_calls": 3, "output_tokens": 30}))
+            return self.batch_result(self.final_response())
+        with patch("scisaurus.runtime.dsh_batch.DshBatchRunner.run", side_effect=run) as transport:
+            report = self.dispatcher().dispatch([assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded", report)
+        self.assertEqual(transport.call_count, 1)
+        for packet in seen[1:]:
+            self.assertEqual({key: value for key, value in packet.items() if key.startswith("engineering-receipts")},
+                             {key: value for key, value in seen[0].items() if key.startswith("engineering-receipts")})
+
+    def test_receipt_inputs_cannot_replace_scientific_contract(self):
+        from scisaurus.runtime.dsh_batch import DshSoftwareProducerClient
+        for name in ("assignment.json", "system-contract.txt"):
+            with self.subTest(name=name), self.assertRaisesRegex(ValidationError, "cannot replace"):
+                DshSoftwareProducerClient(self.backend, root=self.root / "jobs", runtime_python=sys.executable,
+                                          receipt_inputs={name: b"{}"})
+
+    def test_cached_history_observation_is_exposed_once_without_new_execution(self):
+        workbench = SoftwareWorkbench(self.root / "software", deadline=time.monotonic() + 30)
+        action = {"tool_action": {"operation": "search_evidence", "arguments": {"terms": ["solver"]}}}
+        retained = workbench.execute(action["tool_action"])
+        assignment = deepcopy(self.assignment)
+        assignment["_software_history_refs"] = [retained["receipt_ref"]]
+        def run(task, **kwargs):
+            initial = json.loads(kwargs["inputs"]["assignment.json"])
+            historical, = [r for r in initial["software_tool_results"] if r.get("receipt_ref") == retained["receipt_ref"]]
+            self.assertNotIn("result", historical)
+            continuation = kwargs["exchange"]({"response.json": json.dumps(action).encode()},
+                                                {"model_calls": 1, "output_tokens": 10})
+            packet = json.loads(continuation["inputs"]["assignment.json"])
+            exposed, = [r for r in packet["software_tool_results"] if r.get("receipt_ref") == retained["receipt_ref"]]
+            self.assertEqual(exposed["result"], retained["result"])
+            self.assertEqual(exposed["outcome"], retained["outcome"])
+            with self.assertRaisesRegex(ValidationError, "repeated without new input"):
+                kwargs["exchange"]({"response.json": json.dumps(action).encode()},
+                                   {"model_calls": 2, "output_tokens": 20})
+            return self.batch_result(self.final_response())
+        with patch("scisaurus.runtime.dsh_batch.DshBatchRunner.run", side_effect=run), \
+                patch.object(SoftwareWorkbench, "_search_evidence", side_effect=AssertionError("no new retrieval")):
+            report = self.dispatcher().dispatch([assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded", report)
+        self.assertEqual(len([r for r in report["software_tool_results"] if r.get("receipt_ref") == retained["receipt_ref"]]), 0)
+        self.assertIn(retained["receipt_ref"], report["historical_software_tool_refs"])
+
     def test_controller_session_retains_duplicate_action_guard(self):
         action = {"tool_action": {"operation": "search_evidence", "arguments": {"terms": ["solver"]}}}
         def run(task, **kwargs):

@@ -299,19 +299,39 @@ class SoftwareWorkbench:
     def _api(self, suffix):
         return json.loads(self.fetch("https://api.github.com/" + suffix))
 
-    def _receipt(self, ref, operation=None, *, require_success=True):
+    def _receipt_body(self, ref):
         if not isinstance(ref, str) or not re.fullmatch(r"software:sha256:[0-9a-f]{64}", ref):
             raise ValidationError("software reference is not a content-addressed receipt")
         path = self.root / "receipts" / (ref.split(":")[-1] + ".json")
         body = path.read_bytes()
         if _sha(body) != ref.split(":")[-1]:
             raise ValidationError("software receipt hash changed")
+        return body
+
+    def _receipt(self, ref, operation=None, *, require_success=True):
+        body = self._receipt_body(ref)
         receipt = json.loads(body)
         if require_success and receipt.get("outcome") != "ok":
             raise ValidationError(f"software receipt {ref} records outcome {receipt.get('outcome')}; a successful {operation or 'operation'} receipt is required")
         if operation and receipt["action"]["operation"] != operation:
             raise ValidationError(f"software receipt {ref} records operation {receipt['action']['operation']}; operation {operation} is required")
         return receipt
+
+    def history_input_files(self):
+        """Snapshot only owned history into immutable, locally parseable inputs."""
+        files, entries = {}, []
+        for ref in sorted(self.history_refs):
+            body = self._receipt_body(ref)
+            digest = ref.split(":")[-1]
+            name = "engineering-receipts/" + digest + ".json"
+            files[name] = body
+            entries.append({"receipt_ref": ref, "path": name,
+                            "body_sha256": digest, "size_bytes": len(body)})
+        if entries:
+            files["engineering-receipts.json"] = canonical_bytes({
+                "schema_version": "software-history-inputs-1", "entries": entries,
+                "evidence_scope": "historical observations; reading does not admit current execution state"})
+        return files
 
     def validate_retained_results(self, results, *, verify_execution_state=True):
         """Recheck receipt identity and mutable execution state before reuse."""

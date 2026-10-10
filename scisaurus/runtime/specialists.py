@@ -2816,16 +2816,25 @@ class SpecialistDispatcher:
             raise ValidationError("DSH cannot enforce an explicit per-model-call allowance without a provider relay")
         producer_client = DshSoftwareProducerClient if software_tools is not None else DshStructuredProducerClient
         backend_mode = "dsh_software_producer" if software_tools is not None else "dsh_structured_producer"
+        exposed_history_refs = set()
         def consume_software_action(parsed, envelope):
             action = parsed["tool_action"]
             receipt = software_tools.execute(action)
-            if any(row.get("action") == action and row.get("result") == receipt.get("result")
-                   for row in software_results):
+            repeated = any(row.get("action") == action and row.get("result") == receipt.get("result")
+                           for row in software_results)
+            historical_exposure = (receipt.get("reused") is True
+                and receipt.get("receipt_ref") in software_history_refs
+                and receipt.get("receipt_ref") not in exposed_history_refs)
+            if repeated and not historical_exposure:
                 raise ValidationError("scientific software action repeated without new input or evidence")
-            software_results.append(receipt)
+            if historical_exposure:
+                exposed_history_refs.add(receipt["receipt_ref"])
+            if not repeated:
+                software_results.append(receipt)
             from scisaurus.runtime.software_workbench import software_prompt_results, selection_reference_contract
             envelope = deepcopy(envelope)
-            envelope["software_tool_results"] = software_prompt_results(software_results, software_history_refs)
+            envelope["software_tool_results"] = software_prompt_results(
+                software_results, set(software_history_refs) - exposed_history_refs)
             if response_contract == "software_selection":
                 envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
             request = envelope.get("repair_evidence_request")
@@ -2897,6 +2906,8 @@ class SpecialistDispatcher:
             return None
 
         producer_options = ({"tool_exchange": exchange_software_action,
+                             **({"receipt_inputs": software_tools.history_input_files()}
+                                if dsh_producer else {}),
                              **({"final_exchange": exchange_final_response}
                                 if response_contract == "software_selection" else {})}
                             if software_tools is not None else {})

@@ -137,6 +137,41 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(receipt["usage"]["model_calls"], 2)
         self.assertTrue(receipt["process_reaped"])
 
+    def test_complete_receipt_files_are_locally_readable_and_bound_on_every_turn(self):
+        config = self.exchange_backend()
+        script = self.script.read_text().replace("Path('answer.txt').write_text('turn '+str(turn))",
+            "task_text=request['params']['contentBlocks'][0]['text']\n"
+            "    frozen=Path(task_text.split('Immutable task files: ',1)[1].split('\\n',1)[0])\n"
+            "    entry=json.loads((frozen/'engineering-receipts.json').read_text())['entries'][0]\n"
+            "    body=(frozen/entry['path']).read_bytes()\n"
+            "    import hashlib\n"
+            "    assert hashlib.sha256(body).hexdigest()==entry['body_sha256']\n"
+            "    raw=json.loads(body)['result']['raw']\n"
+            "    assert len(raw)==20000 and raw[-1]==19999\n"
+            "    Path('answer.txt').write_text(str(len(raw)))")
+        self.script.write_text(script)
+        config = self.config()
+        body = json.dumps({"outcome": "failed", "result": {"raw": list(range(20000))}}).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        name = "engineering-receipts/" + digest + ".json"
+        inputs = {name: body, "engineering-receipts.json": json.dumps({"entries": [
+            {"path": name, "body_sha256": digest}]}).encode()}
+        turns = []
+        def exchange(files, usage):
+            turns.append(files)
+            if len(turns) == 1:
+                return {"task": "Inspect the original receipt again locally", "inputs": inputs}
+        result = DshBatchRunner(config, root=self.root / "jobs").run(
+            "Read the complete receipt locally", inputs=inputs, outputs=["answer.txt"], exchange=exchange)
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertEqual([turn["answer.txt"] for turn in turns], [b"20000", b"20000"])
+        self.assertEqual(result["usage"]["model_calls"], 2)
+        for turn in receipt["turns"]:
+            self.assertEqual(turn["input_sha256"][name], digest)
+            path = Path(result["receipt"]).parent / turn["input_directory"] / name
+            self.assertEqual(path.read_bytes(), body)
+            self.assertEqual(path.stat().st_mode & 0o222, 0)
+
     def test_controller_exchange_failure_preserves_paid_turn(self):
         for continuation in ({"task": "next", "inputs": {"../escape": "bad"}}, "invalid"):
             with self.subTest(continuation=continuation), self.assertRaises(DshBatchError) as raised:

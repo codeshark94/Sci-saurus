@@ -133,6 +133,33 @@ class SoftwareHistoryTests(unittest.TestCase):
         self.assertEqual(json.loads(text), self.operation)
         self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), self.ref.split(":")[-1])
 
+    def test_history_files_preserve_complete_original_bytes_and_owned_scope(self):
+        self.operation["result"]["output"]["raw"] = list(range(20000))
+        self.operation["outcome"] = "failed"
+        self.operation["error"] = "unresolved geometry"
+        self.ref = self.seal(self.operation)
+        foreign = self.seal({"outcome": "ok", "result": "foreign"})
+        self.workbench.history_refs = frozenset({self.ref})
+        with patch.object(self.workbench, "execute", side_effect=AssertionError("no dispatch")):
+            files = self.workbench.history_input_files()
+        index = json.loads(files["engineering-receipts.json"])
+        entry, = index["entries"]
+        body = files[entry["path"]]
+        self.assertGreater(len(body), 32000)
+        self.assertEqual(body, (self.root / "receipts" / (self.ref.split(":")[-1] + ".json")).read_bytes())
+        self.assertEqual(hashlib.sha256(body).hexdigest(), entry["body_sha256"])
+        self.assertEqual(len(body), entry["size_bytes"])
+        self.assertEqual(json.loads(body), self.operation)
+        self.assertNotIn(foreign, json.dumps(index))
+        self.assertEqual(set(files), {"engineering-receipts.json", entry["path"]})
+
+    def test_history_files_fail_on_changed_original_and_empty_scope_stays_empty(self):
+        self.assertEqual(self.workbench.history_input_files(), {})
+        self.workbench.history_refs = frozenset({self.ref})
+        (self.root / "receipts" / (self.ref.split(":")[-1] + ".json")).write_bytes(b"{}")
+        with self.assertRaisesRegex(ValidationError, "hash changed"):
+            self.workbench.history_input_files()
+
     def test_foreign_receipt_read_and_cached_tamper_are_rejected(self):
         action = {"operation": "read_receipt", "arguments": {"receipt_ref": self.ref}}
         with self.assertRaises(ValidationError):
