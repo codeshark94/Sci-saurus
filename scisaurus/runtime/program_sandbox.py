@@ -340,6 +340,18 @@ def capture_process(process, *, input_bytes, timeout_seconds, max_bytes, mode, c
     truncated = timed_out = False
     deadline = time.monotonic() + float(timeout_seconds)
     selector = selectors.DefaultSelector()
+    group_stopped = False
+
+    def stop_group():
+        nonlocal group_stopped
+        if group_stopped:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        group_stopped = True
+
     try:
         for stream, buffer in ((process.stdout, stdout), (process.stderr, stderr)):
             os.set_blocking(stream.fileno(), False)
@@ -347,9 +359,15 @@ def capture_process(process, *, input_bytes, timeout_seconds, max_bytes, mode, c
         os.set_blocking(process.stdin.fileno(), False)
         written = 0
         stdin_open = True
-        while selector.get_map() or stdin_open:
+        while selector.get_map() or stdin_open or process.poll() is None:
             if check_permission is not None:
                 check_permission()
+            if process.poll() is not None:
+                # Managers and forked workers can retain inherited pipe handles
+                # after the program exits. Their lifetime belongs to this run,
+                # so end the group and drain buffered output instead of waiting
+                # for an unrelated descendant to close every duplicate handle.
+                stop_group()
             if stdin_open and written >= len(input_bytes):
                 try:
                     process.stdin.close()
@@ -418,9 +436,11 @@ def capture_process(process, *, input_bytes, timeout_seconds, max_bytes, mode, c
     try:
         returncode = process.wait(timeout=10)
     except subprocess.TimeoutExpired:
+        stop_group()
         process.kill()
         returncode = process.wait()
         timed_out = True
+    stop_group()
     for stream in (process.stdout, process.stderr):
         try:
             stream.close()

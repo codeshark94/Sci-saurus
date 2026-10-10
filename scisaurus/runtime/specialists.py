@@ -2773,15 +2773,19 @@ class SpecialistDispatcher:
             prompt = build_specialist_prompt(assignment, packet)
         software_tools = None
         software_results = []
+        software_history_refs = assignment.get("_software_history_refs", [])
         if assignment.get("_software_tools") is True:
             if verifier or not self.software_workspace or self.deadline is None:
                 raise ValidationError("scientific software tools require a producer workspace and stage deadline")
-            from scisaurus.runtime.software_workbench import SoftwareWorkbench, project_receipt
+            from scisaurus.runtime.software_workbench import SoftwareWorkbench, software_prompt_results
             envelope = json.loads(prompt)
             evidence_catalog = envelope.get("software_assessment_request",{}).get("evidence_catalog",[])
             software_tools = SoftwareWorkbench(self.software_workspace, deadline=self.deadline,
                 evidence_refs=[row["source_ref"] for row in evidence_catalog],
-                laboratory=self.software_laboratory)
+                laboratory=self.software_laboratory, history_refs=software_history_refs)
+            for ref in software_history_refs:
+                retained = software_tools._receipt(ref, require_success=False)
+                software_results.append({**retained, "receipt_ref": ref, "reused": True})
             for ref in assignment.get("_software_receipt_refs",[]):
                 retained = software_tools._receipt(ref,require_success=False)
                 if retained.get("outcome") == "ok" and retained["action"]["operation"] == "read_evidence":
@@ -2794,11 +2798,12 @@ class SpecialistDispatcher:
                     # changed environment or tampered artifact.
                     software_tools._verify_run_state(retained["action"]["arguments"],
                                                      retained.get("result"))
-                software_results.append({**retained,"receipt_ref":ref,"reused":True})
+                if not any(row.get("receipt_ref") == ref for row in software_results):
+                    software_results.append({**retained,"receipt_ref":ref,"reused":True})
             if response_contract == "software_selection":
                 software_results.append(software_tools.execute({"operation":"check_environment","arguments":{}}))
                 envelope = json.loads(prompt)
-                envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+                envelope["software_tool_results"] = software_prompt_results(software_results, software_history_refs)
                 from scisaurus.runtime.software_workbench import selection_reference_contract
                 envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
                 prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
@@ -2818,9 +2823,9 @@ class SpecialistDispatcher:
                    for row in software_results):
                 raise ValidationError("scientific software action repeated without new input or evidence")
             software_results.append(receipt)
-            from scisaurus.runtime.software_workbench import project_receipt, selection_reference_contract
+            from scisaurus.runtime.software_workbench import software_prompt_results, selection_reference_contract
             envelope = deepcopy(envelope)
-            envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+            envelope["software_tool_results"] = software_prompt_results(software_results, software_history_refs)
             if response_contract == "software_selection":
                 envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
             request = envelope.get("repair_evidence_request")
@@ -3421,7 +3426,21 @@ class SpecialistDispatcher:
         if assignment.get("stage_kind") == "topic_discovery" and not verifier:
             report["input_scope"] = _review_input_scope(prompt)
         if software_tools is not None:
-            report["software_tool_results"] = deepcopy(software_results)
+            retained_history = set()
+            selection = report.get("response", {}).get("software_selection")
+            if isinstance(selection, dict):
+                from scisaurus.runtime.software_workbench import DISCOVERY_OPERATIONS, selected_receipt_closure
+                refs = [selection.get("environment_ref"), selection.get("example_ref"),
+                        *selection.get("computation_refs", []), *selection.get("scientific_source_refs", [])]
+                owned = [ref for ref in refs if ref in software_history_refs]
+                retained_history = {row["receipt_ref"] for row in selected_receipt_closure(software_results, owned)}
+                if selection.get("strategy") == "custom_model":
+                    retained_history.update(row["receipt_ref"] for row in software_results
+                        if row.get("outcome") == "ok" and row["action"]["operation"] in DISCOVERY_OPERATIONS)
+            report["software_tool_results"] = deepcopy([row for row in software_results
+                if row.get("receipt_ref") not in software_history_refs or row.get("receipt_ref") in retained_history])
+            if software_history_refs:
+                report["historical_software_tool_refs"] = list(software_history_refs)
         return report
 
     def dispatch(self, assignments, stage_packet, *, verifier=False, on_result=None):

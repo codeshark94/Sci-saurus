@@ -14772,11 +14772,13 @@ class ComposerRunner:
             }
         software_author = self._software_author_backend_config()
         if software_author is not None:
+            from scisaurus.runtime.software_history import REVISION as HISTORY_REVISION
             # A different DSH composition is a different engineering producer;
             # the accepted software assessment cannot be replayed across it.
             identity["software_author_backend_sha256"] = hashlib.sha256(
                 canonical_bytes(software_author["author_backend"])).hexdigest()
             identity["software_author_runtime_python"] = software_author["runtime_python"]
+            identity["software_history_contract_revision"] = HISTORY_REVISION
         digest = hashlib.sha256(canonical_bytes(identity)).hexdigest()
         logical = f"command/scientific-software-assessments/{digest}"
         previous = self.store.head(logical + "/receipt")
@@ -14843,7 +14845,32 @@ class ComposerRunner:
         request["source_ref_catalog"] = sorted(set(request["source_ref_catalog"]))
         request["source_ref_catalog"] = sorted(set([*request["source_ref_catalog"],
                                                     *[row["source_ref"] for row in evidence_catalog]]))
-        request_record = self._publish(logical + "/request", "note", request, "command.composer")
+        saved_request = None
+        saved = None
+        if software_author is not None:
+            from scisaurus.runtime.software_history import engineering_history
+            saved_request = self.store.head(logical + "/request")
+            if saved_request is not None:
+                saved_manifest, _, saved = self._read_verified_artifact_json(saved_request["artifact_ref"])
+                namespace, name, _ = parse_ref(saved_request["artifact_ref"])
+                if (saved_manifest.get("author") != "command.composer"
+                        or namespace + "/" + name != logical + "/request"
+                        or saved_manifest.get("artifact_ref") != saved_request["artifact_ref"]):
+                    raise ValidationError("software history snapshot lost its controller ownership")
+                if any(saved.get(key) != value for key, value in identity.items()
+                       if key != "computation_scope") or software_computation_identity(
+                        saved.get("computation_scope", {})) != identity["computation_scope"]:
+                    raise ValidationError("software history snapshot belongs to another assignment")
+                request["engineering_history"] = deepcopy(saved["engineering_history"])
+            else:
+                workbench = SoftwareWorkbench(self.root / "scientific-software",
+                    deadline=time.monotonic() + self._stage_remaining(stage),
+                    laboratory=getattr(self, "laboratory_binding", None))
+                request["engineering_history"] = engineering_history(
+                    self.store, self._read_verified_artifact_json, workbench,
+                    project_id=self.workflow["project_id"], stage_id=stage["id"], topic=topic)
+        request_record = (saved_request if saved_request is not None and saved == request else
+                          self._publish(logical + "/request", "note", request, "command.composer"))
         response_repair = None
         retained_producer = None
         failed = self.store.head(logical + "/failure") or carried_failure
@@ -14929,6 +14956,9 @@ class ComposerRunner:
             "software_assessment_request": software_assessment_prompt(request),
             "request_ref": request_record["artifact_ref"],
             "output_contract": selection_contract(getattr(self, "laboratory", None))}, ensure_ascii=False, sort_keys=True)}
+        if software_author is not None:
+            producer["_software_history_refs"] = [row["receipt_ref"]
+                for row in request["engineering_history"]["operations"]]
         if response_repair:
             producer["_software_receipt_refs"] = response_repair["receipt_refs"]
             producer["_response_format_recovery"] = {key: value for key, value in response_repair.items() if key != "receipt_refs"}
