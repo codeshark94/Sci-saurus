@@ -1234,7 +1234,9 @@ class TopicDiscoveryTests(unittest.TestCase):
                              research_form="theory_simulation", evidence_mode="synthetic_simulation",
                              comparison_type="mechanism_ablation",
                              feasibility_plan=_plan(execution_mode="native_runtime", runtime_labels=["heat"]))
-            candidate.pop("capability_requirements", None)
+            candidate["capability_requirements"] = {
+                "executables": ["python3"], "python_packages": [],
+                "stage_kinds": ["experiment"], "runtime_labels": ["heat"]}
         context = {"capability_foundry": {"enabled": True, "allowed_evidence_modes": ["synthetic_simulation"]},
                    "executables": {"python3": True}, "configured_stage_kinds": ["experiment"],
                    "research_feasibility": {"execution_modes": ["native_runtime", "foundry"],
@@ -4649,7 +4651,9 @@ class TopicDiscoveryTests(unittest.TestCase):
                 value = package(payload["principal_objective"])
                 for candidate in value["candidates"]:
                     candidate["feasibility_plan"] = foundry_feasibility_plan()
-                    candidate.pop("capability_requirements")
+                    candidate["capability_requirements"] = {
+                        "executables": ["python3"], "python_packages": [],
+                        "stage_kinds": ["experiment"]}
                 value["selected_id"] = "direction_0"
                 value["candidates"][0].update({
                     "title": "Published Albedo Change in Polar Terrain",

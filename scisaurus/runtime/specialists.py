@@ -1888,6 +1888,9 @@ def build_verifier_prompt(stage, stage_packet, specialist_reports, chief_result,
     for detail in details:
         envelope = _verifier_body(
             stage, stage_packet, specialist_reports, chief_result, detail=detail)
+        if stage.get("kind") == "topic_discovery":
+            from scisaurus.runtime.topic_discovery import capability_requirements_contract
+            envelope["execution_capability_contract"] = capability_requirements_contract()
         body = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if type(max_input_tokens) is not int or max_input_tokens <= 0:
             return body

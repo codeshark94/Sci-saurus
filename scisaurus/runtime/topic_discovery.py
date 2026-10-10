@@ -44,7 +44,7 @@ from scisaurus.runtime.scientific_surface import find_control_leaks, project_int
 
 
 SCHEMA_VERSION = "topic-discovery-1"
-TOPIC_RESPONSE_CONTRACT_REVISION = "topic-execution-surface-boundary-14"
+TOPIC_RESPONSE_CONTRACT_REVISION = "topic-authored-capability-contract-15"
 STAGE_CONFIG_SCHEMA_VERSION = "topic-discovery-config-1"
 TOPIC_HISTORY_SCHEMA_VERSION = "topic-history-1"
 RECENT_YEAR_WINDOW = 4
@@ -589,6 +589,16 @@ def _strings(value, name, *, minimum=1, maximum=8, public=True):
     return value
 
 
+def capability_requirements_contract():
+    """Describe analysis requirements separately from sealed solver runtimes."""
+    return {
+        "executables": "list of exact executable names needed in the declared execution boundary",
+        "python_packages": "list of required downstream analysis packages from research_feasibility.foundry_runtime_packages or the applicable supplied Python inventory; do not list native solver bindings used only inside a sealed laboratory runtime",
+        "stage_kinds": "list of required configured workflow stage kinds; solver formulation names are not workflow stage kinds",
+        "runtime_labels": "optional list of exact attested laboratory labels containing the upstream solver and its bindings; bind the same labels in feasibility_plan and explain any intentionally empty analysis package list",
+    }
+
+
 def _validate_capability_requirements(value, name="capability_requirements"):
     if (not isinstance(value, dict)
             or set(value) - CAPABILITY_FIELDS - CAPABILITY_OPTIONAL_FIELDS
@@ -606,6 +616,41 @@ def _validate_capability_requirements(value, name="capability_requirements"):
         if any(not _LAB_RUNTIME_LABEL.fullmatch(label) for label in value["runtime_labels"]):
             raise ValidationError(f"{name}.runtime_labels contains an invalid runtime label")
     return value
+
+
+def _validate_authored_capability_contract(response, request):
+    """Validate declarations against the contract used for this author receipt.
+
+    Historical author receipts can predate explicit dependency declarations.
+    Their original request governs validation; current prompt revisions must
+    not retroactively change a paid response's contract.
+    """
+    contract = request.get("output_contract", {}) if isinstance(request, dict) else {}
+    if not isinstance(contract, dict) or not isinstance(response, dict):
+        return
+    single_candidate = (response.get("candidate") if set(response) == {"candidate"}
+                        else _single_topic_candidate_response(response))
+    candidate_contract = contract.get("candidate")
+    if isinstance(candidate_contract, dict):
+        candidates = [single_candidate] if isinstance(single_candidate, dict) else []
+    else:
+        collection = contract.get("candidates")
+        candidate_contract = collection.get("items") if isinstance(collection, dict) else None
+        candidates = response.get("candidates")
+        if not isinstance(candidates, list) and isinstance(single_candidate, dict):
+            candidates = [single_candidate]
+    if not isinstance(candidate_contract, dict) or "capability_requirements" not in candidate_contract:
+        return
+    if not isinstance(candidates, list):
+        return  # The package shape validator owns malformed collections.
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if "capability_requirements" not in candidate:
+            raise ValidationError(
+                "topic author response omits output_contract capability_requirements "
+                f"for candidate {candidate.get('id')!r}")
+        _validate_capability_requirements(candidate["capability_requirements"])
 
 
 def validate_feasibility_plan(value, name="feasibility_plan"):
@@ -688,15 +733,11 @@ def validate_feasibility_plan(value, name="feasibility_plan"):
 
 
 def _materialize_foundry_capability_requirements(package, runtime_context):
-    """Add only the deterministic baseline for a foundry-backed selection.
+    """Provide the execution baseline for legacy foundry-backed artifacts.
 
-    Capability requirements describe the execution boundary, not the scientific
-    idea.  Asking a model to repeat that same inventory for every portfolio
-    candidate wastes the bounded response budget and made otherwise valid topic
-    packages fail when the selected candidate was the last object emitted.  A
-    model-supplied requirement remains authoritative and is still validated;
-    this helper only fills an omitted selected-candidate baseline from the live
-    runtime inventory.
+    This baseline does not describe authored solver or analysis dependencies.
+    Current author receipts are checked against their explicit declaration
+    contract before this compatibility projection is applied.
     """
     if not isinstance(package, dict) or not isinstance(runtime_context, dict):
         return package
@@ -4015,9 +4056,8 @@ SYSTEM = (
     "comparing the alternatives. "
     + _CANDIDATE_LANGUAGE_CONTRACT + " Return JSON only. "
     "For capability_requirements, copy exact names from the supplied runtime inventory and leave a list empty "
-    "when a requirement is unnecessary. This field is optional on portfolio alternatives; for a selected "
-    "candidate in a foundry-backed mission, the runtime supplies only the deterministic Python/experiment "
-    "baseline when the field is omitted. If topic_exclusions are supplied, retain an excluded direction only as "
+    "when a requirement is unnecessary. Declare each authored candidate's analysis dependencies and sealed solver labels explicitly. "
+    "If topic_exclusions are supplied, retain an excluded direction only as "
     "a rejected alternative and never select it."
 )
 
@@ -4469,6 +4509,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "disconfirmation_test_note": "optional detail about how the disconfirmation test separates explanations",
         "feasibility": _CANDIDATE_EXECUTION_TEXT_CONTRACT["feasibility"],
         "feasibility_plan": feasibility_plan_contract(runtime_context),
+        "capability_requirements": capability_requirements_contract(),
         "resource_plan": _CANDIDATE_EXECUTION_TEXT_CONTRACT["resource_plan"],
     }
     candidate_constraints = [
@@ -4479,7 +4520,7 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         "keep one primary phenomenon, one main mechanism or boundary, and one primary observable; do not couple several mechanisms or statistical tests unless the supplied seed records support each component",
         "do not introduce a mechanism, population, observable, model family, or statistical test that is absent from the supplied seed/evidence without a concrete bounded source query and resource plan",
         "search queries must be usable as ordinary scholarly search strings",
-        "capability_requirements is derived from the declared runtime boundary; do not emit it in candidate objects",
+        "Declare capability_requirements from the actual analysis inventory and attested solver labels; an empty list needs an execution-boundary justification when the study requires that kind of dependency",
         "feasibility_plan must be an exact machine-readable inventory, not a second prose claim; declare synthetic or analytical inputs for the deterministic foundry and never hide an external dataset, measurement, or network request",
         "evidence_inputs.status must use exactly one of available, acquirable_before_experiment, or unavailable; do not use synonyms such as ready, planned, missing, or obtainable",
         "evidence_inputs.kind must use exactly one of synthetic, analytical_parameters, project_artifact, survey_metadata, survey_full_text, public_dataset, new_measurement, or external_service; do not use shorthand such as simulation, dataset, or measurement",
@@ -5169,6 +5210,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
         "disconfirmation_test_note": "optional operational detail for the disconfirmation test",
         "feasibility": _CANDIDATE_EXECUTION_TEXT_CONTRACT["feasibility"],
         "feasibility_plan": feasibility_plan_contract(runtime_context),
+        "capability_requirements": capability_requirements_contract(),
         "resource_plan": _CANDIDATE_EXECUTION_TEXT_CONTRACT["resource_plan"],
         "frontier_seed_id": "copy target_frontier_seed_id exactly",
         "prior_work_ids": "one to three work_id values from target_seed_records only",
@@ -5270,7 +5312,7 @@ def _topic_candidate_refinement_prompt(objective, parent_candidate, *,
             "Keep one phenomenon, one main mechanism, one comparison, and one primary observable.",
             "Keep every narrative field under 45 words and every query under 12 words.",
             "Do not claim novelty, a result, or a literature gap; those require later evidence.",
-            "Do not include capability_requirements unless it is a complete object copied from the parent.",
+            "Return complete capability_requirements and repair its declarations against the supplied runtime inventory; do not copy an inadequate parent inventory unchanged.",
             "Use only literal keys listed in output_contract.candidate; omit aliases such as mechanism_boundary or disconfirmation_test_note_optional and put boundary detail in data_regime or theory_target.",
             "Return only the JSON object with no markdown or explanation.",
         ]),
@@ -6986,6 +7028,11 @@ class TopicDiscoveryRunner:
             try:
                 parsed_package, response_repairs = _normalise_topic_model_response(
                     result, single_candidate_refinement=single_candidate_refinement)
+                if not retained_proposal_active:
+                    author_request = response_evidence["request"]
+                    if (result.response_metadata or {}).get("backend") == "retained-author-response":
+                        author_request = result.response_metadata["original_evidence"]["request"]
+                    _validate_authored_capability_contract(parsed_package, author_request)
                 if portfolio_step == "select_topic_portfolio":
                     if not isinstance(parsed_package, dict) or set(parsed_package) != {
                             "selected_id", "selection_rationale"}:

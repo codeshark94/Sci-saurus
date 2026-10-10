@@ -86,3 +86,62 @@ class ScopeTests(unittest.TestCase):
                         intake_mode='concept', runtime_context={'laboratory': case['runtime']},
                         refinement_context={'parent_topic': parent, 'work_orders': case['orders']},
                         resume_author_response=evidence)
+
+
+class CapabilityContractTests(unittest.TestCase):
+    def test_declarations_are_bound_to_actual_author_contract(self):
+        from scisaurus.runtime.topic_discovery import (
+            _validate_authored_capability_contract, capability_requirements_contract)
+        request = {"output_contract": {"candidate": {
+            "capability_requirements": capability_requirements_contract()}}}
+        from scisaurus.tests.test_topic_discovery import package
+        candidate = deepcopy(package("Scientific comparison")["candidates"][0])
+        candidate.pop("capability_requirements")
+        for response in ({"candidate": candidate}, candidate):
+            with self.subTest(response=response), self.assertRaisesRegex(
+                    ValidationError, "omits output_contract capability_requirements"):
+                _validate_authored_capability_contract(response, request)
+        portfolio = {"output_contract": {"candidates": {"items": request["output_contract"]["candidate"]}}}
+        with self.assertRaisesRegex(ValidationError, "omits output_contract"):
+            _validate_authored_capability_contract({"candidates": [candidate]}, portfolio)
+        for response in ({"candidate": candidate}, candidate):
+            with self.subTest(portfolio_response=response), self.assertRaisesRegex(
+                    ValidationError, "omits output_contract"):
+                _validate_authored_capability_contract(response, portfolio)
+        _validate_authored_capability_contract({"candidates": [candidate]}, request)
+        _validate_authored_capability_contract({"candidate": candidate},
+            {"output_contract": {"candidate": {"id": "exact identifier"}}})
+        authored = {"id": "direction", "capability_requirements": {
+            "executables": [], "python_packages": ["numpy", "matplotlib"],
+            "stage_kinds": ["experiment"], "runtime_labels": ["waves"]}}
+        original = deepcopy(authored)
+        _validate_authored_capability_contract({"candidate": authored}, request)
+        self.assertEqual(authored, original)
+        authored["capability_requirements"]["stage_kinds"] = ["homogenization"]
+        with self.assertRaisesRegex(ValidationError, "unsupported stage kind"):
+            _validate_authored_capability_contract({"candidate": authored}, request)
+
+    def test_portfolio_refinement_and_review_share_dependency_contract(self):
+        from scisaurus.runtime.topic_discovery import (capability_requirements_contract,
+            topic_prompt, _topic_candidate_refinement_prompt)
+        from scisaurus.runtime.specialists import build_verifier_prompt
+        from scisaurus.tests.test_topic_discovery import package
+        objective = "A bounded scientific comparison"
+        original = package(objective)
+        parent = original["candidates"][1]
+        initial = json.loads(topic_prompt(objective, 3, runtime_context={}))
+        repair = json.loads(_topic_candidate_refinement_prompt(objective, parent,
+            base_package=original, target_shape={key: parent[key] for key in (
+                "research_form", "evidence_mode", "comparison_type")},
+            target_seed={"target_seed_id": "frontier_1", "eligible_seed_ids": ["frontier_1"], "target_work_ids": []},
+            frontier_seeds=[], recent_papers=[], runtime_context={}, refinement_feedback={}))
+        review = json.loads(build_verifier_prompt({"id": "topic", "kind": "topic_discovery"},
+            {}, [], {"topic": parent}))
+        expected = capability_requirements_contract()
+        self.assertEqual(initial["output_contract"]["candidates"]["items"]["capability_requirements"], expected)
+        self.assertEqual(repair["output_contract"]["candidate"]["capability_requirements"], expected)
+        self.assertEqual(review["execution_capability_contract"], expected)
+        self.assertFalse(any("do not emit it" in item for item in initial.get("constraints", [])))
+        self.assertFalse(any("copied from the parent" in item for item in repair["constraints"]
+                             if "capability_requirements" in item))
+        self.assertIn("sealed", expected["python_packages"])
