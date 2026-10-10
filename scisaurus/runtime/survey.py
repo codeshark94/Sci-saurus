@@ -5519,7 +5519,48 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 "repairs": value["repairs"], "current_entry_refs": {
                     wid: record["artifact_ref"] for wid, record in self.analysis_records.items()}}
 
+    def _retry_retained_survey_admission(self):
+        """Retry deterministic admission of an unchanged, paid, passing review."""
+        scopes = set((self.resume_session or {}).get("reopened_scopes", []))
+        if "integrated_review" not in scopes or scopes - {"integrated_review", "assessment"}:
+            return False
+        bundle = self.store.head("kb/surveys/current")
+        if bundle is None or self.map_record is None:
+            return False
+        accepted = self.store.accepted(bundle["artifact_id"])
+        if accepted is not None and accepted["version"] == bundle["version"]:
+            return False
+        body = self._body(bundle)
+        expected = {
+            "score_ref": self.score_ref, "map_ref": self.map_record["artifact_ref"],
+            "work_refs": sorted(record["artifact_ref"] for record in self.work_records.values()),
+            "source_refs": sorted(self.source_docs), "query_refs": sorted(self.query_refs),
+            "work_review_refs": sorted(record["artifact_ref"] for record in self.work_reviews.values()),
+        }
+        for key, value in expected.items():
+            actual = body.get(key)
+            if (sorted(actual) if isinstance(actual, list) else actual) != value:
+                return False
+        rows = self.control._conn.execute(
+            "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'kb/survey-reviews/%' "
+            "ORDER BY created_at DESC LIMIT 1").fetchall()
+        if not rows:
+            return False
+        review = self.store.get(rows[0]["artifact_ref"])
+        response = self._body(review)
+        checks = response.get("checks", [])
+        if (review.get("author") != "methods.survey-reviewer" or response.get("survey_ref") != bundle["artifact_ref"]
+                or not checks or any(check.get("outcome") != "passed" for check in checks)):
+            return False
+        adopted = self.gate.accept(bundle["artifact_ref"], review["artifact_ref"],
+            author="strategy.survey-integrator", expected_version=accepted["version"] if accepted else None,
+            guard=self._admission_guard)
+        self._record_survey_admission(adopted)
+        return True
+
     def _accept_survey(self):
+        if self._retry_retained_survey_admission():
+            return
         response = None
         while True:
             rejected = self._accept_survey_once(response)
@@ -5648,6 +5689,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         accepted = self.store.accepted(bundle["artifact_id"])
         adopted = self.gate.accept(bundle["artifact_ref"], review["artifact_ref"], author="strategy.survey-integrator",
                                   expected_version=accepted["version"] if accepted else None, guard=self._admission_guard)
+        self._record_survey_admission(adopted)
+
+    def _record_survey_admission(self, adopted):
         self.survey_ref = adopted["artifact_ref"]
         self._survey_acceptance_pending = False
         self.incumbent = self.survey_ref

@@ -323,7 +323,7 @@ class SurveyGate:
             if prompt.get("phase") == "implementation_evidence_review_batch":
                 score_manifest, score_raw = self._artifact(survey["score_ref"])
                 score = self._json(score_raw, "survey score")
-                if score.get("design_brief") is None:
+                if score.get("survey", {}).get("design_brief") is None:
                     raise ValidationError("batched implementation review requires a bound design brief")
                 from scisaurus.runtime.survey_records import project_work_review_batch
                 prompt, reply = project_work_review_batch(prompt, reply, entry_ref=entry_ref, work_id=work_id)

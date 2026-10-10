@@ -629,6 +629,33 @@ class TestSurveyRunner(unittest.TestCase):
             runner._review_work_claims()
         self.assertTrue(all(runner._work_review_current(wid) for wid in runner.analysis_records))
 
+    def test_implementation_batch_admission_uses_bound_score_and_reuses_paid_review(self):
+        from scisaurus.tests.test_material_development import brief
+        config = survey_config(self.endpoint)
+        config["survey"]["design_brief"] = brief()
+        runner = self.runtime(config)
+        runner._initialize(); runner._setup()
+        runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+        runner._map()
+        with patch.object(runner.gate, "accept", side_effect=ValidationError("Admission interrupted")):
+            with self.assertRaisesRegex(ValidationError, "Admission interrupted"):
+                runner._accept_survey()
+        calls = runner.model_calls_dispatched
+        runner.resume_session = {"reopened_scopes": ["integrated_review"]}
+        runner._accept_survey()
+        self.assertEqual(runner.model_calls_dispatched, calls)
+        self.assertIsNotNone(runner.survey_ref)
+        runner.gate.require_current(runner.survey_ref)
+        missing_score = {"schema_version": "literature-survey-score-1", "survey": {}}
+        original_artifact = runner.gate._artifact
+        def without_brief(ref, **kwargs):
+            manifest, raw = original_artifact(ref, **kwargs)
+            return (manifest, json.dumps(missing_score).encode()) if ref == runner.score_ref else (manifest, raw)
+        bundle = runner._body(runner.store.get(runner.survey_ref))
+        with patch.object(runner.gate, "_artifact", side_effect=without_brief):
+            with self.assertRaisesRegex(ValidationError, "bound design brief"):
+                runner.gate._work_reviews(bundle)
+
     def test_implementation_batch_preserves_exact_receipts_and_cache(self):
         from scisaurus.tests.test_material_development import brief
         runner = self.runtime()
