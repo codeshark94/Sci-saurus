@@ -76,6 +76,69 @@ def _parse_json_output(result, name):
                               "verify the entry point and stdin handling") from exc
 
 
+def _first_replay_difference(left, right, path=""):
+    """Locate an exact JSON difference without changing numeric precision."""
+    def entry(value):
+        if isinstance(value, (dict, list)):
+            encoded = canonical_bytes(value)
+            return {"present": True, "type": type(value).__name__,
+                    "sha256": hashlib.sha256(encoded).hexdigest(), "bytes": len(encoded)}
+        return {"present": True, "type": type(value).__name__, "value": value}
+
+    if type(left) is type(right) and isinstance(left, dict):
+        for key in sorted(set(left) | set(right)):
+            child = path + "/" + key.replace("~", "~0").replace("/", "~1")
+            if key not in left or key not in right:
+                return {"path": child,
+                        "baseline": entry(left[key]) if key in left else {"present": False},
+                        "replay": entry(right[key]) if key in right else {"present": False}}
+            difference = _first_replay_difference(left[key], right[key], child)
+            if difference is not None:
+                return difference
+        return None
+    if type(left) is type(right) and isinstance(left, list):
+        for index in range(max(len(left), len(right))):
+            child = path + "/" + str(index)
+            if index >= len(left) or index >= len(right):
+                return {"path": child,
+                        "baseline": entry(left[index]) if index < len(left) else {"present": False},
+                        "replay": entry(right[index]) if index < len(right) else {"present": False}}
+            difference = _first_replay_difference(left[index], right[index], child)
+            if difference is not None:
+                return difference
+        return None
+    if type(left) is not type(right) or canonical_bytes(left) != canonical_bytes(right):
+        return {"path": path, "baseline": entry(left), "replay": entry(right)}
+    return None
+
+
+def _replay_failure_details(raw_replays, payload, candidate):
+    baseline = json.loads(raw_replays[0])
+    comparisons = []
+    for index, raw in enumerate(raw_replays[1:], 2):
+        if raw == raw_replays[0]:
+            continue
+        document = json.loads(raw)
+        if isinstance(baseline, dict) and isinstance(document, dict):
+            differences = []
+            for key in sorted(set(baseline) | set(document)):
+                difference = _first_replay_difference(
+                    {key: baseline[key]} if key in baseline else {},
+                    {key: document[key]} if key in document else {})
+                if difference is not None:
+                    differences.append(difference)
+        else:
+            differences = [_first_replay_difference(baseline, document)]
+        comparisons.append({"baseline_run": 1, "replay_run": index,
+                            "first_difference_by_output_field": differences})
+    return {"executor_source_sha256": hashlib.sha256(candidate["executor_source"].encode()).hexdigest(),
+            "stdin_sha256": hashlib.sha256(payload).hexdigest(),
+            "canonical_replay_outputs": [
+                {"run": index, "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+                for index, raw in enumerate(raw_replays, 1)],
+            "replay_comparisons": comparisons}
+
+
 def validator_readiness_contract():
     return {
         "stdin": {"readiness_probe": True},
@@ -123,7 +186,13 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
             raise ValidationError(f"deterministic replay {index + 1} did not return JSON") from exc
         raw_replays.append(canonical_bytes(document))
     if any(replay != raw_replays[0] for replay in raw_replays[1:]):
-        raise ValidationError("deterministic replay produced non-identical output")
+        raise ProgramGateRejected(
+            "deterministic replay produced non-identical output",
+            {"decision": "rejected", "checks": [
+                {"id": "replay_identity", "outcome": "failed",
+                 "evidence": "Canonical JSON differs between executions of the same source and input."}]},
+            gate="deterministic_replay",
+            details={"gate_evidence": _replay_failure_details(raw_replays, payload, candidate)})
     document = validate_program_output(
         json.loads(raw_replays[0]), candidate["experiment_intent"],
         configured_input.get("work_orders", []), configured_input=configured_input)

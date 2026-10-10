@@ -359,6 +359,35 @@ class CapabilityFoundryTests(unittest.TestCase):
         actual["findings"][0]["source_refs"][0]["line"] = -1
         self.assertEqual(feedback, snapshot)
 
+    def test_authoring_repair_preserves_candidate_bound_replay_evidence(self):
+        evidence = {"executor_source_sha256": "a" * 64, "stdin_sha256": "b" * 64,
+                    "canonical_replay_outputs": [{"run": 1, "sha256": "c" * 64}],
+                    "replay_comparisons": [{"baseline_run": 1, "replay_run": 2,
+                        "first_difference_by_output_field": [{"path": "/metrics/0/value",
+                            "baseline": {"present": True, "value": 1.0},
+                            "replay": {"present": True, "value": 1.000000000000001}}]}]}
+        feedback = {"gate": "deterministic_replay", "decision": "rejected",
+                    "failed_checks": [{"id": "replay_identity", "outcome": "failed"}],
+                    "gate_evidence": evidence}
+        candidate = self._payload()
+        state = {}
+        _record_program_gate_feedback(state, feedback, candidate)
+        bound = _candidate_bound_value(state, candidate, "validation_feedback",
+                                       "validation_feedback_candidate_sha256")
+        prompt = authoring_patch_prompt(
+            brief={}, required_intent={}, configured_input={}, candidate=candidate,
+            feedback="non-identical output", validation_context={},
+            validation_feedback=bound, format_repair={})
+        actual = prompt["repair_request"]["validation_feedback"]
+        self.assertEqual(actual["gate_evidence"], evidence)
+        self.assertEqual(actual["repair_scope"]["active_issue"], "blocking_set")
+        actual["gate_evidence"]["replay_comparisons"][0]["replay_run"] = -1
+        self.assertEqual(feedback["gate_evidence"], evidence)
+        revised = deepcopy(candidate)
+        revised["executor_source"] += "\n"
+        self.assertEqual(_candidate_bound_value(state, revised, "validation_feedback",
+                        "validation_feedback_candidate_sha256"), {})
+
     def test_candidate_output_contract_repair_does_not_expand_scientific_scope(self):
         failure = {"gate": "analysis_output_contract", "error": "upper must be finite"}
         prompt = authoring_patch_prompt(

@@ -15,7 +15,9 @@ from scisaurus.runtime.capability_registry import (
     TRANSACTION_SCHEMA, experiment_program_payload, load_registry, register_capability,
 )
 from scisaurus.runtime.program_admission import SCHEMA_VERSION, validate_program_candidate
-from scisaurus.runtime.program_gates import ProgramGateRejected, admit_program_candidate
+from scisaurus.runtime.program_gates import (
+    ProgramGateRejected, _first_replay_difference, admit_program_candidate,
+)
 from scisaurus.runtime.experiment import validate_program_output
 from scisaurus.runtime.program_sandbox import (
     _macho_dependency_paths, run_sandboxed, sandbox_profile, sandbox_status,
@@ -291,6 +293,62 @@ class GateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "non-identical"):
             admit_program_candidate(candidate(), execute=execute, validate=self._validate())
+
+    def test_replay_feedback_preserves_exact_differences_for_each_output_field(self):
+        baseline = output_document()
+        changed = json.loads(json.dumps(baseline))
+        changed["assets"][0]["sha256"] = "b" * 64
+        changed["metrics"][0]["value"] = 1.000000000000001
+        changed["observations"][0]["abs_error"] = 1.000000000000002
+        outputs = [baseline, changed, baseline]
+        documents = iter(outputs)
+        value = candidate()
+        with self.assertRaises(ProgramGateRejected) as raised:
+            admit_program_candidate(value,
+                execute=lambda _: Result(json.dumps(next(documents)).encode()),
+                validate=lambda _: self.fail("non-identical output reached independent validator"))
+        feedback = raised.exception.feedback
+        self.assertEqual(feedback["gate"], "deterministic_replay")
+        self.assertEqual(feedback["failed_checks"][0]["id"], "replay_identity")
+        evidence = feedback["gate_evidence"]
+        self.assertEqual(evidence["executor_source_sha256"],
+                         hashlib.sha256(value["executor_source"].encode()).hexdigest())
+        self.assertEqual(evidence["stdin_sha256"],
+                         hashlib.sha256(canonical_bytes(value["test_vector"]["input"])).hexdigest())
+        self.assertEqual(evidence["canonical_replay_outputs"], [
+            {"run": i, "sha256": expected_digest(doc), "bytes": len(canonical_bytes(doc))}
+            for i, doc in enumerate(outputs, 1)])
+        self.assertEqual(len(evidence["replay_comparisons"]), 1)
+        comparison = evidence["replay_comparisons"][0]
+        self.assertEqual((comparison["baseline_run"], comparison["replay_run"]), (1, 2))
+        differences = {d["path"]: d for d in comparison["first_difference_by_output_field"]}
+        self.assertEqual(set(differences), {
+            "/assets/0/sha256", "/metrics/0/value", "/observations/0/abs_error"})
+        self.assertEqual(differences["/metrics/0/value"]["replay"]["value"],
+                         changed["metrics"][0]["value"])
+        self.assertEqual(differences["/observations/0/abs_error"]["baseline"]["value"], 1.0)
+        self.assertEqual(baseline, output_document())
+
+    def test_replay_diagnostics_distinguish_numeric_types_and_missing_values(self):
+        for left, right in ((1, 1.0), (True, 1), (False, 0), (-0.0, 0.0)):
+            with self.subTest(left=left, right=right):
+                difference = _first_replay_difference({"v": left}, {"v": right})
+                self.assertEqual(difference["path"], "/v")
+                self.assertEqual(difference["baseline"]["type"], type(left).__name__)
+                self.assertEqual(difference["replay"]["type"], type(right).__name__)
+        difference = _first_replay_difference({"a/b~": None}, {})
+        self.assertEqual(difference["path"], "/a~1b~0")
+        self.assertEqual(difference["baseline"], {"present": True, "type": "NoneType", "value": None})
+        self.assertEqual(difference["replay"], {"present": False})
+        self.assertEqual(_first_replay_difference([], [None])["path"], "/0")
+        self.assertIsNone(_first_replay_difference({"v": [1, None]}, {"v": [1, None]}))
+
+    def test_replay_diagnostics_pin_changed_container_without_expanding_it(self):
+        difference = _first_replay_difference({"v": [1, 2]}, {"v": None})
+        self.assertEqual(difference["baseline"], {
+            "present": True, "type": "list", "sha256": expected_digest([1, 2]),
+            "bytes": len(canonical_bytes([1, 2]))})
+        self.assertEqual(difference["replay"], {"present": True, "type": "NoneType", "value": None})
 
     def test_normalized_output_digest_matches_validator_candidate(self):
         document = output_document()

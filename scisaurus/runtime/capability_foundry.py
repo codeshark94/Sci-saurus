@@ -1986,6 +1986,8 @@ def _compact_repair_findings(value):
         items = value.get(key)
         result[key] = [deepcopy_config(item) for item in items
                        if isinstance(item, dict)] if isinstance(items, list) else []
+    if isinstance(value.get("gate_evidence"), dict):
+        result["gate_evidence"] = deepcopy_config(value["gate_evidence"])
     blocking = [item for item in result["findings"]
                 if item.get("severity") == "blocking"]
     result["repair_scope"] = {
