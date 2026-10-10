@@ -10,14 +10,14 @@ from unittest.mock import patch
 
 from scisaurus.core.errors import ValidationError
 from scisaurus.runtime.capability_foundry import candidate_prompt
-from scisaurus.runtime.experiment import bind_deterministic_validation, validate_deterministic_validation
+from scisaurus.runtime.experiment import bind_deterministic_validation, validate_deterministic_validation, validate_program_output
 from scisaurus.runtime.measurement_contract import recalculation_outcomes
 from scisaurus.runtime.program_admission import (
     format_recovery_intent_constraints, validate_program_candidate,
 )
 from scisaurus.runtime.research_quality import build_research_design
 from scisaurus.runtime.study_evidence import (
-    EVIDENCE_KINDS, evidence_source_refs, study_evidence_contract, validate_evidence_plan,
+    EVIDENCE_KINDS, EvidenceOutputContractError, evidence_source_refs, study_evidence_contract, validate_evidence_plan,
 )
 from scisaurus.tests.test_program_foundry import candidate, output_document
 
@@ -166,6 +166,7 @@ class StudyEvidenceTests(unittest.TestCase):
 
     def test_unavailable_external_validation_remains_a_limitation(self):
         intent = planned_intent()
+        intent['run_count'] = len(document()['observations'])
         entry = next(row for row in intent["evidence_plan"] if row["kind"] == "external_validation")
         entry.update(status="not_applicable", metric_ids=[], condition_ids=[], validator_check_id=None,
                      method="No compatible acquired observations.",
@@ -175,9 +176,13 @@ class StudyEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "lost its claim limitation"):
             bind_deterministic_validation(v, d, intent)
         d["limitations"].append(entry["claim_limit"])
+        with self.assertRaises(EvidenceOutputContractError) as failure:
+            validate_program_output(d, intent)
+        self.assertEqual(failure.exception.repair_gate, "evidence_output_contract")
         with self.assertRaisesRegex(ValidationError, "non-applicability reason"):
             bind_deterministic_validation(v, d, intent)
         d["limitations"].append(entry["method"])
+        validate_program_output(d, intent)
         bind_deterministic_validation(v, d, intent)
         entry["validator_check_id"] = "pretended_validation"
         with self.assertRaisesRegex(ValidationError, "must not claim"):

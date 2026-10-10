@@ -4387,6 +4387,29 @@ if __name__ == "__main__":
 
 
 class IndependentValidatorAuthorshipTests(unittest.TestCase):
+    def test_executor_evidence_scope_failure_does_not_call_validator_author(self):
+        from scisaurus.runtime.study_evidence import EVIDENCE_KINDS
+        with tempfile.TemporaryDirectory() as path:
+            foundry = CapabilityFoundryTests._foundry(Path(path))
+            foundry.max_attempts = 1
+            payload = CapabilityFoundryTests._payload()
+            intent = payload['experiment_intent']
+            intent['evidence_plan'] = [
+                {'id': kind, 'kind': kind, 'status': 'not_applicable',
+                 'metric_ids': [], 'condition_ids': [], 'source_refs': [],
+                 'validator_check_id': None, 'method': 'Unperformed fixture obligation.',
+                 'acceptance_rule': 'Not applicable in this contract fixture.',
+                 'claim_limit': intent['limitations'][0]}
+                for kind in sorted(EVIDENCE_KINDS)]
+            producer = StubClient(payload)
+            phases = []
+            with self.assertRaises(ModelWorkBlocked):
+                foundry.generate('bounded comparison', client=producer,
+                                 on_progress=lambda phase, state: phases.append((phase, deepcopy(state))))
+            self.assertEqual(foundry.validator_client.calls, 0)
+            self.assertFalse(any(phase == 'independent_validator_authoring' for phase, _ in phases))
+            self.assertEqual(phases[-1][1]['last_failure_gate'], 'evidence_output_contract')
+
     def test_captured_validator_response_requires_latest_successful_dispatch_owner(self):
         from scisaurus.runtime.capability_foundry import _captured_validator_request
         response = {'model': 'peer', 'finish_reason': 'stop', 'elapsed_seconds': 1.5,
@@ -4735,6 +4758,8 @@ class IndependentValidatorAuthorshipTests(unittest.TestCase):
                 def complete(inner, *, system, prompt):
                     inner.calls += 1
                     packet = json.loads(prompt)
+                    from scisaurus.runtime.program_admission import ALLOWED_IMPORTS
+                    self.assertEqual(packet['permitted_modules'], sorted(ALLOWED_IMPORTS))
                     self.assertEqual(packet['readiness_handshake']['stdin'],
                                      {'readiness_probe': True})
                     self.assertEqual(packet['readiness_handshake']['stdout'],

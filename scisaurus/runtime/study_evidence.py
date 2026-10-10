@@ -1,7 +1,7 @@
 """Prospective evidence obligations bound to a frozen computational study."""
 from copy import deepcopy
 
-from scisaurus.core.errors import ValidationError
+from scisaurus.core.errors import ModelContractError, ValidationError
 from scisaurus.runtime.scores import exact, identifier
 
 
@@ -12,6 +12,12 @@ PLAN_FIELDS = frozenset({
     "id", "kind", "status", "metric_ids", "condition_ids", "source_refs",
     "validator_check_id", "method", "acceptance_rule", "claim_limit",
 })
+
+
+class EvidenceOutputContractError(ModelContractError):
+    """The executor omitted a frozen evidence scope from its result."""
+
+    repair_gate = "evidence_output_contract"
 
 
 def study_evidence_contract():
@@ -142,15 +148,20 @@ def validate_evidence_checks(intent, verdict):
 
 def bind_evidence_observations(intent, candidate, verdict):
     """Check observable coverage without substituting for scientific review."""
+    validate_evidence_checks(intent, verdict)
+    validate_evidence_observations(intent, candidate)
+
+
+def validate_evidence_observations(intent, candidate):
+    """Check executor-owned evidence fields before independent authoring."""
     plan = validate_evidence_plan(intent)
     if not plan:
         return
-    validate_evidence_checks(intent, verdict)
     conditions = {row["condition"] for row in candidate["observations"]
                   if isinstance(row.get("condition"), str)}
     for entry in plan:
         if entry["claim_limit"] not in candidate["limitations"]:
-            raise ValidationError(f"evidence obligation {entry['id']} lost its claim limitation")
+            raise EvidenceOutputContractError(f"evidence obligation {entry['id']} lost its claim limitation")
         if entry["status"] == "planned":
             missing = set(entry["condition_ids"]) - conditions
             if missing:
@@ -158,4 +169,4 @@ def bind_evidence_observations(intent, candidate, verdict):
                                       + ",".join(sorted(missing)))
         else:
             if entry["method"] not in candidate["limitations"]:
-                raise ValidationError(f"unperformed evidence obligation {entry['id']} lost its non-applicability reason")
+                raise EvidenceOutputContractError(f"unperformed evidence obligation {entry['id']} lost its non-applicability reason")

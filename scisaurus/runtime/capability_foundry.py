@@ -52,7 +52,7 @@ from scisaurus.runtime.specialists import (
     research_question_alignment, RESEARCH_QUESTION_ALIGNMENT_RULE,
 )
 from scisaurus.runtime.program_admission import (
-    ExperimentIntentContractError, INTENT_FIELDS, is_main_entry_guard, scan_program_source,
+    ALLOWED_IMPORTS, ExperimentIntentContractError, INTENT_FIELDS, is_main_entry_guard, scan_program_source,
     validate_experiment_intent,
     validate_program_candidate,
 )
@@ -4373,7 +4373,7 @@ class CapabilityFoundry:
                 "response_contract": {"validator_source": "complete Python source"},
                 "instructions": "The runtime request contains candidate.metrics as an array of records in candidate_output_exact_shapes; match each primary outcome to a record by its exact id and read that record's value only for reported_value. A numeric schema example is not a reported value. Use observation_schema for the actual row fields. Implement recalculation from raw observations and the frozen estimand. Never trust candidate metric values as recalculated values. Check every declared primary outcome, raw-data consistency, frozen limitations and finite values. For each planned evidence_plan entry, emit its exact validator_check_id and assess acceptance_rule from current observations; retain failed checks rather than dropping obligations. No executor source or producer validator is available. Use only the declared runtime packages and permitted modules. Return only the complete JSON object.",
                 "runtime": runtime,
-                "permitted_modules": ["json", "math", "statistics", "hashlib", "pathlib", "sys", "itertools", "functools", "random", "collections", "dataclasses", "typing", "decimal", "fractions", "re", "time", "os", "numpy", "matplotlib"],
+                "permitted_modules": sorted(ALLOWED_IMPORTS),
             }
             if self.laboratory is not None:
                 assignment["laboratory_execution"] = {

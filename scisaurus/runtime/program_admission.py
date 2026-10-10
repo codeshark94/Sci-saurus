@@ -40,7 +40,7 @@ class ExperimentIntentContractError(ModelContractError):
 # The sandbox (P3.2) is the real boundary; this allowlist keeps the admission
 # surface small and reviewable and is the first of the five gates.
 ALLOWED_IMPORTS = frozenset({
-    "abc", "array", "base64", "binascii", "bisect", "cmath", "collections", "contextlib",
+    "__future__", "abc", "array", "base64", "binascii", "bisect", "cmath", "collections", "contextlib",
     "copy", "dataclasses", "decimal", "enum", "fractions", "functools", "hashlib", "heapq",
     "io", "itertools", "json", "math", "matplotlib", "numbers", "numpy", "operator", "os",
     "pathlib", "random", "re", "statistics", "string", "struct", "sys", "textwrap", "time",

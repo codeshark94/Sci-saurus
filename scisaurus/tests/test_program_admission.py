@@ -84,6 +84,14 @@ def candidate():
 
 
 class ProgramAdmissionTests(unittest.TestCase):
+    def test_future_annotations_preserves_static_import_guards(self):
+        source = "from __future__ import annotations\n" + VALIDATOR
+        self.assertEqual(scan_program_source(source, "validator"),
+                         {"__future__", "json", "sys"})
+        for imported in ("socket", "subprocess", "unregistered_package"):
+            with self.subTest(imported=imported), self.assertRaises(ValidationError):
+                scan_program_source(source + "\nimport " + imported, "validator")
+
     def test_model_authored_stage_seconds_requires_the_runtime_stage_set(self):
         self.assertEqual(validate_experiment_intent(deepcopy(INTENT)), INTENT)
         for stage_seconds in (

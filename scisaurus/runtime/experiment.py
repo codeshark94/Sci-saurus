@@ -366,6 +366,8 @@ def validate_program_output(value, experiment, work_orders=None, *, configured_i
     normalize_program_output(value)
     from scisaurus.runtime.solver_observations import validate_solver_observations
     validate_solver_observations(value, configured_input)
+    from scisaurus.runtime.study_evidence import validate_evidence_observations
+    validate_evidence_observations(experiment, value)
     # The executable result is admitted on reproducibility and independent
     # recalculation first.  A quality contract is a substantive publication
     # floor, not a pre-execution response-format gate: an author may omit the
