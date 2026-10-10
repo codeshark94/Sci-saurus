@@ -21,7 +21,7 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-reference-capacity-and-generation-16"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-independent-batch-settlement-17"
 CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-3"
 CURRENT_MAP_REVIEW_PROTOCOLS = frozenset({
     "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL,
@@ -1022,21 +1022,35 @@ def validate_assessment(value, sources, works, *, require_spans=False, windows=N
         raise ValidationError("unresolved or solved comparisons cannot authorize experiment eligibility")
 
 
+def index_work_review_batch(prompt, reply, *, require_complete=False):
+    """Index unambiguous assigned rows; omission never creates a verdict."""
+    items, replies = prompt.get("entries"), reply.get("reviews")
+    if (not isinstance(items, list) or not isinstance(replies, list)
+            or set(reply) != {"reviews"} or not items
+            or any(not isinstance(item, dict) for item in [*items, *replies])
+            or any(not isinstance(item.get("entry"), dict) for item in items)):
+        raise ValidationError("batched implementation review has invalid exact entry coverage")
+    assigned_ids = [item.get("entry", {}).get("work_id") for item in items]
+    entry_refs = [item.get("entry_ref") for item in items]
+    reply_ids = [item.get("work_id") for item in replies]
+    if (any(not isinstance(item, str) for item in [*assigned_ids, *reply_ids])
+            or len(set(assigned_ids)) != len(assigned_ids)
+            or any(not isinstance(ref, str) for ref in entry_refs)
+            or len(set(entry_refs)) != len(entry_refs)
+            or len(set(reply_ids)) != len(reply_ids) or not set(reply_ids).issubset(assigned_ids)):
+        raise ValidationError("batched implementation review changed its assigned work identities")
+    missing = sorted(set(assigned_ids) - set(reply_ids))
+    if require_complete and missing:
+        raise ValidationError(f"implementation evidence reviews omitted assigned work_ids: {missing}")
+    return {row["work_id"]: row for row in replies}
+
+
 def project_work_review_batch(prompt, reply, *, entry_ref, work_id):
     """Select one receipt-bound review without synthesizing provider outputs."""
     if prompt.get("phase") != "implementation_evidence_review_batch":
         return prompt, reply
-    items, replies = prompt.get("entries"), reply.get("reviews")
-    if (not isinstance(items, list) or not isinstance(replies, list)
-            or set(reply) != {"reviews"} or len(items) != len(replies)
-            or any(not isinstance(item, dict) for item in [*items, *replies])):
-        raise ValidationError("batched implementation review has invalid exact entry coverage")
-    assigned_ids = [item.get("entry", {}).get("work_id") for item in items]
-    reply_ids = [item.get("work_id") for item in replies]
-    if (any(not isinstance(item, str) for item in [*assigned_ids, *reply_ids])
-            or len(set(assigned_ids)) != len(assigned_ids)
-            or len(set(reply_ids)) != len(reply_ids) or set(reply_ids) != set(assigned_ids)):
-        raise ValidationError("batched implementation review changed its assigned work identities")
+    index_work_review_batch(prompt, reply)
+    items, replies = prompt["entries"], reply["reviews"]
     matches = [item for item in items if item.get("entry_ref") == entry_ref]
     rows = [item for item in replies if item.get("work_id") == work_id]
     if len(matches) != 1 or len(rows) != 1 or matches[0].get("entry", {}).get("work_id") != work_id:

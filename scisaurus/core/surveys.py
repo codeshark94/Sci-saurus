@@ -550,6 +550,7 @@ class SurveyGate:
     def _model_review_execution(self, execution_ref, author):
         execution, context, result, params = self._recorded_execution(
             execution_ref, author, operation="model", task_kinds={"review", "verification"},
+            allow_blocked_model_batch=True,
         )
         prompt = self._json(params.get("prompt"), "review prompt")
         reply = json_object(
@@ -558,12 +559,21 @@ class SurveyGate:
         )
         if result.get("finish_reason") != "stop":
             raise ValidationError("review model reply did not finish normally")
+        task_id = execution["artifact_id"].removeprefix("command/executions/")
+        task_state = self.control._conn.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+        if task_state == "blocked":
+            if prompt.get("phase") != "implementation_evidence_review_batch":
+                raise ValidationError("blocked model output requires a source-bound independent batch")
+            from scisaurus.runtime.survey_records import index_work_review_batch
+            index_work_review_batch(prompt, reply)
         return execution, context, prompt, reply
 
     def _recorded_execution(self, execution_ref, author, *, operation, task_kinds,
-                            allow_blocked_retrieval=False):
+                            allow_blocked_retrieval=False, allow_blocked_model_batch=False):
         if allow_blocked_retrieval and operation == "model":
             raise ValidationError("blocked model output cannot establish review authority")
+        if allow_blocked_model_batch and operation != "model":
+            raise ValidationError("partial model batch authority cannot apply to another operation")
         execution, raw = self._artifact(execution_ref)
         prefix = "command/executions/"
         if (execution["artifact_type"] != "report" or not execution["artifact_id"].startswith(prefix)
@@ -576,7 +586,8 @@ class SurveyGate:
         ).fetchone()
         if (task is None or task["kind"] not in task_kinds
                 or task["state"] not in ({"awaiting_review", "completed", "blocked"}
-                                         if allow_blocked_retrieval else {"awaiting_review", "completed"})
+                                         if allow_blocked_retrieval or allow_blocked_model_batch
+                                         else {"awaiting_review", "completed"})
                 or self._json(task["payload_json"], "review task").get("operation") != operation
                 or attempt is None or attempt["state"] != "succeeded"
                 or attempt["lease_owner"] != author):
@@ -611,7 +622,10 @@ class SurveyGate:
         if (any(value is None for value in (started, finished, context_seq, execution_seq))
                 or not started < context_seq < execution_seq < finished):
             raise ValidationError("execution record was not published during its successful attempt")
-        return execution, context, self._json(raw, "execution result"), self._json(context_raw, "execution context")
+        result = self._json(raw, "execution result")
+        if operation == "model" and result.get("usage") != usage:
+            raise ValidationError("review model result usage differs from its successful attributed attempt")
+        return execution, context, result, self._json(context_raw, "execution context")
 
     def _acceptance(self, survey_ref, review_ref):
         survey, body, dependencies = self._survey(survey_ref)

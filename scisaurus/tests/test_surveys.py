@@ -114,6 +114,17 @@ class TestSurveyGate(unittest.TestCase):
             self.tasks.transition(task_id, "awaiting_review", author)
         return execution
 
+    def test_model_review_receipt_requires_exact_attributed_usage(self):
+        original = self.publish
+        def mismatched_usage(logical, body, **kwargs):
+            if logical.startswith("command/executions/"):
+                body = {**body, "usage": {"model_calls": 9}}
+            return original(logical, body, **kwargs)
+        with patch.object(self, "publish", side_effect=mismatched_usage):
+            execution = self.model({"checks": [], "rationale": "Recorded response."})
+        with self.assertRaisesRegex(ValidationError, "usage differs"):
+            self.gate._model_review_execution(execution, "methods.reviewer")
+
     def fetch(self, text, *, overrides=None):
         self.serial += 1
         task_id, author = f"capture-{self.serial}", "research.retriever"

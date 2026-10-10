@@ -485,4 +485,9 @@ entry. The admission gate checks each current entry, relationship, source window
 and model reply against that original receipt. Aggregate context review remains
 independent. A cached receipt is reused only for identical source-bound inputs;
 this batching does not assert novelty, complete coverage or successful physics.
+Incomplete batches retain independently valid rows from the original successful
+dispatch. Missing or invalid rows remain unresolved and only those entries are
+requested again. Duplicate or foreign work identities invalidate the envelope.
+The batch failure and full attributed usage remain recorded; retaining one row
+does not approve another entry or the aggregate survey.
 Ordinary research surveys keep their existing review flow.

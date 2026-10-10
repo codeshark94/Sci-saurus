@@ -406,6 +406,14 @@ def simulated_survey_worker(kind, params, channel):
         value = {"reviews": [{"work_id": entry["entry"]["work_id"],
             "checks": check_rows(entry["required_checks"]),
             "rationale": "Each claim is supported or explicitly unknown."} for entry in assignment["entries"]]}
+        if mode == "batch-missing" and len(value["reviews"]) > 1:
+            value["reviews"] = value["reviews"][1:]
+        if mode == "batch-invalid" and len(value["reviews"]) > 1:
+            value["reviews"][0]["checks"][0]["outcome"] = "invalid"
+        if mode == "batch-foreign":
+            value["reviews"][0]["work_id"] = "Wforeign"
+        if mode == "batch-duplicate":
+            value["reviews"].append(deepcopy(value["reviews"][0]))
     elif phase == "work_review":
         if mode in {"review-malformed", "isolated-review-block"} and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -549,6 +557,78 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_partial_implementation_batch_retains_rows_and_requests_only_unresolved(self):
+        from scisaurus.tests.test_material_development import brief
+        for mode in ("batch-missing", "batch-invalid"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                original_root = self.root
+                self.root = Path(temp)
+                try:
+                    runner = self.runtime(survey_config(self.endpoint, mode))
+                finally:
+                    self.root = original_root
+                runner._initialize(); runner._setup()
+                runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+                runner._map(); runner.score["design_brief"] = brief()
+                with self.assertRaises(ModelWorkBlocked) as failure:
+                    runner._review_work_claims()
+                self.assertIn("implementation evidence review", str(failure.exception))
+                self.assertEqual(len(runner.work_reviews), len(runner.analysis_records) - 1)
+                self.assertTrue(all(runner._work_review_current(wid) for wid in runner.work_reviews))
+                contexts = list(self.model_contexts(runner.control, runner.store))
+                batches = [prompt for _, prompt in contexts if prompt.get("phase") == "implementation_evidence_review_batch"]
+                missing = set(runner.analysis_records) - set(runner.work_reviews)
+                self.assertEqual(len(batches), 1)
+                runner.resume_session = {"session": 1}
+                runner._review_work_claims()
+                batches = [prompt for _, prompt in self.model_contexts(runner.control, runner.store)
+                           if prompt.get("phase") == "implementation_evidence_review_batch"]
+                self.assertEqual(len(batches), 2)
+                self.assertEqual({entry["entry"]["work_id"] for entry in batches[1]["entries"]}, missing)
+                self.assertTrue(all(runner._work_review_current(wid) for wid in runner.analysis_records))
+                self.assertEqual(runner.model_calls_dispatched, 4)  # two maps and two independent review receipts
+
+    def test_ambiguous_implementation_batch_cannot_settle_any_row(self):
+        from scisaurus.tests.test_material_development import brief
+        for mode in ("batch-foreign", "batch-duplicate"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                original_root = self.root; self.root = Path(temp)
+                try:
+                    runner = self.runtime(survey_config(self.endpoint, mode))
+                finally:
+                    self.root = original_root
+                runner._initialize(); runner._setup()
+                runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+                runner._map(); runner.score["design_brief"] = brief()
+                with self.assertRaises(ModelWorkBlocked):
+                    runner._review_work_claims()
+                self.assertEqual(runner.work_reviews, {})
+
+    def test_saved_partial_batch_is_settled_before_any_new_request(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime(survey_config(self.endpoint, "batch-missing"))
+        runner._initialize(); runner._setup()
+        runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+        runner._map(); runner.score["design_brief"] = brief()
+        checked = runner._models_checked
+        def legacy_batch(jobs, **kwargs):
+            for job in jobs:
+                job.pop("on_validation_failure", None)
+            return checked(jobs, **kwargs)
+        with patch.object(runner, "_models_checked", side_effect=legacy_batch):
+            with self.assertRaises(ModelWorkBlocked):
+                runner._review_work_claims()
+        self.assertEqual(runner.work_reviews, {})
+        runner.resume_session = {"session": 1}
+        original_dispatch = runner._models_checked
+        def missing_only(jobs, **kwargs):
+            self.assertEqual(len(jobs[0]["assignment"]["entries"]), 1)
+            self.assertEqual(len(runner.work_reviews), len(runner.analysis_records) - 1)
+            return original_dispatch(jobs, **kwargs)
+        with patch.object(runner, "_models_checked", side_effect=missing_only):
+            runner._review_work_claims()
+        self.assertTrue(all(runner._work_review_current(wid) for wid in runner.analysis_records))
+
     def test_implementation_batch_preserves_exact_receipts_and_cache(self):
         from scisaurus.tests.test_material_development import brief
         runner = self.runtime()

@@ -51,7 +51,7 @@ from scisaurus.runtime.survey_records import (
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
     normalize_survey_review_envelope, survey_review_assignment_identity,
     CURRENT_MAP_REVIEW_PROTOCOL,
-    named_reference_ids,
+    named_reference_ids, index_work_review_batch,
 )
 from scisaurus.runtime.time_policy import TimePolicy
 
@@ -2546,6 +2546,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                         job["validator"](value)
                     except (ValidationError, TypeError, ValueError, KeyError) as exc:
                         failure_class = getattr(exc, "failure_class", None) or "model_contract"
+                        partial = (job["on_validation_failure"](execution)
+                                   if job.get("on_validation_failure") else False)
                         feedback[job["name"]] = {"error": str(exc), "previous_response": value,
                             "finish_reason": result.finish_reason,
                             "scope": "Repair only this assignment's contract violations; preserve every valid field. "
@@ -2556,7 +2558,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                        "failure_class": failure_class},
                                       "command.controller", subjects=[proposal["artifact_ref"]])
                         attempts = states[job["name"]].get("repair_attempts", 0) + 1
-                        exhausted = attempts >= self.config["limits"]["max_rounds"]
+                        exhausted = partial or attempts >= self.config["limits"]["max_rounds"]
                         states[job["name"]] = cache.put(keys[job["name"]], {
                             "status": "blocked" if exhausted else "repairing",
                             "failure_origin": "response_validation",
@@ -5117,41 +5119,96 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if self.score.get("design_brief") is None:
             return self._models_checked(jobs, stage="unit_review", task_kind="verification",
                 on_contract_blocked=lambda name, error: contract_blocks.append(error))
-        assignments = [job["assignment"] for job in jobs]
-        expected = {item["entry"]["work_id"] for item in assignments}
+        def assignment_for(entries):
+            return {"phase": "implementation_evidence_review_batch",
+                "assignment": "Audit the supplied short implementation context in one batch.",
+                "entries": entries,
+                "response_contract": {"top_level_fields": ["reviews"],
+                    "reviews": "One object per exact work_id, with work_id plus that entry's exact response_contract fields."},
+                "instructions": "Return only {reviews:[{work_id,checks,rationale}]} (include critique_adjudications only where the entry requires it). "
+                    "Execute each entry's source-bound checks using its captured text. Keep each result to one short sentence. "
+                    "This establishes source fidelity of implementation context, not novelty or experimental success. "
+                    "Do not demand a complete bibliography, final optimized design or results before the first pilot."}
+
+        expected_assignment = self._follow_up_assignment(assignment_for([job["assignment"] for job in jobs]))
+        def settle(execution_ref):
+            try:
+                _, _, prompt, reply = self.gate._model_review_execution(execution_ref, "methods.work-reviewer")
+            except ValidationError:
+                return False
+            if prompt.get("phase") != "implementation_evidence_review_batch":
+                return False
+            current_scope = {key: value for key, value in expected_assignment.items() if key != "entries"}
+            prior_scope = {key: value for key, value in prompt.items() if key != "entries"}
+            if self._response_assignment_identity(current_scope) != self._response_assignment_identity(prior_scope):
+                return False
+            try:
+                rows = index_work_review_batch(prompt, reply)
+            except ValidationError:
+                return False
+            entries = {item["entry"]["work_id"]: item for item in prompt["entries"]}
+            admitted, invalid = [], {}
+            for job in jobs:
+                wid = job["assignment"]["entry"]["work_id"]
+                if self._work_review_current(wid) or entries.get(wid) != job["assignment"] or wid not in rows:
+                    continue
+                try:
+                    value = job["normalizer"]({key: item for key, item in rows[wid].items() if key != "work_id"})
+                    job["validator"](value)
+                except (ValidationError, TypeError, ValueError, KeyError) as exc:
+                    invalid[wid] = str(exc)
+                    continue
+                job["on_valid"](value, execution_ref)
+                admitted.append(wid)
+            if admitted:
+                execution = self.store.get(execution_ref)
+                task_id = execution["artifact_id"].removeprefix("command/executions/")
+                self._record(f"command/batch-settlements/{task_id}", "note", {
+                    "execution_ref": execution_ref, "admitted_work_ids": admitted,
+                    "missing_work_ids": sorted(set(entries) - set(rows)), "invalid_rows": invalid,
+                    "scope": "Each retained row passed its own exact source-bound contract. Missing and invalid rows remain unresolved.",
+                }, "command.controller", subjects=[execution_ref])
+            return bool(admitted)
+
+        if self.resume_session:
+            receipts = self.control._conn.execute(
+                "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE ? ORDER BY created_at DESC",
+                ("command/executions/survey-implementation-evidence-review-%",)).fetchall()
+            for row in receipts:
+                execution_ref = row["artifact_ref"]
+                execution = self.store.get(execution_ref)
+                context = self._body(self.store.get(execution["inputs"][0]["ref"]))
+                prompt = json.loads(context["prompt"])
+                owned = self._retained_settled_response("implementation-evidence-review", "methods.work-reviewer",
+                                                      prompt, execution_ref=execution_ref)
+                if owned is not None:
+                    settle(execution_ref)
+            jobs = [job for job in jobs if not self._work_review_current(job["assignment"]["entry"]["work_id"])]
+        if not jobs:
+            return
+
+        assignment = assignment_for([job["assignment"] for job in jobs])
         def normalize(value):
-            exact(value, {"reviews"}, "implementation evidence reviews")
-            rows = value["reviews"]
-            if not isinstance(rows, list) or len(rows) != len(jobs):
-                raise ValidationError("implementation evidence reviews require every exact assigned work")
-            by_id = {}
-            for row in rows:
-                if not isinstance(row, dict) or not isinstance(row.get("work_id"), str):
-                    raise ValidationError("implementation evidence review requires work_id")
-                if row["work_id"] in by_id:
-                    raise ValidationError("duplicate implementation evidence review work_id")
-                by_id[row["work_id"]] = {key: item for key, item in row.items() if key != "work_id"}
-            if set(by_id) != expected:
-                raise ValidationError("implementation evidence review work_ids differ from the assignment")
-            return {"reviews": [{"work_id": job["assignment"]["entry"]["work_id"],
-                **job["normalizer"](by_id[job["assignment"]["entry"]["work_id"]])} for job in jobs]}
+            rows = index_work_review_batch(assignment, value, require_complete=True)
+            normalized = []
+            for job in jobs:
+                wid = job["assignment"]["entry"]["work_id"]
+                try:
+                    row = job["normalizer"]({key: item for key, item in rows[wid].items() if key != "work_id"})
+                    job["validator"](row)
+                except ValidationError as exc:
+                    raise ValidationError(f"implementation evidence review {wid}: {exc}") from exc
+                normalized.append({"work_id": wid, **row})
+            return {"reviews": normalized}
         def validate(value):
             for job, row in zip(jobs, value["reviews"]):
                 job["validator"]({key: item for key, item in row.items() if key != "work_id"})
         def integrate(value, execution):
             for job, row in zip(jobs, value["reviews"]):
                 job["on_valid"]({key: item for key, item in row.items() if key != "work_id"}, execution)
-        assignment = {"phase": "implementation_evidence_review_batch",
-            "assignment": "Audit the supplied short implementation context in one batch.",
-            "entries": assignments,
-            "response_contract": {"top_level_fields": ["reviews"],
-                "reviews": "One object per exact work_id, with work_id plus that entry's exact response_contract fields."},
-            "instructions": "Return only {reviews:[{work_id,checks,rationale}]} (include critique_adjudications only where the entry requires it). "
-                "Execute each entry's source-bound checks using its captured text. Keep each result to one short sentence. "
-                "This establishes source fidelity of implementation context, not novelty or experimental success. "
-                "Do not demand a complete bibliography, final optimized design or results before the first pilot."}
         self._models_checked([{"name": "implementation-evidence-review", "actor": "methods.work-reviewer",
-            "assignment": assignment, "normalizer": normalize, "validator": validate, "on_valid": integrate}],
+            "assignment": assignment, "normalizer": normalize, "validator": validate,
+            "on_valid": integrate, "on_validation_failure": settle}],
             stage="unit_review", task_kind="verification",
             on_contract_blocked=lambda name, error: contract_blocks.append(error))
 
