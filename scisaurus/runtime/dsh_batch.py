@@ -506,6 +506,38 @@ class DshAuthorClient:
                                "configuration_sha256": hashlib.sha256(canonical_bytes(self.config)).hexdigest()})
 
 
+def read_completed_structured_producer(job, *, config_sha256):
+    """Read immutable inputs and output from a settled structured producer."""
+    job = Path(job)
+    paths = [job, *(job / name for name in (
+        "receipt.json", "input", "work", "input/assignment.json",
+        "input/system-contract.txt", "work/response.json"))]
+    if any(path.is_symlink() for path in paths):
+        raise ValidationError("completed producer evidence is symlinked")
+    receipt = json.loads((job / "receipt.json").read_bytes())
+    assignment = json.loads((job / "input/assignment.json").read_bytes())
+    if (receipt.get("schema_version") != "dsh-batch-receipt-1"
+            or receipt.get("status") != "completed" or receipt.get("process_reaped") is not True
+            or not isinstance(receipt.get("model"), str) or not receipt["model"].strip()
+            or not isinstance(config_sha256, str) or len(config_sha256) != 64
+            or receipt.get("config_sha256") != config_sha256
+            or receipt.get("task_sha256") != hashlib.sha256(
+                DshStructuredProducerClient.task(None, assignment).encode()).hexdigest()
+            or set(receipt.get("input_sha256", {})) != {"assignment.json", "system-contract.txt"}
+            or not isinstance(receipt.get("usage"), dict)
+            or any(type(receipt["usage"].get(key)) not in (int, float)
+                   or not math.isfinite(receipt["usage"][key]) or receipt["usage"][key] < 0
+                   for key in ("model_calls", "input_tokens", "output_tokens"))):
+        raise ValidationError("completed producer receipt has no settled owner")
+    for name, digest in receipt["input_sha256"].items():
+        if hashlib.sha256((job / "input" / name).read_bytes()).hexdigest() != digest:
+            raise ValidationError("completed producer input digest differs")
+    output = (job / "work/response.json").read_bytes()
+    if hashlib.sha256(output).hexdigest() != receipt.get("outputs", {}).get("response.json"):
+        raise ValidationError("completed producer output digest differs")
+    return receipt, assignment, (job / "input/system-contract.txt").read_text(), json.loads(output)
+
+
 class DshStructuredProducerClient:
     """Author a file-backed structured deliverable under the controller contract."""
 

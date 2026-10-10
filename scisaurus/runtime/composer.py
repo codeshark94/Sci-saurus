@@ -1540,7 +1540,7 @@ class ComposerRunner:
             raise StateError("topic proposal recovery requires a unique topic stage")
         stage = stages[0]
         from scisaurus.runtime.topic_discovery import validate_topic_stage_config, _topic_prompt_refinement_projection
-        from scisaurus.runtime.dsh_batch import DshStructuredProducerClient, validate_batch_config
+        from scisaurus.runtime.dsh_batch import read_completed_structured_producer, validate_batch_config
         descriptor = validate_topic_stage_config(self._read_json_object(Path(stage["config_path"])))
         refinement = self._topic_refinement_context(stage)
         model = self._stage_model_config(stage, json.loads(Path(descriptor["model_config_path"]).read_text()))
@@ -1571,29 +1571,11 @@ class ComposerRunner:
                 raise StateError("completed proposal has a different scientific input or laboratory boundary")
             if receipt.get("status") != "completed":
                 raise StateError("the current proposal assignment has an unsettled producer receipt")
-            if (receipt.get("schema_version") != "dsh-batch-receipt-1"
-                    or not isinstance(receipt.get("model"), str) or not receipt["model"].strip()
-                    or not isinstance(receipt.get("input_sha256"), dict)
-                    or not isinstance(receipt.get("outputs"), dict)
-                    or not isinstance(receipt.get("usage"), dict)
-                    or any(type(receipt["usage"].get(key)) not in (int, float)
-                           or not math.isfinite(receipt["usage"][key]) or receipt["usage"][key] < 0
-                           for key in ("model_calls", "input_tokens", "output_tokens"))):
-                raise StateError("completed proposal has an invalid execution receipt")
-            if (receipt.get("config_sha256") != expected_config
-                    or receipt.get("task_sha256") != hashlib.sha256(DshStructuredProducerClient.task(None, assignment).encode()).hexdigest()):
-                raise StateError("completed proposal receipt has a different producer contract")
-            for name, digest in receipt.get("input_sha256", {}).items():
-                file = (job / "input" / name).resolve()
-                if (not file.is_relative_to((job / "input").resolve()) or not file.is_file()
-                        or hashlib.sha256(file.read_bytes()).hexdigest() != digest):
-                    raise StateError("completed proposal has altered immutable inputs")
-            if set(receipt.get("input_sha256", {})) != {"assignment.json", "system-contract.txt"}:
-                raise StateError("completed proposal receipt does not bind the full assignment")
-            output = job / "work/response.json"
-            if output.is_symlink() or not output.is_file() or hashlib.sha256(output.read_bytes()).hexdigest() != receipt.get("outputs", {}).get("response.json"):
-                raise StateError("completed proposal output does not match its execution receipt")
-            package = json.loads(output.read_bytes())
+            try:
+                receipt, assignment, _, package = read_completed_structured_producer(
+                    job, config_sha256=expected_config)
+            except (ValidationError, ValueError, OSError) as exc:
+                raise StateError("completed proposal has invalid producer evidence") from exc
             if (not isinstance(package, dict) or not isinstance(package.get("candidates"), list)
                     or len(package["candidates"]) != scope["candidate_count"]
                     or package.get("selected_id") not in {item.get("id") for item in package["candidates"] if isinstance(item, dict)}):
@@ -26218,6 +26200,23 @@ class ComposerRunner:
                 retained_review = self._load_topic_source_review(stage, review_scope)
                 if retained_review is not None:
                     topic_kwargs["resume_review"] = retained_review
+                elif isinstance(self.context.get(stage["id"], {}).get("retained_author_response_ref"), str):
+                    ref = self.context[stage["id"]]["retained_author_response_ref"]
+                    manifest, _, retained_author = self._read_verified_artifact_json(ref)
+                    if (manifest.get("author") != "command.composer"
+                            or retained_author.get("schema_version") != "topic-author-revalidation-1"):
+                        raise StateError("retained author response has no controller revalidation")
+                    owner = retained_author.get("assignment_owner") or {}
+                    current_orders = [{key: value for key, value in item.items() if key != "recovery_generation"}
+                                      for item in self.active_research_requests]
+                    owned_orders = [{key: value for key, value in item.items() if key != "recovery_generation"}
+                                    for item in owner.get("work_orders", [])]
+                    if (owner.get("workflow_id") != self.workflow["id"] or owner.get("stage_id") != stage["id"]
+                            or owner.get("topic_id") != (topic_refinement or {}).get("parent_topic_id")
+                            or owner.get("topic_cycle") != (topic_refinement or {}).get("cycle")
+                            or current_orders != owned_orders):
+                        raise StateError("retained author response belongs to a different current obligation")
+                    topic_kwargs["resume_author_response"] = deepcopy(retained_author["author_evidence"])
                 if specialist_reports:
                     topic_kwargs["specialist_reports"] = deepcopy(specialist_reports)
                 if (isinstance(topic_refinement, dict)
@@ -27977,6 +27976,144 @@ class ComposerRunner:
                 "validation_error": validation_error[:900],
             })
         return admitted
+
+    def _resume_disproven_topic_validation(self, completed, by_id):
+        """Revalidate a settled author revision before retaining a deterministic pivot."""
+        from scisaurus.runtime.topic_discovery import validate_retained_topic_author_response
+        from scisaurus.runtime.dsh_batch import read_completed_structured_producer
+
+        stage = next((item for item in by_id.values() if item.get("kind") == "topic_discovery"), None)
+        if stage is None:
+            return False
+        record = self.stage_records.get(stage["id"], {})
+        context = self.context.get(stage["id"], {})
+        traces = context.get("candidate_attempt_trace", [])
+        trace = traces[-1] if isinstance(traces, list) and traces else None
+        if (not isinstance(trace, dict) or trace.get("status") != "refinement_rejected"
+                or trace.get("rejection_type") != "refinement"
+                or record.get("verifier_outcome") != "not_evaluated"
+                or record.get("failure_class") != "scientific_review"
+                or not isinstance(context.get("topic_pivot"), dict)):
+            return False
+        pivot = context["topic_pivot"]
+        basis = pivot.get("scientific_basis") or {}
+        rejected = [{"topic_id": (trace.get("selected_topic") or {}).get("id"),
+                     "rejection_type": trace.get("rejection_type"), "rejection_reason": trace.get("error")}]
+        current_orders = getattr(self, "active_research_requests", None)
+        if current_orders is None:
+            return False
+        pivot_orders = [item for item in current_orders if isinstance(item, dict)]
+        if (pivot.get("status") != "required" or pivot.get("source_stage_id") != stage["id"]
+                or basis != {"kind": "topic_candidate_rejection", "retry_reason": "scientific_candidate_rejected",
+                             "rejected_candidates": rejected}
+                or len(pivot_orders) != 1
+                or pivot_orders[0].get("id") != f"auto-topic-pivot-{pivot.get('cycle')}"
+                or pivot_orders[0].get("source_stage_id") != stage["id"]
+                or record.get("failure_dossier_ref", "missing") not in pivot_orders[0].get("evidence_needed", "")):
+            return False
+        evidence = trace.get("model_response")
+        try:
+            validate_retained_topic_author_response(evidence)
+        except ValidationError:
+            return False
+        backend = evidence.get("backend", {})
+        receipt_path = Path(backend.get("receipt", ""))
+        if receipt_path.is_symlink() or any(parent.is_symlink() for parent in receipt_path.parents):
+            raise StateError("retained author receipt is symlinked")
+        receipt_path = receipt_path.resolve()
+        producer_root = (self.root / "topic-production").resolve()
+        if (backend.get("backend") != "dsh-batch-1"
+                or not receipt_path.is_relative_to(producer_root)
+                or receipt_path.name != "receipt.json"):
+            raise StateError("retained author response has a foreign producer receipt")
+        receipt, assignment, system, response = read_completed_structured_producer(
+            receipt_path.parent, config_sha256=backend.get("configuration_sha256"))
+        projected = {key: value for key, value in assignment.items() if key != "runtime_python"}
+        if (canonical_bytes(projected) != canonical_bytes(evidence["request"])
+                or system != evidence.get("system") or response != json.loads(evidence["response"])
+                or receipt.get("model") != evidence.get("model")
+                or receipt.get("usage") != evidence.get("usage")):
+            raise StateError("retained author response differs from its paid receipt")
+        parent = evidence["request"]["parent_candidate"]
+        if any(parent.get(key) != (context.get("topic") or {}).get(key)
+               for key in ("id", "research_question", "phenomenon", "domain")):
+            raise StateError("retained author response changed the current parent")
+        owner_ids = {item.get("id") for item in evidence["request"]["composer_repair_context"].get("work_orders", [])
+                     if isinstance(item, dict)}
+        rows = self.control._conn.execute(
+            "SELECT manifest_json FROM artifacts WHERE logical_id LIKE 'command/composer/checkpoints/%' "
+            "ORDER BY created_at DESC LIMIT 64").fetchall()
+        failed = prior = None
+        for row in rows:
+            manifest = json.loads(row["manifest_json"])
+            verified, digest, checkpoint = self._read_verified_artifact_json(manifest["artifact_ref"])
+            if (verified.get("author") != "command.composer"
+                    or checkpoint.get("workflow_id") != self.workflow["id"]):
+                continue
+            checkpoint_record = checkpoint.get("stages", {}).get(stage["id"], {})
+            checkpoint_context = checkpoint.get("context", {}).get(stage["id"], {})
+            if failed is None and (
+                    checkpoint_record.get("attempt_number") == record.get("attempt_number")
+                    and checkpoint_record.get("failure_dossier_ref") == record.get("failure_dossier_ref")
+                    and checkpoint_record.get("attempt_id") == record.get("attempt_id")
+                    and checkpoint_context.get("topic_pivot") == pivot
+                    and checkpoint.get("active_research_requests") == current_orders
+                    and canonical_bytes(checkpoint_context.get("candidate_attempt_trace")) == canonical_bytes(traces)
+                    and checkpoint.get("usage") == self.usage):
+                failed = (manifest["artifact_ref"], digest, checkpoint)
+            orders = checkpoint.get("active_research_requests", [])
+            owned = [item for item in orders if isinstance(item, dict) and item.get("id") in owner_ids
+                     and item.get("recovery_mode") == "authored_definition_repair"]
+            if (prior is None and owned and len(owned) == len(owner_ids)
+                    and len(orders) == len(owned)
+                    and checkpoint_record.get("attempt_count", 0) < record.get("attempt_count", 0)
+                    and checkpoint_context.get("topic") == context.get("topic")):
+                prior = (manifest["artifact_ref"], digest, checkpoint)
+            if failed is not None and prior is not None:
+                break
+        if failed is None or prior is None:
+            raise StateError("retained author response lacks an immutable failed and owned prior frontier")
+        dossier_manifest, _, dossier = self._read_verified_artifact_json(record["failure_dossier_ref"])
+        if (dossier_manifest.get("author") != "command.composer"
+                or dossier.get("stage_id") != stage["id"]
+                or dossier.get("attempt_number") != record.get("attempt_number")
+                or dossier.get("failure_class") != record.get("failure_class")
+                or dossier.get("project_dir") != (record.get("attempts") or [{}])[-1].get("project_dir")):
+            raise StateError("retained author response has a different failure dossier")
+        restored, audit = self._restore_topic_lineage_checkpoint(
+            failed[2], prior[2], stage["id"], "current deterministic validation accepts the exact paid author response")
+        recovery = self._publish("command/topic-author-revalidation/" + stage["id"] + "/" + evidence["response_sha256"],
+            "decision_note", {"schema_version": "topic-author-revalidation-1",
+                "failed_checkpoint_ref": failed[0], "failed_checkpoint_sha256": failed[1],
+                "prior_checkpoint_ref": prior[0], "prior_checkpoint_sha256": prior[1],
+                "failure_dossier_ref": record["failure_dossier_ref"], "author_evidence": deepcopy(evidence),
+                "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "scientific_admission": False, "usage": deepcopy(self.usage),
+                "assignment_owner": {"workflow_id": self.workflow["id"], "stage_id": stage["id"],
+                    "topic_id": parent["id"], "topic_cycle": prior[2]["active_research_requests"][0]["topic_cycle"],
+                    "work_orders": deepcopy(prior[2]["active_research_requests"])}}, "command.composer")
+        self.context = restored["context"]
+        self.stage_records = restored["stages"]
+        self.active_research_requests = restored.get("active_research_requests", [])
+        self.continuation_pending_stage_ids = set(restored.get("continuation_pending_stage_ids", []))
+        self.reopened_stage_ids = set(restored.get("reopened_stage_ids", []))
+        self.context[stage["id"]]["retained_author_response_ref"] = recovery["artifact_ref"]
+        self.stage_records[stage["id"]]["status"] = "retrying"
+        self.continuation_pending_stage_ids.add(stage["id"])
+        self.reopened_stage_ids.add(stage["id"])
+        for item in self.active_research_requests:
+            item["recovery_generation"] = item.get("recovery_generation", 0) + 1
+        self.departments.activate_work_orders(self.active_research_requests)
+        self.departments.retire_superseded_work_orders(
+            {item.get("id") for item in self.active_research_requests}, stage_ids={stage["id"]},
+            reason="superseded by receipt-bound deterministic validation reconciliation")
+        completed.clear()
+        completed.update(stage_id for stage_id, row in self.stage_records.items()
+                         if self._stage_releases_dependencies(row, stage_kind=by_id.get(stage_id, {}).get("kind")))
+        completed.difference_update(self.continuation_pending_stage_ids)
+        self.department_activity.append({**audit, "action": "revalidate_settled_topic_author_response",
+            "recovery_ref": recovery["artifact_ref"], "model_calls_dispatched": 0})
+        return True
 
     @staticmethod
     def _is_survey_evidence_contract_blocker(stage, error):
@@ -30536,6 +30673,8 @@ class ComposerRunner:
             completed = {stage_id for stage_id, row in self.stage_records.items()
                          if self._stage_releases_dependencies(
                              row, stage_kind=by_id.get(stage_id, {}).get("kind"))}
+            if self._resume_disproven_topic_validation(completed, by_id):
+                self._checkpoint("resume:paid_topic_author_response_revalidated", force=True)
             if self._restore_interrupted_completed_survey_acquisition(completed, by_id):
                 self._checkpoint("resume:completed_survey_acquisition_reused", force=True)
             restored_lineage_frontier = self._restore_unjustified_refinement_frontier(

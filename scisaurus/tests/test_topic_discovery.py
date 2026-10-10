@@ -757,11 +757,28 @@ class TopicDiscoveryTests(unittest.TestCase):
                         runner._repair_missing_topic_fields(
                             value, deadline=None, budget=TopicBudget(None, {}))
                     self.assertEqual(value, original)
+
                 else:
                     runner._repair_missing_topic_fields(
                         value, deadline=None, budget=TopicBudget(None, {}))
                     original["candidates"][0][field] = text
                     self.assertEqual(value, original)
+
+    def test_unchanged_question_cannot_be_a_refinement_identity_regression(self):
+        parent = package("objective")["candidates"][0]
+        parent["phenomenon"] = "Microstructure-dependent electric polarizability and load-bearing stiffness"
+        parent["research_question"] = "Can a periodic dielectric topology lower refractive index at equal stiffness?"
+        candidate = deepcopy(parent)
+        candidate["feasibility"] = "A bounded local calculation with an independent validator."
+        self.assertEqual(validate_topic_refinement(
+            parent, candidate, salvage_anchor=parent), [])
+        candidate["research_question"] = "Does microbial growth change with oxygen availability?"
+        with self.assertRaisesRegex(ValidationError, "no longer addresses"):
+            validate_topic_refinement(parent, candidate, salvage_anchor=parent)
+        candidate["research_question"] = parent["research_question"]
+        candidate["phenomenon"] = "Microbial growth"
+        with self.assertRaisesRegex(ValidationError, "must preserve"):
+            validate_topic_refinement(parent, candidate, salvage_anchor=parent)
 
     def test_topic_clients_preserve_route_generation_capacity(self):
         runner = TopicDiscoveryRunner({

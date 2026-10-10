@@ -74,6 +74,34 @@ iteration.
 | **Paper delivery** | Claim/evidence index, bibliography, figures, LaTeX source, rendered PDF, and a release proposal with provenance |
 | **Tools and environments** | Allowlisted programs, APIs, and MCP services with readiness checks and drift-aware bindings |
 
+## Open-source scientific toolkit
+
+The laboratory exposes the following tool routes to DSH. Availability is
+established by the selected profile's current attestation and operational probes;
+a recipe alone does not establish an installed or usable solver.
+
+| Tools | Purpose | Profile / execution boundary |
+|---|---|---|
+| **FreeCAD** | Parametric solids, STEP and editable FCStd geometry | Native CAD runtime |
+| **Gmsh, meshio** | Meshing, region tags and mesh/field transfer | Native meshing runtime |
+| **SfePy** | Diffusion, elasticity, homogenization and declared coupled formulations | Native continuum runtime |
+| **Meep, MPB** | Maxwell time-domain fields and periodic electromagnetic eigenmodes | Native waves runtime; formulation limits differ |
+| **MOOSE** | Declared multiphysics modules and coupled-field models | Extended Linux container; module and reference-case verification required |
+| **Elmer** | Thermal, structural and other supported finite-element formulations | Extended profile; native serial Elmer runtime |
+| **OpenFOAM** | Fluid flow and declared transport/thermal coupling | Extended Linux container |
+| **CalculiX, Code_Aster** | Structural finite-element calculations | Extended Linux containers |
+| **NumPy, SciPy, h5py, netCDF4, Matplotlib** | Numerical analysis, complete field extraction, data exchange and figures | Packages depend on the selected runtime; these are not physical solvers |
+| **LAMMPS, Quantum ESPRESSO, ASE** | Atomistic MD, DFT and atomistic workflow integration | Not provisioned or attested by the current laboratory profiles |
+
+DSH discovers the available labels with `list_runtimes` and `inspect_runtime`,
+selects a physical formulation, runs it through the receipt-bound workbench,
+and retains native inputs, logs and raw fields. Geometry or field conversion
+does not establish physical coupling. See [solver selection](docs/145-metamaterial-solvers.md),
+[laboratory preparation](docs/140-metamaterial-laboratory.md), and the
+[native](config/laboratory-metamaterial.example.json) /
+[extended](config/laboratory-multiphysics.example.json) profiles for installation,
+probes and model limits.
+
 ## Evidence and operating boundaries
 
 - **The Principal owns the mandate and release boundary.** Live provider access

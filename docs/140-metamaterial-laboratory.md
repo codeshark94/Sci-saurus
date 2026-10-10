@@ -494,6 +494,15 @@ session, and each session occupies one of the shared three model dispatch slots.
 Experiment feasibility estimates count model calls inside the scientific
 execution itself, excluding controller production and review work.
 
+A settled scoped author response can be revalidated after a deterministic
+validation change. Recovery requires the exact paid receipt, immutable failed
+checkpoint, original owned frontier, and rejection-bound pivot. Later independent
+scientific decisions are not eligible. Replay binds the original objective,
+work-order lineage, topic identity and current scientific/laboratory scope;
+changed scope fails closed. Historical failures and usage remain recorded.
+The retained response passes normal schema, feasibility and independent review
+again and does not establish scientific admission by itself.
+
 ## Active-time allocation
 
 A stopped managed mission can receive an immutable operator execution-control

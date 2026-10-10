@@ -1070,6 +1070,38 @@ def _single_topic_candidate_response(value):
     return deepcopy(candidate)
 
 
+def validate_retained_topic_author_response(evidence):
+    """Recheck a paid scoped revision without accepting its scientific claims."""
+    if not isinstance(evidence, dict) or evidence.get("finish_reason") != "stop":
+        raise ValidationError("retained topic author response did not finish")
+    text = evidence.get("response")
+    if (not isinstance(text, str) or evidence.get("response_sha256")
+            != hashlib.sha256(text.encode()).hexdigest()):
+        raise ValidationError("retained topic author response hash differs")
+    request = evidence.get("request")
+    if (not isinstance(request, dict)
+            or request.get("assignment") != "repair_selected_topic_candidate"
+            or (request.get("composer_repair_context") or {}).get("preserve_research_question") is not True):
+        raise ValidationError("retained topic author response has no owned identity-preserving assignment")
+    parent = request.get("parent_candidate")
+    parsed = json_object(text, "retained topic author response")
+    if not isinstance(parsed, dict) or set(parsed) != {"candidate"}:
+        raise ValidationError("retained topic author response must contain one candidate")
+    candidate = parsed["candidate"]
+    if (not isinstance(parent, dict) or not isinstance(candidate, dict)
+            or any(candidate.get(key) != parent.get(key)
+                   for key in ("id", "research_question", "phenomenon", "domain"))):
+        raise ValidationError("retained topic author response changes its scientific identity")
+    package = {"schema_version": SCHEMA_VERSION, "objective": request["principal_objective"],
+               "candidates": [deepcopy(candidate)], "selected_id": candidate["id"],
+               "selection_rationale": "Scoped revision of the retained candidate."}
+    validate_topic_package(package, candidate_count=1)
+    validate_topic_refinement(parent, candidate, salvage_anchor=parent)
+    runtime = request.get("runtime_context") or {}
+    validate_topic_feasibility(_materialize_foundry_capability_requirements(package, runtime), runtime)
+    return parsed
+
+
 def _repair_known_candidate_field_aliases(package):
     """Canonicalize only explicit, lossless aliases from model JSON."""
     if not isinstance(package, dict) or not isinstance(package.get("candidates"), list):
@@ -2428,7 +2460,9 @@ def validate_topic_refinement(parent, candidate, *, require_structural_pivot=Fal
                           - _MISSION_BOILERPLATE)}
         )
         required_identity_matches = min(3, len(identity_tokens))
-        if (required_identity_matches
+        question_changed = (_refinement_value(candidate.get("research_question"))
+                            != _refinement_value(lineage_parent.get("research_question")))
+        if (question_changed and required_identity_matches
                 and len(identity_tokens.intersection(candidate_question_tokens))
                 < required_identity_matches):
             raise ValidationError(
@@ -6015,7 +6049,8 @@ class TopicDiscoveryRunner:
     def _run_impl(self, objective, *, candidate_count=4, max_attempts=3,
             repair_mode="bounded", recent_papers=None, runtime_context=None,
             bibliography=None, sampling_seed=None, maturity_review_rounds=0,
-            refinement_context=None, budgets=None, specialist_reports=None, intake_mode="portfolio", resume_review=None):
+            refinement_context=None, budgets=None, specialist_reports=None, intake_mode="portfolio", resume_review=None,
+            resume_author_response=None):
         _text(objective, "topic objective", public=False)
         _validate_topic_intake(intake_mode, candidate_count, maturity_review_rounds)
         if repair_mode not in {"bounded", "until_deadline"}:
@@ -6085,6 +6120,26 @@ class TopicDiscoveryRunner:
                 raise ValidationError("retained source review does not own the current topic assignment")
             sampling_seed = resume_review["sampling_seed"]
             recent_papers = deepcopy(resume_review.get("recent_papers", []))
+        if resume_author_response is not None:
+            if resume_review is not None:
+                raise ValidationError("retained author and source review cannot both own the proposal")
+            validate_retained_topic_author_response(resume_author_response)
+            parent = (refinement_context or {}).get("parent_topic")
+            owned_parent = resume_author_response["request"]["parent_candidate"]
+            if (not isinstance(parent, dict)
+                    or any(parent.get(key) != owned_parent.get(key)
+                           for key in ("id", "research_question", "phenomenon", "domain"))):
+                raise ValidationError("retained author response belongs to another parent")
+            request = resume_author_response["request"]
+            projected = _topic_prompt_refinement_projection(refinement_context)
+            old_runtime = _topic_prompt_runtime_projection(request.get("runtime_context") or {})
+            current_runtime = _topic_prompt_runtime_projection(runtime_context or {})
+            if (request.get("principal_objective") != objective
+                    or request["composer_repair_context"].get("work_orders") != projected.get("work_orders")
+                    or request["composer_repair_context"].get("review_owner_evidence") != projected.get("review_owner_evidence")
+                    or any(old_runtime.get(key) != current_runtime.get(key) for key in (
+                        "laboratory", "scientific_input_artifacts", "scientific_input_contract", "research_feasibility"))):
+                raise ValidationError("retained author response has a different scientific assignment or runtime")
         if self.author_client is not None and enforce_model_cost_limits():
             raise ValidationError("DSH topic production requires a provider relay to enforce model cost limits")
         recent_papers = list(recent_papers or [])
@@ -6836,6 +6891,17 @@ class TopicDiscoveryRunner:
                         elapsed_seconds=0, finish_reason="stop", response_metadata={"backend": "retained-source-review"})
                     budget.events.append({"role": "topic_discovery", "status": "retained_for_review",
                                           "package_sha256": retained["package_sha256"]})
+                elif resume_author_response is not None:
+                    retained_author = resume_author_response
+                    resume_author_response = None
+                    self._source_review_checkpoint = None
+                    retained_proposal_active = False
+                    result = ModelResult(text=retained_author["response"], model=retained_author["model"],
+                        usage={"model_calls": 0, "input_tokens": 0, "output_tokens": 0},
+                        elapsed_seconds=0, finish_reason="stop", response_metadata={
+                            "backend": "retained-author-response", "original_evidence": retained_author})
+                    budget.events.append({"role": "topic_discovery", "status": "retained_for_validation",
+                                          "response_sha256": retained_author["response_sha256"]})
                 else:
                     self._source_review_checkpoint = None
                     retained_proposal_active = False
@@ -6873,7 +6939,8 @@ class TopicDiscoveryRunner:
                 "backend": deepcopy(result.response_metadata),
             }
             try:
-                if (result.response_metadata or {}).get("backend") != "retained-source-review":
+                if (result.response_metadata or {}).get("backend") not in {
+                        "retained-source-review", "retained-author-response"}:
                     budget.record_model_result(result)
             except QuotaExceededError as exc:
                 candidate_attempt_trace.append({"attempt": attempt + 1,
