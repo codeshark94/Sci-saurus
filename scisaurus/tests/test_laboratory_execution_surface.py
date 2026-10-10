@@ -91,8 +91,10 @@ print(json.dumps({'solver':json.loads(x.stdout)}))
         fixture.setUp()
         self.addCleanup(fixture.tearDown)
         config = fixture.config()
-        for client_type, output in ((DshAuthorClient, {'executor.py': b"print('source')", 'intent.json': b'{}'}),
-                                    (DshValidatorClient, {'validator.py': b"print('validator')"})):
+        for client_type, output, analysis in (
+                (DshAuthorClient, {'executor.py': b"print('source')", 'intent.json': b'{}'}, False),
+                (DshAuthorClient, {'executor.py': b"print('source')", 'intent.json': b'{}'}, True),
+                (DshValidatorClient, {'validator.py': b"print('validator')"}, False)):
             client = client_type(config, root=self.root / client_type.__name__, runtime_python=sys.executable,
                                  laboratory=self.binding)
             self.assertTrue(client.runner.root.is_dir())
@@ -101,6 +103,8 @@ print(json.dumps({'solver':json.loads(x.stdout)}))
                 seen.update(task=task, **options)
                 return {'files': output, 'usage': {'model_calls': 1}, 'receipt': 'owned', 'elapsed_seconds': 1}
             prompt = {'configured_input': {'science': 7}}
+            if analysis:
+                prompt['configured_input']['scientific_software'] = {'solver_observations': {'schema_version': 'solver-observations-1'}}
             with patch.object(client.runner, 'run', side_effect=run):
                 client.complete(system='', prompt=json.dumps(prompt))
             context = json.loads(seen['inputs']['laboratory.json'])
@@ -108,6 +112,10 @@ print(json.dumps({'solver':json.loads(x.stdout)}))
             self.assertGreater(context['host_resources']['storage']['free_bytes'], 0)
             self.assertIn('SCI_LABORATORY_RUNTIMES', context['execution']['runtime_access'])
             self.assertIn('laboratory.json', seen['task'])
+            self.assertNotIn('scientific_run', context['execution']['containers'])
+            if client_type is DshAuthorClient:
+                self.assertEqual('analyses controller-produced solver_observations' in seen['task'], analysis)
+                self.assertEqual('Invoke selected established native' in seen['task'], not analysis)
             self.assertNotIn('executor_source', canonical_bytes(context).decode())
 
     def test_admission_registration_and_replay_preserve_solver_binding(self):

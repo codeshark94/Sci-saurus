@@ -126,7 +126,7 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         raise ValidationError("deterministic replay produced non-identical output")
     document = validate_program_output(
         json.loads(raw_replays[0]), candidate["experiment_intent"],
-        configured_input.get("work_orders", []))
+        configured_input.get("work_orders", []), configured_input=configured_input)
     admitted_output = canonical_bytes(document)
     digest = hashlib.sha256(admitted_output).hexdigest()
     if digest != expected:

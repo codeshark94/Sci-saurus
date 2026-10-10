@@ -239,7 +239,7 @@ def normalize_program_output(value):
     return value
 
 
-def validate_program_output(value, experiment, work_orders=None):
+def validate_program_output(value, experiment, work_orders=None, *, configured_input=None):
     work_orders = validate_work_orders(work_orders)
     output_fields = set(PROGRAM_OUTPUT_FIELDS)
     allowed_output_fields = output_fields | set(PROGRAM_OUTPUT_OPTIONAL_FIELDS)
@@ -362,6 +362,8 @@ def validate_program_output(value, experiment, work_orders=None):
         if len(matches) < requirement["min_count"]:
             raise ValidationError("experiment output omits a required asset")
     normalize_program_output(value)
+    from scisaurus.runtime.solver_observations import validate_solver_observations
+    validate_solver_observations(value, configured_input)
     # The executable result is admitted on reproducibility and independent
     # recalculation first.  A quality contract is a substantive publication
     # floor, not a pre-execution response-format gate: an author may omit the
@@ -889,7 +891,8 @@ def completed_experiment_result_proof(project_dir):
         if digest != run.get("raw_results_sha256") or canonical_bytes(candidate) != raw:
             return None
         experiment, orders = config["experiment"], config.get("work_orders", [])
-        validate_program_output(candidate, experiment, orders)
+        validate_program_output(candidate, experiment, orders,
+                                configured_input=experiment["execution"]["input"])
         deterministic = read(run["deterministic_validation_ref"])
         validated = validate_deterministic_validation(
             {key: value for key, value in deterministic.items() if key != "execution_ref"},
@@ -991,7 +994,8 @@ def review_context_capacity_proof(project_dir):
         runner = object.__new__(ExperimentRunner)
         runner.experiment = config["experiment"]
         runner.work_orders = config.get("work_orders", [])
-        validate_program_output(candidate, runner.experiment, runner.work_orders)
+        validate_program_output(candidate, runner.experiment, runner.work_orders,
+                                configured_input=runner.experiment["execution"]["input"])
         validated = validate_deterministic_validation(
             {key: value for key, value in deterministic.items() if key != "execution_ref"},
             runner.experiment, digest)
@@ -1178,7 +1182,8 @@ class ExperimentRunner(ExecutionRuntime):
         result, ref = self.operations.run(self.bindings["execution"], {"input": payload}, self._call,
             operator="methods.experiment-operator")
         self.time_policy.observe("production", time.monotonic() - started)
-        candidate = validate_program_output(result["document"], self.experiment, self.work_orders)
+        candidate = validate_program_output(result["document"], self.experiment, self.work_orders,
+                                            configured_input=payload["configured_input"])
         self.execution_refs.append(ref)
         self._executed_configured_input = deepcopy(payload["configured_input"])
         return candidate

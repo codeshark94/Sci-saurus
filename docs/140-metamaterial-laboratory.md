@@ -55,7 +55,38 @@ candidates retain the existing import restrictions. All generated programs retai
 the deny-by-default sandbox, no-network policy, finite watchdog and resource limits.
 The execution context distinguishes declared runtime limits from the preview/replay
 limits inherited by native children. Container runtimes use controller-owned
-SoftwareWorkbench `scientific_run`, not direct Docker access from a native script.
+SoftwareWorkbench `run` with `purpose: scientific_computation`, not direct Docker
+access from a native script.
+
+Container-backed studies perform the small design and baseline solves through
+the Workbench, then analyse their retained fields. Binary fields are extracted
+to complete numeric JSON through a receipt-bound controller operation. Selected
+computation source, input, captured stdout and full output are sealed into a
+`solver-observations-1` bundle. The executor and independent validator receive
+the same frozen bundle. Admission, registered execution and completed-result
+revalidation reject omitted, duplicated or substituted raw fields. Observation
+rows preserve each receipt's exact `source_record_id` and `source_values`;
+conditions and evidence roles remain author-declared and scientifically reviewed.
+Upstream calibration does not become candidate performance through this binding.
+A changed physical design needs a changed solver source or input and a controller
+computation; unchanged verified receipts are retained evidence, not fresh solves.
+
+Selected artifact inputs retain their producing run receipts through
+every extraction or conversion step. `inputs[].source_receipt_ref` pins the
+producer when several successful runs emitted identical bytes; an older input
+without this field resolves only when the current receipt graph has one owner.
+Missing, ambiguous, failed or cyclic dependencies are rejected. Cached selection
+rehashes only the selected dependency graph, while all diagnostic receipt
+identities remain checked and retained.
+
+Repair leads, evidence authors and verifiers retain the complete laboratory
+inventory. Cached software choices revalidate their selected computation
+dependencies rather than requiring every unused installation to remain available.
+Recovery diagnostics stay in the failure dossier and structured repair plan;
+they do not alter the scientific objective solely because an execution error
+message changed. Small experiments have no implicit figure-count requirement.
+Explicit authored asset requirements and publication quality floors remain
+separate from computational validity.
 
 ## Concept-led design iterations
 

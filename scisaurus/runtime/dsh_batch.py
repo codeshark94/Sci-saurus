@@ -577,10 +577,17 @@ class DshAuthorClient:
                 "deliverable; the two files are. Experimental admission is performed independently by the controller.")
         if self.laboratory is not None:
             task += (" Read laboratory.json before implementation. It lists the attested installed solvers, "
-                     "current host capacity and exact SCI_LABORATORY_RUNTIMES invocation interface. "
-                     "The generic runtime is an orchestration host. Invoke established solvers with their "
-                     "declared interpreters; do not rebuild their physics solvers in numpy or relabel old "
-                     "calibration outputs as a new design. Use the same interface in exported executor.py.")
+                     "current host capacity and execution interfaces. Do not rebuild established physics "
+                     "solvers in numpy or relabel old calibration outputs as a new design.")
+            software = base.get("configured_input", {}).get("scientific_software") or {}
+            if software.get("solver_observations") is not None:
+                task += (" This assignment analyses controller-produced solver_observations. Preserve their "
+                         "complete receipt-bound raw fields in executor.py; the controller has executed the "
+                         "container calculations. Do not launch Docker or repeat these solves from the executor.")
+            else:
+                task += (" The generic runtime is an orchestration host. Invoke selected established native "
+                         "solvers with their declared interpreters through SCI_LABORATORY_RUNTIMES. "
+                         "Use the same interface in exported executor.py; container solvers require controller run operations.")
         result = self.runner.run(task, inputs=inputs,
             seed_files=seed, outputs=["executor.py", "intent.json"],
             deadline=time.monotonic() + self.timeout_seconds)

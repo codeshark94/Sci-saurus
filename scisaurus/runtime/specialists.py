@@ -299,7 +299,12 @@ SOFTWARE_SELECTION_SYSTEM = (
     "justify a feasible scale. A generic CPU benchmark is not solver throughput, and the presence "
     "of GPU, Docker or MPI tooling does not prove a working scientific runtime. "
     "For reuse, run the bounded scientific computation needed for the "
-    "declared question and preserve its actual input and output. Never call stored upstream data a "
+    "declared question and preserve its actual input and output. Container-only solvers execute through "
+    "these controller tools: produce the smallest "
+    "current-design and matched-baseline calculation here and extract complete numeric fields into JSON "
+    "when outputs are binary. The later executor analyses those immutable fields; it cannot invoke Docker. "
+    "Keep operational verification separate from actual concept observations, and do not require a full "
+    "optimization or final robustness study before this small pilot. Never call stored upstream data a "
     "new simulation. A custom model needs source-bound mathematical justification and an explicit "
     "explanation of why established candidates are unsuitable; unavailable prerequisites require "
     "hold, not an invented fallback. Respond with only one JSON object, without markdown or "
@@ -817,6 +822,8 @@ def _verifier_repair_packet(value, *, detail="full"):
         if key in value and not isinstance(value[key], (dict, list))
     }
     output["candidate_program"] = _repair_candidate_program(value)
+    if isinstance(value.get("laboratory"), dict):
+        output["laboratory"] = _preserve_response_value(value["laboratory"])
     output["question_alignment"] = _preserve_response_value(value.get("question_alignment", {}))
     output["foundry_execution_evidence"] = _preserve_response_value(value.get("foundry_execution_evidence", {}))
     output["failure_lineage"] = _bounded_value(
@@ -1720,6 +1727,8 @@ def repair_adjudication_evidence_document(repair_packet, reviewer_reports=(), *,
         },
         "topic": _bounded_value(repair_packet.get("topic", {}), max_depth=3,
                                 max_keys=16, max_items=6, max_text=1000),
+        **({"laboratory": _preserve_response_value(repair_packet["laboratory"])}
+           if isinstance(repair_packet.get("laboratory"), dict) else {}),
         "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
         "foundry_execution_evidence": _preserve_response_value(repair_packet.get("foundry_execution_evidence", {})),
         "plan_review_failure": _bounded_value(
@@ -1873,6 +1882,8 @@ def build_repair_evidence_prompt(assignment, repair_packet, request, *, prior_re
         "repair_evidence_request": _preserve_response_value(request),
         "scientific_input_recovery": scientific_input_recovery_contract(),
         "topic": _preserve_response_value(repair_packet.get("topic", {})),
+        **({"laboratory": _preserve_response_value(repair_packet["laboratory"])}
+           if isinstance(repair_packet.get("laboratory"), dict) else {}),
         "evidence_experiment_intent": _preserve_response_value(last.get("experiment_intent", {})),
         "candidate_program": _repair_candidate_program(repair_packet),
         "prior_evidence_review": _preserve_response_value(prior_review),

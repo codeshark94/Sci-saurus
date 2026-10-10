@@ -420,7 +420,12 @@ def laboratory_context(laboratory, *, attestation=None):
             "probe_modules": list(runtime["probe_modules"]),
             "limitations": list(runtime["limitations"]),
             "commands": sorted(runtime.get("commands", {})),
-            "command_access": "Read the controller-injected JSON mapping SCI_SOLVER_COMMANDS and use subprocess argument lists; never install or guess host paths.",
+            "command_access": (
+                "Request the controller run operation with this runtime label and purpose=scientific_computation. "
+                "Retain declared input/output artifacts and extract complete numeric fields in a subsequent "
+                "receipt-bound run; native executors cannot launch Docker."
+                if runtime["kind"] == "container" else
+                "Read the controller-injected JSON mapping SCI_SOLVER_COMMANDS and use subprocess argument lists; never install or guess host paths."),
             "execution_platform": (runtime.get("container") or {}).get("platform", platform.system()),
             "controller_attested": (record.get("verified") is True
                                     and record.get("probe", {}).get("mode") == ("container" if runtime["kind"] == "container" else "sandbox-exec")),
@@ -1324,7 +1329,7 @@ class LaboratoryBinding:
                                                "file_size_bytes": DEFAULT_FILE_SIZE},
                     "runtime_access": "json.loads(os.environ['SCI_LABORATORY_RUNTIMES']) maps attested native runtime labels to executable and environment. Invoke a workspace script with subprocess argument lists using that executable, env={**os.environ, **runtime['environment']}, cwd in the workspace, finite timeout and captured stdout/stderr. Runtime environment may contain SCI_SOLVER_COMMANDS for native solver commands. Keep launch and solver imports under a __main__ guard for spawn-based dependencies; retain the controller-inherited private TMPDIR and workspace cache variables.",
                     "implementation": "Write geometry, solver configuration, invocation and result-processing scripts. Use the established solver for physical calculations; do not reconstruct its numerical solver or substitute calibration outputs for new designs. Retain exact solver source, inputs, commands, raw outputs and failures for every calculation.",
-                    "containers": "Container runtimes require controller SoftwareWorkbench scientific_run; native author/replay scripts cannot launch containers directly.",
+                    "containers": "Container runtimes require the controller SoftwareWorkbench run operation with purpose=scientific_computation; native author/replay scripts cannot launch containers directly.",
                     "resources": "Capacity is an observation, not a reservation. Native children share the outer finite watchdog, CPU, memory and file limits. Use declared runtime limits and current available resources when choosing a small pilot; no model calls from executors.",
                 }}
 

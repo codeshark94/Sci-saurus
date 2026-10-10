@@ -1143,6 +1143,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                          and parsed_brief.get("study_evidence_contract") == study_evidence_contract()
                          and not INTENT_FIELDS.issubset(required_intent or {}))
     requires_source_data = _requires_source_data_manifest(brief)
+    solver_manifest = test_input.get("scientific_software", {}).get("solver_observations") if isinstance(test_input, dict) else None
     analysis_descriptions = analysis_output_contract()
     analysis_shape = {key: analysis_descriptions[key] for key in sorted(ANALYSIS_FIELDS)}
     prompt = {
@@ -1187,7 +1188,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
                 "primary_outcomes": [{"id": "identifier", "definition": "text", "unit": "text",
                                       "direction": "higher|lower|descriptive", "threshold": None}],
                 "limitations": ["text", "..."],
-                "required_assets": [{"role": "figure", "media_types": ["image/png"], "min_count": 3}],
+                "required_assets": [],
                 "reviewers": [{"id": "identifier", "focus": "text"}, {"id": "identifier", "focus": "text"}],
                 "stage_seconds": {"setup": 60, "supervision": 30, "production": 90,
                                   "unit_review": 60, "integrated_review": 180, "reassessment": 90},
@@ -1257,7 +1258,7 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "primary_outcomes": [{"id": "tail_error", "definition": "95th-percentile absolute error.",
                                   "unit": "error", "direction": "lower", "threshold": None}],
             "limitations": ["Only the declared sampling process and estimators are covered."],
-            "required_assets": [{"role": "figure", "media_types": ["image/png"], "min_count": 3}],
+            "required_assets": [{"role": "figure", "media_types": ["image/png"], "min_count": 1}],
             "reviewers": [{"id": "statistical_method", "focus": "Estimator definitions and numerical traceability."},
                           {"id": "adversarial_claims", "focus": "Overstatement and missing limitations."}],
             "stage_seconds": {"setup": 60, "supervision": 30, "production": 90, "unit_review": 60,
@@ -1291,7 +1292,9 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
             "the validator must implement the exact {'readiness_probe': true} handshake by returning "
             "exactly {'status': 'ready'}; this handshake proves launchability only and never accepts data",
             "the engine must be fully deterministic: one seed, no clock, no unordered iteration",
-            "the executor must emit at least three image/png figure assets with captions",
+            "Declare assets needed to inspect the measurement and comparison; a small pilot may have no "
+            "figure assets. Honor explicit required_assets and quality_contract floors. Do not create "
+            "redundant figures to satisfy a generic presentation count.",
             "write each asset into the current working directory with Path(relative_path).write_bytes; "
             "the assets array must contain exactly id, path, sha256, role, media_type and caption; "
             "never embed image bytes or base64 data in stdout",
@@ -1372,6 +1375,25 @@ def candidate_prompt(brief, runtime_packages, test_input, required_intent=None, 
         "source_ref must exactly match evidence_plan_source_refs from the current controller-owned input. "
         "Each planned obligation must be independently checked under its exact validator_check_id, even when its check fails. "
         "Preserve every claim_limit and each not_applicable method verbatim in output limitations.")
+    if solver_manifest is not None:
+        from scisaurus.runtime.solver_observations import solver_observation_manifest
+        if solver_manifest != solver_observation_manifest(test_input["scientific_software"]):
+            raise ValidationError("controller solver observations do not match their selected receipts")
+        prompt["executor_output_exact_shapes"]["observations"] = [{
+            "source_record_id": "exact solver_observations record source_record_id",
+            "source_values": "complete exact record source_values object, including all numeric fields",
+            "condition": "agent-declared physical condition, bound to the actual solver input",
+        }]
+        prompt["constraints"].extend([
+            "This is analysis of controller-executed synthetic solver fields. Preserve every "
+            "configured_input.scientific_software.solver_observations record exactly once with "
+            "source_record_id/source_values, without sampling, substitution or added numeric fields. "
+            "Declare run_count from the number of complete computation records, not grid nodes or array entries.",
+            "Assign evidence roles and condition labels from the exact run source/input and the frozen design. "
+            "An operational calibration is a control, not candidate performance. If the existing runs cannot "
+            "answer the declared comparison, request the missing design computations through the controller "
+            "before analysis; never invent a solve or replace the established solver.",
+        ])
     if requires_source_data:
         prompt["constraints"].extend([
             "This experiment depends on empirical source data. Use only configured_input.source_data_manifest; "
@@ -5231,7 +5253,8 @@ class CapabilityFoundry:
                     raise ValidationError("executor did not return a JSON document") from exc
                 document = validate_program_output(
                     document, attempt_value["experiment_intent"],
-                    payload_value["configured_input"].get("work_orders", []))
+                    payload_value["configured_input"].get("work_orders", []),
+                    configured_input=payload_value["configured_input"])
                 _validate_source_observation_binding(
                     document, payload_value["configured_input"])
                 attempt_value.pop("validator_source", None)
@@ -5525,10 +5548,6 @@ class CapabilityFoundry:
         declared = {item["id"] for item in candidate["experiment_intent"]["primary_outcomes"]}
         if declared - metrics:
             findings.append({"severity": "blocking", "finding": "declared outcome missing from program metrics"})
-        figures = [item for item in document.get("assets", [])
-                   if isinstance(item, dict) and item.get("role") == "figure"]
-        if len(figures) < 3:
-            findings.append({"severity": "blocking", "finding": "fewer than three figure assets"})
         if not document.get("limitations"):
             findings.append({"severity": "blocking", "finding": "program reports no limitations"})
         return {"status": "rejected" if findings else "admitted", "findings": findings}

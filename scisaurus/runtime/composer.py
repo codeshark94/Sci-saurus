@@ -4244,14 +4244,12 @@ class ComposerRunner:
             "repair_priority": "immediate",
             "objective": (
                 "Diagnose, patch, and rerun the failed computational experiment. "
-                f"{repair_instruction} "
-                + ("Independent review evidence: " + " | ".join(reviewer_evidence[:5])
-                   if reviewer_evidence else "Failure evidence: " + str(error)[:900])
+                f"{repair_instruction}"
             )[:1800],
             "why": (
                 "The generated capability failed before producing an observation. The next bounded action "
                 "is a topic-preserving, evidence-directed Methods source repair. "
-                f"Gate={prior_gate}; this is not a validator-only retry."
+                "The immutable failure dossier records the failed gate and diagnostics."
             )[:1800],
             "success_condition": (
                 "The repaired executor and validator run in a fresh namespace, every primary outcome "
@@ -7437,9 +7435,10 @@ class ComposerRunner:
             "capability_foundry": ({
                 "enabled": True,
                 "execution_boundary": (
-                    "Upstream CAD and simulation run through controller operations under exact attested runtime labels. "
-                    "Retained artifact hashes and extracted fields feed downstream deterministic seeded Python analysis "
-                    "with the exact listed packages and no network or subprocess access. Generated solver observations "
+                    "Native CAD and simulation may run from authored orchestration scripts through exact attested "
+                    "laboratory runtime labels, with bounded subprocess access. Container solvers run through "
+                    "controller SoftwareWorkbench operations. Retain source, input, commands and complete raw output "
+                    "for deterministic analysis and replay. Network access and model calls remain forbidden. Solver observations "
                     "are synthetic intermediates, not pre-existing empirical inputs."
                     if sealed_laboratory else
                     "deterministic seeded Python with no network or subprocess access"),
@@ -13273,6 +13272,8 @@ class ComposerRunner:
         from scisaurus.runtime.capability_foundry import validator_output_contract
         packet = {
             "schema_version": "capability-repair-packet-1",
+            **({"laboratory": self.laboratory_binding.context()}
+               if getattr(self, "laboratory_binding", None) is not None else {}),
             "stage_id": stage.get("id"),
             "continuation_cycle": self.continuation_cycles,
             "failure_lineage": failure_lineage,
@@ -13491,6 +13492,7 @@ class ComposerRunner:
         packet["review_input_sha256"] = self._capability_repair_review_input_sha256(packet)
         packet["science_input_sha256"] = hashlib.sha256(canonical_bytes({
             "stage_id": stage.get("id"),
+            **({"laboratory": packet["laboratory"]} if "laboratory" in packet else {}),
             "topic": packet.get("topic"),
             "experiment_intent": intent,
             "admitted_model_definition": (packet.get("admitted_model_definition") or {}).get("definition"),
@@ -13534,6 +13536,8 @@ class ComposerRunner:
         })).hexdigest()
         complete_evidence = {name: packet.pop(name, {}) for name in (
             "foundry_execution_evidence", "admitted_model_definition")}
+        if "laboratory" in packet:
+            complete_evidence["laboratory"] = packet.pop("laboratory")
         packet = self._capability_repair_projection(
             packet, max_depth=9, max_text=CAPABILITY_REPAIR_SOURCE_CHARS)
         packet.update(complete_evidence)
@@ -14166,6 +14170,7 @@ class ComposerRunner:
             )},
             "experiment_intent": intent,
             "candidate_sources": source_identity,
+            **({"laboratory": packet["laboratory"]} if "laboratory" in packet else {}),
             "question_alignment": packet.get("question_alignment"),
             "question_alignment_rule": RESEARCH_QUESTION_ALIGNMENT_RULE,
             "program_snapshot": program_identity,
@@ -14640,12 +14645,24 @@ class ComposerRunner:
         selected = evidence["selected_operations"]
         strategy = evidence["selection"]["strategy"]
         if strategy == "reuse":
+            from scisaurus.runtime.software_workbench import selected_receipt_closure
+            refs = [evidence["selection"].get("environment_ref"), evidence["selection"].get("example_ref"),
+                    *evidence["selection"].get("computation_refs", [])]
+            if any(ref is not None for ref in refs):
+                selected = selected_receipt_closure(
+                    [*selected, *evidence.get("discovery_and_diagnostics", [])], refs)
             execution_contract = (
                 "Use the selected established software mechanisms and retained computations as source-bound controls. "
                 "Do not replace the package mechanism with copied or invented equations. "
                 "New designs and scientific parameters require fresh solver execution through the controller-bound "
                 "laboratory runtime interface in the authored executor. Retain source, input, command and "
                 "complete raw outputs; do not relabel old controls as new observations.")
+            if not evidence.get("laboratory"):
+                execution_contract = (
+                    "Reuse the exact acquired software computations as source-bound inputs. "
+                    "Do not replace the package mechanism with copied or invented equations. "
+                    "New scientific parameters require a new controller-recorded software computation, "
+                    "not relabelled old outputs.")
         elif strategy == "custom_model":
             execution_contract = (
                 "Implement the admitted source-bound mathematical specification as a custom model. "
@@ -14663,7 +14680,7 @@ class ComposerRunner:
                 if "files" in result:
                     result["files_sha256"] = hashlib.sha256(canonical_bytes(result.pop("files"))).hexdigest()
                 result.pop("steps", None)
-        return {"assessment_ref": assessment["artifact_ref"], "selection": evidence["selection"],
+        projected = {"assessment_ref": assessment["artifact_ref"], "selection": evidence["selection"],
                 "operations": _preserve_response_value(selected),
                 "host_environment_checks": _preserve_response_value([
                     row for row in evidence.get("discovery_and_diagnostics", [])
@@ -14675,6 +14692,23 @@ class ComposerRunner:
                     "laboratory_config_sha256": evidence.get("laboratory_config_sha256")}
                    if evidence.get("laboratory") else {}),
                 "execution_contract": execution_contract}
+        if strategy == "reuse":
+            from scisaurus.runtime.solver_observations import solver_observation_manifest
+            manifest = solver_observation_manifest(projected)
+            if manifest is not None:
+                projected["solver_observations"] = manifest
+                projected["execution_contract"] = (
+                    "Container physics runs through the controller Workbench before analysis. Use the complete "
+                    "receipt-bound solver_observations as synthetic inputs, preserving every raw output exactly once "
+                    "as observation source_record_id/source_values. Declare condition labels, evidence roles and "
+                    "interpretation in the frozen intent. Calibration and upstream verification remain controls, "
+                    "not evidence for a changed design. If these computations do not cover the declared candidate "
+                    "and equal-constraint baseline, request those specific controller computations before analysis; "
+                    "do not invent replacement equations, substitute values or launch Docker from the executor. "
+                    "Changed geometry, solver source or physical input requires a changed Workbench action. "
+                    "An identical verified cached action is retained evidence, not a new solve. Deterministic "
+                    "analysis replay, independent recalculation and scientific applicability review remain required.")
+        return projected
 
     def _software_producer_quota(self, stage):
         quota = deepcopy(self.departments._resolve_assignment("methods", "methodologist")["quota"])
@@ -14786,22 +14820,9 @@ class ComposerRunner:
                 if retained["selection"]["environment_ref"] is not None:
                     workbench._environment(retained["selection"]["environment_ref"])
                 elif getattr(self, "laboratory_binding", None) is not None:
-                    binding = self.laboratory_binding
-                    for label in {row.get("label") for row in
-                                  binding.attestation.get("runtimes", [])
-                                  if isinstance(row, dict)}:
-                        if not binding.runtime_fingerprint(label).get("matches_attestation"):
-                            raise ValidationError(
-                                f"accepted laboratory software assessment reused a drifted runtime "
-                                f"{label!r}; re-provision instead of trusting the cached assessment")
                     tools = producer.get("report", {}).get("software_tool_results", []) or []
-                    by_ref = {row.get("receipt_ref"): row for row in tools if isinstance(row, dict)}
-                    for ref in retained["selection"].get("computation_refs", []):
-                        row = by_ref.get(ref)
-                        if row is None:
-                            raise ValidationError(
-                                "accepted laboratory software assessment lost a selected "
-                                "computation receipt")
+                    from scisaurus.runtime.software_workbench import selected_receipt_closure
+                    for row in selected_receipt_closure(tools, retained["selection"].get("computation_refs", [])):
                         workbench._verify_run_state(row["action"]["arguments"], row.get("result"))
             return {**retained, "artifact_ref": previous["artifact_ref"], "dispatch_usage": {}}
         request = {"schema_version": "scientific-software-assessment-request-1", **identity,
@@ -14871,7 +14892,7 @@ class ComposerRunner:
                                                       evidence_refs=[row["source_ref"] for row in evidence_catalog],
                                                       laboratory=getattr(self, "laboratory_binding", None))
                         tools = deepcopy(report.get("software_tool_results", []))
-                        workbench.validate_retained_results(tools)
+                        workbench.validate_retained_results(tools, verify_execution_state=False)
                         tools.append(workbench.execute({"operation": "check_environment", "arguments": {}}))
                         original_response = report["response"].get("raw", report["response"])
                         if (not isinstance(original_response, dict)
@@ -14926,11 +14947,14 @@ class ComposerRunner:
                 deadline=time.monotonic() + self._stage_remaining(stage),
                 evidence_refs=[row["source_ref"] for row in evidence_catalog],
                 laboratory=getattr(self, "laboratory_binding", None))
-            workbench.validate_retained_results(tools)
+            workbench.validate_retained_results(tools, verify_execution_state=False)
             validate_selection(response.get("raw", response), workbench, tools)
         selected_refs = ([selection.get("environment_ref"), selection.get("example_ref"), *selection.get("computation_refs", [])]
                          if isinstance(selection, dict) else [])
-        from scisaurus.runtime.software_workbench import project_receipt
+        from scisaurus.runtime.software_workbench import project_receipt, selected_receipt_closure
+        if (produced.get("status") == "succeeded" and response.get("decision") == "pass"
+                and selection.get("strategy") == "reuse"):
+            selected_refs = [row["receipt_ref"] for row in selected_receipt_closure(tools, selected_refs)]
         evidence = {"request_ref": request_record["artifact_ref"], "request": deepcopy(request), "selection": deepcopy(selection),
                     "selected_operations": [project_receipt(row) for row in tools if row.get("receipt_ref") in selected_refs],
                     "discovery_and_diagnostics": [project_receipt(row) for row in tools if row.get("receipt_ref") not in selected_refs],
@@ -15957,7 +15981,7 @@ class ComposerRunner:
                 "required_properties": [
                     "bounded reproducible experiment",
                     "raw observations sufficient for independent recalculation",
-                    "at least three scientifically informative figures",
+                    "diagnostic assets appropriate to the declared measurement and comparison",
                     "no network access or undeclared data",
                 ],
             }

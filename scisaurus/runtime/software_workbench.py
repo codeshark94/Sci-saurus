@@ -38,7 +38,7 @@ ARTIFACT_REF_PREFIX = "software-artifact:sha256:"
 # tool contract and orchestration all use these exact field sets so a declared
 # input can never carry an extra sha256/size field that the contract omits.
 DECLARED_INPUT_FIELDS = ("artifact_ref", "name")
-DECLARED_INPUT_OPTIONAL = ("media_type",)
+DECLARED_INPUT_OPTIONAL = ("media_type", "source_receipt_ref")
 DECLARED_OUTPUT_FIELDS = ("name",)
 DECLARED_OUTPUT_OPTIONAL = ("media_type",)
 DISCOVERY_OPERATIONS = frozenset({"search", "search_evidence", "search_web", "inspect"})
@@ -78,7 +78,8 @@ def tool_contract():
                     "source": "complete Python or R program",
                     "input": {}, "purpose": "upstream_example | scientific_computation",
                     "documentation_refs": ["software:sha256:... acquired or laboratory source reference"],
-                    "inputs": [{"artifact_ref": "software-artifact:sha256:...", "name": "safe/relative/path.step"}],
+                    "inputs": [{"artifact_ref": "software-artifact:sha256:...", "name": "safe/relative/path.step",
+                                "source_receipt_ref": "optional producing run receipt; required when multiple runs produced identical bytes"}],
                     "outputs": [{"name": "safe/relative/result.vtk", "media_type": "optional MIME type/subtype"}],
                     "expected": None},
         },
@@ -110,6 +111,53 @@ def tool_contract():
 
 def _sha(value):
     return hashlib.sha256(value).hexdigest()
+
+
+def selected_receipt_closure(results, refs):
+    """Retain the exact successful producer graph of selected artifact inputs."""
+    by_ref, producers = {}, {}
+    for row in results:
+        ref = row.get("receipt_ref")
+        if not isinstance(ref, str):
+            continue
+        prior = by_ref.get(ref)
+        if prior is not None and any(prior.get(k) != row.get(k) for k in ("action", "outcome", "result")):
+            raise ValidationError("selected software receipt has conflicting ownership")
+        by_ref[ref] = row
+        if row.get("outcome") == "ok" and row.get("action", {}).get("operation") == "run":
+            for output in row.get("result", {}).get("outputs", []):
+                producers.setdefault(output["artifact_ref"], set()).add(ref)
+    selected, visiting, ordered = set(), set(), []
+
+    def visit(ref):
+        if ref in visiting:
+            raise ValidationError("selected software artifact dependency graph contains a cycle")
+        if ref in selected:
+            return
+        row = by_ref.get(ref)
+        if row is None or row.get("outcome") != "ok":
+            raise ValidationError("selected software artifact dependency lacks a successful owned receipt")
+        visiting.add(ref)
+        if row.get("action", {}).get("operation") == "run":
+            for item in row["action"].get("arguments", {}).get("inputs", []) or []:
+                owners = producers.get(item["artifact_ref"], set())
+                owner = item.get("source_receipt_ref")
+                if owner is not None:
+                    if owner not in owners:
+                        raise ValidationError("input source_receipt_ref does not own the declared artifact")
+                elif len(owners) == 1:
+                    owner = next(iter(owners))
+                else:
+                    raise ValidationError("input artifact producer is missing or ambiguous; declare source_receipt_ref")
+                visit(owner)
+        visiting.remove(ref)
+        selected.add(ref)
+        ordered.append(row)
+
+    for ref in refs:
+        if ref is not None:
+            visit(ref)
+    return ordered
 
 
 def project_receipt(receipt):
@@ -237,7 +285,7 @@ class SoftwareWorkbench:
             raise ValidationError(f"software receipt {ref} records operation {receipt['action']['operation']}; operation {operation} is required")
         return receipt
 
-    def validate_retained_results(self, results):
+    def validate_retained_results(self, results, *, verify_execution_state=True):
         """Recheck receipt identity and mutable execution state before reuse."""
         if not isinstance(results, list):
             raise ValidationError("retained software results must be a list")
@@ -248,7 +296,7 @@ class SoftwareWorkbench:
             if retained != {key: value for key, value in row.items()
                             if key not in {"receipt_ref", "reused"}}:
                 raise ValidationError("retained software result does not match its exact receipt")
-            if retained.get("outcome") != "ok":
+            if retained.get("outcome") != "ok" or not verify_execution_state:
                 continue
             operation = retained["action"]["operation"]
             if operation == "run":
@@ -410,12 +458,19 @@ class SoftwareWorkbench:
                 raise ValidationError("software run declares duplicate input artifact names")
             seen.add(name)
             data = self._read_artifact(row["artifact_ref"])
+            provenance = {}
+            if row.get("source_receipt_ref") is not None:
+                owner = self._receipt(row["source_receipt_ref"], "run")
+                if not any(item.get("artifact_ref") == row["artifact_ref"]
+                           for item in owner.get("result", {}).get("outputs", [])):
+                    raise ValidationError("input source_receipt_ref does not own the declared artifact")
+                provenance["source_receipt_ref"] = row["source_receipt_ref"]
             total += len(data)
             if total > limits["max_input_bytes"]:
                 raise ValidationError("declared software run inputs exceed the laboratory input byte limit")
             declared.append({"artifact_ref": row["artifact_ref"], "name": name,
                              "sha256": row["artifact_ref"][len(ARTIFACT_REF_PREFIX):],
-                             "size": len(data)})
+                             "size": len(data), **provenance})
         return declared
 
     def _declared_outputs(self, value, limits):
@@ -552,7 +607,8 @@ class SoftwareWorkbench:
                                     "files_sha256": _sha(canonical_bytes(environment["files"]))}
         limits = self._effective_limits()
         state["inputs"] = [
-            {"artifact_ref": row["artifact_ref"], "name": row["name"]}
+            {"artifact_ref": row["artifact_ref"], "name": row["name"],
+             **({"source_receipt_ref": row["source_receipt_ref"]} if "source_receipt_ref" in row else {})}
             for row in self._declared_inputs(arguments.get("inputs"), limits)
         ]
         state["outputs"] = self._declared_outputs(arguments.get("outputs"), limits)
@@ -1386,15 +1442,8 @@ def validate_selection(response, workbench, results):
         # Accepted selection reuse rehashes the retained outputs and inputs and
         # re-checks the current runtime, so a stale or tampered receipt can never
         # be admitted as a successful reuse.
-        for ref in selection["computation_refs"]:
-            computation = workbench._receipt(ref, "run")["result"]
-            workbench.verify_run_outputs(computation)
-            for row in computation.get("inputs") or []:
-                workbench._read_artifact(row["artifact_ref"])
-            if computation.get("runtime") is not None:
-                workbench._lab_runtime(computation["runtime"])
-            elif computation.get("environment_ref") is not None:
-                workbench._environment(computation["environment_ref"])
+        for receipt in selected_receipt_closure(results, selection["computation_refs"]):
+            workbench._verify_run_state(receipt["action"]["arguments"], receipt["result"])
     if selection["strategy"] == "custom_model":
         if not selection["scientific_source_refs"] or not any(row.get("outcome") == "ok" and row["action"]["operation"] in DISCOVERY_OPERATIONS for row in results):
             raise ValidationError("custom modelling requires actual software discovery and nonempty "

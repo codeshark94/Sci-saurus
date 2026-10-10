@@ -11031,7 +11031,7 @@ class ComposerWorkflowTests(unittest.TestCase):
                 )
                 self.assertIn("hypothesis, not a confirmed defect", request["objective"])
                 self.assertIn("Correct the sign in executor and validator",
-                              request["objective"])
+                              " ".join(request["experiment_repair_plan"]["review_evidence"]))
 
                 stale = {
                     "kind": "additional_experiment",
@@ -11094,8 +11094,9 @@ class ComposerWorkflowTests(unittest.TestCase):
                         stage, context, "methods review did not complete", 4)
 
                 objective = request["objective"]
-                self.assertEqual(objective.count(finding), 1)
-                self.assertEqual(objective.count(
+                self.assertNotIn(finding, objective)
+                self.assertEqual(" ".join(request["experiment_repair_plan"]["review_evidence"]).count(finding), 1)
+                self.assertEqual(" ".join(request["experiment_repair_plan"]["review_evidence"]).count(
                     "Persisted independent-review finding:"), 1)
                 self.assertNotIn(
                     "Persisted independent-review finding: Persisted independent-review finding:",
