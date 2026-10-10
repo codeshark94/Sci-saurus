@@ -1338,6 +1338,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(proof["review_evidence"]["candidate_sha256"], result["raw_results_sha256"])
         self.assertEqual(len(proof["review_evidence"]["independent_reviews"]), 2)
         self.assertEqual(proof["review_evidence"]["assessment"]["decision"], "accepted_with_limitations")
+        self.assertTrue(proof["review_evidence"]["observations"]["complete"])
+        self.assertEqual(proof["review_evidence"]["execution_evidence"]["candidate_sha256"], result["raw_results_sha256"])
+        self.assertEqual(len(proof["review_evidence"]["execution_evidence"]["executions"]), 2)
         self.assertTrue(proof["file_hashes"])
         raw = project / "output/raw-results.json"
         original = raw.read_bytes()

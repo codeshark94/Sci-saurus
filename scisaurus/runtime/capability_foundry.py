@@ -2257,6 +2257,7 @@ def program_failure_context(document):
 
 
 def program_review_evidence(candidate, document, verdict):
+    from scisaurus.runtime.review_evidence import REALIZATION_REVIEW_RULE
     digest = hashlib.sha256(canonical_bytes(document)).hexdigest()
     validate_deterministic_validation(verdict, candidate["experiment_intent"], digest)
     bind_deterministic_validation(verdict, document, candidate["experiment_intent"])
@@ -2271,6 +2272,7 @@ def program_review_evidence(candidate, document, verdict):
         "reported_metrics": deepcopy_config(document["metrics"]),
         "independent_validation": deepcopy_config(verdict),
         "decision_assessments": verified_decisions(candidate["experiment_intent"], verdict),
+        "realization_review_rule": REALIZATION_REVIEW_RULE,
         "claim_consistency_contract": (
             "Compare the current implementation, estimand, independently recalculated values, "
             "decision_assessments and result statements. A declared threshold is a rule, not an "

@@ -32,7 +32,9 @@ from scisaurus.runtime.experiment_config import (
 )
 from scisaurus.runtime.models import ModelCallError, ModelResult
 from scisaurus.runtime.operations import OperationsCell
-from scisaurus.runtime.review_evidence import review_observation_table
+from scisaurus.runtime.review_evidence import (
+    review_observation_table, review_execution_evidence, REALIZATION_REVIEW_RULE,
+)
 from scisaurus.runtime.results import validate_results_package
 from scisaurus.runtime.research_quality import (
     build_research_design,
@@ -939,6 +941,13 @@ def completed_experiment_result_proof(project_dir):
             if sha256_hex(asset_path.read_bytes()) != asset["sha256"]:
                 return None
             files[str(asset_path)] = asset["sha256"]
+        executed_input = deepcopy(experiment["execution"]["input"])
+        if orders:
+            executed_input["work_orders"] = deepcopy(orders)
+        execution_evidence = review_execution_evidence(
+            [(ref, read(ref)) for ref in run["execution_refs"]],
+            experiment_program_payload(experiment, executed_input), candidate,
+            normalize_output=normalize_program_output)
         return {"schema_version": "completed-experiment-result-1", "project_dir": str(project),
                 "research_question": run["research_question"], "candidate_sha256": digest,
                 "run_ref": run_ref, "config_ref": config_ref, "artifact_hashes": records,
@@ -950,7 +959,9 @@ def completed_experiment_result_proof(project_dir):
                     "limitations": candidate["limitations"],
                     "deterministic_validation": deterministic,
                     "independent_reviews": reviews, "assessment": assessment,
-                    "evidence_scope": "Complete observations were reviewed by the producer's independent reviewers. This outer-stage evidence carries their current verdicts and result claims, not another raw-row recalculation."}}
+                    "observations": review_observation_table(candidate["observations"]),
+                    "execution_evidence": execution_evidence,
+                    "evidence_scope": "Complete lossless observations and receipt-bound executed sources/input accompany the current verdicts and claims. Scientific reviewers must compare constructed models and observed constraints, not only recalculated metrics."}}
 
 
 def review_context_capacity_proof(project_dir):
@@ -994,6 +1005,8 @@ def review_context_capacity_proof(project_dir):
         runner = object.__new__(ExperimentRunner)
         runner.experiment = config["experiment"]
         runner.work_orders = config.get("work_orders", [])
+        runner.store = store
+        runner.execution_refs = run["execution_refs"]
         validate_program_output(candidate, runner.experiment, runner.work_orders,
                                 configured_input=runner.experiment["execution"]["input"])
         validated = validate_deterministic_validation(
@@ -1241,6 +1254,17 @@ class ExperimentRunner(ExecutionRuntime):
             raise ValidationError("independent metric recalculation rejected the experiment output")
         return value, record, execution_ref
 
+    def _review_execution_evidence(self, candidate):
+        records = []
+        for ref in self.execution_refs:
+            manifest = self.store.get(ref)
+            body = self.store.read_body(manifest["body_hash"])
+            if sha256_hex(body) != manifest["body_hash"]:
+                raise ValidationError("execution review artifact hash mismatch")
+            records.append((ref, json.loads(body)))
+        return review_execution_evidence(records, self._program_input(), candidate,
+                                         normalize_output=normalize_program_output)
+
     def _review_assignment(self, reviewer, candidate, deterministic, evidence_refs):
         summary = {key: candidate[key] for key in (
             "schema_version", "study_id", "revision", "procedures", "observations",
@@ -1256,7 +1280,8 @@ class ExperimentRunner(ExecutionRuntime):
             "Assess every ID in required_finding_ids exactly once as {finding_id,outcome,rationale}; outcomes are supported, overstated, or insufficient_evidence. Do not invent suffixes, placeholders, or summary IDs. "
             "Decision is accepted, accepted_with_limitations, or rejected. Both accepted decisions require every check passed and every finding supported. Use accepted_with_limitations only for limitations that do not contradict a check or finding outcome. If any check is failed or insufficient_evidence, or any finding is overstated or insufficient_evidence, choose rejected and preserve those outcomes; never soften adverse evidence to make the decision acceptable. "
             "Treat program numbers as observations only after the independent recalculation passes. Check method-contract alignment, calculation trace, inference scope, and limitation coverage. "
-            "Do not infer general scientific truth, novelty, or external validity from one finite computational study. Preserve negative and mixed results. Keep each evidence or rationale field concise (at most 400 characters) and include no more than six limitations."
+            "Do not infer general scientific truth, novelty, or external validity from one finite computational study. Preserve negative and mixed results. Keep each evidence or rationale field concise (at most 400 characters) and include no more than six limitations. "
+            + REALIZATION_REVIEW_RULE
         )
         if self.work_orders:
             instructions += (
@@ -1292,6 +1317,8 @@ class ExperimentRunner(ExecutionRuntime):
         for name in INTENT_EXTENSIONS:
             if name in self.experiment:
                 assignment["study"][name] = deepcopy(self.experiment[name])
+        if getattr(self, "execution_refs", None):
+            assignment["execution_evidence"] = self._review_execution_evidence(candidate)
         from scisaurus.runtime.measurement_contract import verified_decisions
         assignment["verified_decisions"] = verified_decisions(self.experiment, deterministic)
         if self.work_orders:
