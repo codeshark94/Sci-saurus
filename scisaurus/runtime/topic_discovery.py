@@ -4775,7 +4775,9 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
             "frontier_seed_pivot_required": bool(
                 refinement_context.get("require_frontier_seed_pivot") is True
             ) if refinement_context else False,
-        } if refinement_context and not response_contract_only else {},
+        } if (refinement_context and not response_contract_only
+              and not (intake_mode == "concept"
+                       and refinement_context.get("mode") == "concept_reselection")) else {},
         "portfolio_requirements": portfolio_requirements,
         "portfolio_shape_plan": portfolio_shape_plan,
         "previous_candidate_directions": candidate_history,

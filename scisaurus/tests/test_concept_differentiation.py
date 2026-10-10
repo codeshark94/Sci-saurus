@@ -111,6 +111,7 @@ class ConceptDifferentiationTests(unittest.TestCase):
         self.assertNotIn('keep the parent', rules)
         self.assertNotIn('repair the reviewed direction', rules)
         self.assertIn('new concept selection', rules)
+        self.assertEqual(calls[2]['refinement_shape'], {})
         self.assertEqual(calls[3]['retired_concept']['candidate'], calls[2]['retired_direction'])
         self.assertEqual(calls[3]['retired_concept']['source_challenge']['concept_differentiation']['assessment'], 'known_design_variant')
         self.assertEqual(len(result['candidates']), 3)
