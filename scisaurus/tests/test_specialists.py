@@ -3,6 +3,8 @@ from copy import deepcopy
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import tempfile
+from pathlib import Path
 import time
 import unittest
 from unittest.mock import patch
@@ -377,6 +379,11 @@ class SpecialistDispatcherTests(unittest.TestCase):
         self.assertEqual(value["chief_result"]["coverage"], chief["coverage"])
 
     def setUp(self):
+        slots = tempfile.TemporaryDirectory()
+        self.addCleanup(slots.cleanup)
+        slot_root = patch("scisaurus.runtime.model_dispatch._slot_root", return_value=Path(slots.name))
+        slot_root.start()
+        self.addCleanup(slot_root.stop)
         clear_model_provider_cooldown({
             "protocol": "openai_compatible",
             "base_url": "http://127.0.0.1:11434/v1",

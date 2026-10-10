@@ -278,8 +278,10 @@ SOFTWARE_SELECTION_SYSTEM = (
     "You are the Methods scientific software assessor. Before a new implementation, actively "
     "discover established software from the admitted question and its literature, inspect primary "
     "documentation and licensing, and check the actual host environment with the provided tools. "
-    "For a reuse strategy, provision a pinned isolated environment and reproduce its upstream "
-    "example. Choose software by mechanism, units, calibration, study "
+    "For a reuse strategy, use a verified declared laboratory runtime when suitable, or acquire "
+    "a pinned isolated environment otherwise. Follow scientific_source_reference_contract.reuse_paths "
+    "for the exact selection fields; runtime inventory is not an acquisition receipt. Reproduce "
+    "the upstream example and retain bounded scientific computations. Choose software by mechanism, units, calibration, study "
     "scope and actual host CPU, RAM, storage, architecture and accelerator/runtime support, "
     "not popularity alone. "
     "Use the supplied evidence_catalog to read accepted literature and follow its code and primary "
@@ -2834,7 +2836,49 @@ class SpecialistDispatcher:
             continue_previous_output = False
             previous_text = None
             return updated
-        producer_options = {"tool_exchange": exchange_software_action} if software_tools is not None else {}
+        def normalise_software_selection(parsed):
+            from scisaurus.runtime.software_workbench import validate_selection
+            normalized = _normalise_report(parsed)
+            validate_selection(parsed, software_tools, software_results)
+            normalized["software_selection"] = _preserve_response_value(parsed["software_selection"])
+            return normalized
+
+        def exchange_final_response(parsed, envelope, usage):
+            nonlocal validation_retries, schema_repair_used, last_validation_error
+            try:
+                normalise_software_selection(parsed)
+            except ValidationError as exc:
+                identity = software_response_failure_identity(exc, parsed=parsed)
+                if identity in repaired_software_contract_errors:
+                    return None
+                if enforce_costs and output_budget_used + usage.get("output_tokens", 0) >= output_budget:
+                    return None
+                text = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+                original = json.loads(prompt)
+                original.pop("author_backend", None)
+                original["runtime_python"] = envelope["runtime_python"]
+                repair = json.loads(_specialist_repair_prompt(
+                    json.dumps(original, ensure_ascii=False, sort_keys=True), exc, text,
+                    max_input_tokens=max_input_tokens,
+                    response_contract=response_contract, output_role=assigned_role))
+                repair["runtime_python"] = envelope["runtime_python"]
+                if estimate_input_tokens(system, json.dumps(repair, ensure_ascii=False, sort_keys=True)) > max_input_tokens:
+                    raise ValidationError("DSH response repair exceeds its assignment input-token limit")
+                repaired_software_contract_errors.add(identity)
+                validation_retries += 1
+                schema_repair_used = True
+                last_validation_error = str(exc)
+                request_input.setdefault("controller_response_repairs", []).append({
+                    "error": str(exc), "failure_identity": identity,
+                    "response_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    "cumulative_backend_usage": deepcopy(usage)})
+                return repair
+            return None
+
+        producer_options = ({"tool_exchange": exchange_software_action,
+                             **({"final_exchange": exchange_final_response}
+                                if response_contract == "software_selection" else {})}
+                            if software_tools is not None else {})
         engineering_client = (producer_client(
             self.software_author_backend, root=str(self.software_workspace) + "/dsh-producer",
             runtime_python=self.software_author_runtime_python, **producer_options) if dsh_producer else None)
@@ -3089,9 +3133,7 @@ class SpecialistDispatcher:
                 normalized = _normalise_verdict(parsed, **_verifier_obligation_scope(prompt, assignment)) \
                     if verifier else _normalise_report(parsed)
                 if response_contract == "software_selection" and not verifier:
-                    from scisaurus.runtime.software_workbench import validate_selection
-                    validate_selection(parsed, software_tools, software_results)
-                    normalized["software_selection"] = _preserve_response_value(parsed["software_selection"])
+                    normalized = normalise_software_selection(parsed)
                 if response_contract == "repair_evidence" and not verifier:
                     if (set(parsed) != {"decision", "summary", "findings", "evidence_gaps", "requested_actions", "evidence_note"}
                             or not isinstance(parsed.get("summary"), str)

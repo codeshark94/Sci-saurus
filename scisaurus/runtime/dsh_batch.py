@@ -689,9 +689,10 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
 
     deliverable_label = "software producer"
 
-    def __init__(self, config, *, root, runtime_python, tool_exchange=None):
+    def __init__(self, config, *, root, runtime_python, tool_exchange=None, final_exchange=None):
         super().__init__(config, root=root, runtime_python=runtime_python)
         self.tool_exchange = tool_exchange
+        self.final_exchange = final_exchange
 
     def exchange_for(self, assignment, system):
         if self.tool_exchange is None:
@@ -701,9 +702,14 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
                 response = json_object(files["response.json"].decode("utf-8"), "DSH software producer response")
             except (ValidationError, ValueError, UnicodeError):
                 return None
-            if set(response) != {"tool_action"}:
+            if set(response) == {"tool_action"}:
+                updated = self.tool_exchange(response, assignment, usage)
+            elif self.final_exchange is not None:
+                updated = self.final_exchange(response, assignment, usage)
+                if updated is None:
+                    return None
+            else:
                 return None
-            updated = self.tool_exchange(response, assignment, usage)
             assignment.clear()
             assignment.update(updated)
             return {"task": self.task(assignment), "inputs": {

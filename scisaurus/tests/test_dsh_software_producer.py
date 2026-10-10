@@ -124,6 +124,65 @@ class DshSoftwareProducerTests(unittest.TestCase):
         self.assertEqual(report["status"], "succeeded", report)
         self.assertEqual(len(report["software_tool_results"]), 2)
 
+    def test_final_contract_repair_continues_in_same_session(self):
+        def run(task, **kwargs):
+            initial = json.loads(kwargs["inputs"]["assignment.json"])
+            invalid = {"response": self.final_response()}
+            repair = kwargs["exchange"]({"response.json": json.dumps(invalid).encode()},
+                                         {"model_calls": 3, "input_tokens": 41, "output_tokens": 17})
+            packet = json.loads(repair["inputs"]["assignment.json"])
+            self.assertEqual(packet["evidence_packet"], initial)
+            self.assertFalse(packet["response_format_repair"]["stage_failure_evidence"])
+            self.assertEqual(packet["runtime_python"], initial["runtime_python"])
+            self.assertIsNone(kwargs["exchange"](
+                {"response.json": json.dumps(self.final_response()).encode()},
+                {"model_calls": 4, "input_tokens": 51, "output_tokens": 23}))
+            return self.batch_result(self.final_response(), usage={"model_calls": 4, "input_tokens": 51, "output_tokens": 23})
+        with patch("scisaurus.runtime.dsh_batch.DshBatchRunner.run", side_effect=run) as transport:
+            report = self.dispatcher().dispatch([self.assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded", report)
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(report["validation_retries"], 1)
+        self.assertEqual(report["usage"]["model_calls"], 4)
+        self.assertEqual(len(report["request_inputs"][0]["controller_response_repairs"]), 1)
+
+    def test_repeated_final_contract_failure_stops_without_new_session(self):
+        invalid = {"response": self.final_response()}
+        def run(task, **kwargs):
+            files = {"response.json": json.dumps(invalid).encode()}
+            self.assertIsNotNone(kwargs["exchange"](files, {"model_calls": 3, "output_tokens": 17}))
+            self.assertIsNone(kwargs["exchange"](files, {"model_calls": 4, "output_tokens": 23}))
+            return self.batch_result(invalid, usage={"model_calls": 4, "input_tokens": 51, "output_tokens": 23})
+        with patch("scisaurus.runtime.dsh_batch.DshBatchRunner.run", side_effect=run) as transport:
+            report = self.dispatcher().dispatch([self.assignment], {})[0]
+        self.assertEqual(report["status"], "failed", report)
+        self.assertEqual(report["failure"]["kind"], "output_contract")
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(report["usage"]["model_calls"], 4)
+
+    def test_in_session_contract_repair_then_tool_restores_current_evidence(self):
+        def run(task, **kwargs):
+            initial = json.loads(kwargs["inputs"]["assignment.json"])
+            kwargs["exchange"]({"response.json": json.dumps({"response": self.final_response()}).encode()},
+                               {"model_calls": 3, "output_tokens": 17})
+            action = {"tool_action": {"operation": "search_evidence", "arguments": {"terms": ["solver"]}}}
+            continuation = kwargs["exchange"]({"response.json": json.dumps(action).encode()},
+                                               {"model_calls": 4, "output_tokens": 23})
+            packet = json.loads(continuation["inputs"]["assignment.json"])
+            self.assertEqual(packet["question"], initial["question"])
+            self.assertNotIn("response_format_repair", packet)
+            self.assertNotIn("evidence_packet", packet)
+            self.assertEqual(packet["software_tool_results"][-1]["action"], action["tool_action"])
+            self.assertIsNone(kwargs["exchange"]({"response.json": json.dumps(self.final_response()).encode()},
+                                                 {"model_calls": 5, "output_tokens": 29}))
+            return self.batch_result(self.final_response(), usage={"model_calls": 5, "output_tokens": 29})
+        with patch("scisaurus.runtime.dsh_batch.DshBatchRunner.run", side_effect=run) as transport:
+            report = self.dispatcher().dispatch([self.assignment], {})[0]
+        self.assertEqual(report["status"], "succeeded", report)
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(report["validation_retries"], 0)
+        self.assertEqual(report["usage"]["model_calls"], 5)
+
     def test_controller_exchange_after_format_repair_restores_base_assignment(self):
         calls = []
         def run(task, **kwargs):

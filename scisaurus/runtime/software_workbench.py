@@ -1329,6 +1329,17 @@ def selection_reference_contract(workbench, results):
                 if row.get("outcome") == "ok" and row.get("receipt_ref")}),
             "selection_path": "/software_selection/scientific_source_refs",
             "model_path": "/software_selection/model_definition/source_refs",
+            "reuse_paths": {
+                "acquired_environment": {
+                    "environment_ref": "Successful acquire receipt, never list_runtimes or inspect_runtime.",
+                    "example_ref": "Matching upstream_example run in that acquired environment.",
+                    "computation_refs": "Scientific computation runs in that same acquired environment."},
+                "declared_laboratory_runtime": {
+                    "available": getattr(workbench, "laboratory", None) is not None,
+                    "environment_ref": None, "example_ref": None,
+                    "computation_refs": "Nonempty scientific_computation run receipts using declared runtime labels. "
+                                        "Runtime inventory and upstream examples remain supporting source refs, "
+                                        "not environment_ref or example_ref."}},
             "custom_model_prerequisites": {
                 "discovery_operations": sorted(DISCOVERY_OPERATIONS),
                 "requirement": "A successful discovery receipt and nonempty scientific_source_refs are required. "

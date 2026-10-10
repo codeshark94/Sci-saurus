@@ -53,6 +53,10 @@ the final structured selection. The controller executes the declared operation,
 then provides a new read-only assignment containing its bound receipts. Workspace
 scripts and session history survive the exchange; independent work orders and
 validator sessions remain isolated.
+Final selection contract corrections also continue in that session. Each distinct
+diagnostic permits one correction; an unchanged failure terminates with its paid
+response and usage retained. Corrections preserve the current scientific evidence
+and restore the canonical assignment when another tool observation is requested.
 
 Controller sessions use `dsh-controller-session-receipt-1`. Their receipts retain
 each message owner, immutable assignment and task hashes, archived output bytes
