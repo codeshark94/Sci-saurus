@@ -41,15 +41,16 @@ ROLE_QUOTA_FIELDS = frozenset({
 LEGACY_ROLE_QUOTA_FIELDS = frozenset({
     "max_calls", "max_input_tokens", "max_output_tokens", "max_seconds",
 })
-# Per-call allowance leaves 16 Ki tokens inside a 256 Ki context window; the
-# selected provider route remains the hard ceiling and no prompt is padded.
+# Input quotas are accounting ceilings. Each selected route separately reserves
+# its output allowance inside the provider context window; prompts are not padded.
 ROLE_INPUT_CONTEXT_ALLOWANCE = 245760
 # A final length continuation may need one request beyond the legacy call cap.
-# Keep the cumulative output-token allowance unchanged: the extra request is
+# The cumulative allowance covers three full responses; a fourth request is
 # usable only when a bounded response was truncated and output budget remains.
 ROLE_MAX_CALLS = 4
-ROLE_OUTPUT_TOKENS_PER_CALL = 8192
+ROLE_OUTPUT_TOKENS_PER_CALL = 32768
 ROLE_OUTPUT_TOKEN_ALLOWANCE = 3 * ROLE_OUTPUT_TOKENS_PER_CALL
+_LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL = 8192
 _V2_DEFAULT_ROLE_QUOTAS = (
     {"max_calls": 2, "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
      "max_output_tokens": 4000, "max_seconds": 900},
@@ -208,21 +209,21 @@ def _upgrade_role_quota(value, schema_version):
         v4_default = {
             "max_calls": 2,
             "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-            "max_output_tokens": 2 * ROLE_OUTPUT_TOKENS_PER_CALL,
-            "max_output_tokens_per_call": ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_output_tokens": 2 * _LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_output_tokens_per_call": _LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL,
             "max_seconds": 900,
         }
         if schema_version == PRIOR_SCHEMA_VERSION and value == v4_default:
             value = {
                 **value,
                 "max_calls": ROLE_MAX_CALLS,
-                "max_output_tokens": ROLE_OUTPUT_TOKEN_ALLOWANCE,
+                "max_output_tokens": 3 * _LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL,
             }
         v5_default = {
             "max_calls": 3,
             "max_input_tokens": ROLE_INPUT_CONTEXT_ALLOWANCE,
-            "max_output_tokens": ROLE_OUTPUT_TOKEN_ALLOWANCE,
-            "max_output_tokens_per_call": ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_output_tokens": 3 * _LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL,
+            "max_output_tokens_per_call": _LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL,
             "max_seconds": 900,
         }
         if schema_version == V5_SCHEMA_VERSION and value == v5_default:
@@ -238,7 +239,7 @@ def _upgrade_role_quota(value, schema_version):
         per_call = quota["max_output_tokens"]
         quota["max_output_tokens"] *= quota["max_calls"]
     else:
-        per_call = min(ROLE_OUTPUT_TOKENS_PER_CALL, quota["max_output_tokens"])
+        per_call = min(_LEGACY_ROLE_OUTPUT_TOKENS_PER_CALL, quota["max_output_tokens"])
     quota["max_output_tokens_per_call"] = per_call
     return _validate_role_quota(quota)
 

@@ -709,6 +709,14 @@ class RefinementValidationRepairModel(FakeModel):
 
 
 class TopicDiscoveryTests(unittest.TestCase):
+    def test_topic_clients_preserve_route_generation_capacity(self):
+        runner = TopicDiscoveryRunner({
+            "base_url": "http://example.invalid", "model": "fake", "protocol": "ollama",
+            "timeout_seconds": 1, "max_output_tokens": 32768,
+        })
+        for role in ("topic_discovery", "research.topic-maturity-reviewer"):
+            self.assertEqual(runner._client(role).max_output_tokens, 32768)
+
     def test_salvage_scope_validation_errors_are_contract_not_scientific_rejections(self):
         self.assertEqual(
             _topic_validation_rejection_type(

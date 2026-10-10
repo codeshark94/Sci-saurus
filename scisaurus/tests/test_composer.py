@@ -8581,6 +8581,29 @@ class ComposerWorkflowTests(unittest.TestCase):
                 from scisaurus.runtime.survey_config import validate_survey_config
                 validate_survey_config(result)
 
+                # Exercise descriptor intake through the production entry point:
+                # the generic descriptor has no concept-specific fields.
+                descriptor = survey_config("http://127.0.0.1:1")
+                original_search = deepcopy(descriptor["survey"]["search"])
+                Path(workflow["stages"][1]["config_path"]).write_text(json.dumps(descriptor))
+                request = {"id": "baseline", "kind": "literature_search", "owner": "methods.survey",
+                    "objective": "Resolve the baseline.", "why": "Implementation needs a source.",
+                    "success_condition": "The source is captured.", "evidence_needed": "Baseline definition."}
+                adapt = runner._adapt_continuation_config
+                projected = {}
+                def inspect_adaptation(stage, value):
+                    projected.update(adapt(stage, value))
+                    raise InterruptedError("offline projection boundary")
+                with patch.object(runner, "_adapt_continuation_config", side_effect=inspect_adaptation), \
+                        patch.object(runner, "_requests_for_stage", return_value=[request]), \
+                        patch.object(runner, "_augment_full_text_routes"), \
+                        patch.object(runner, "_prior_stage_project", return_value=None):
+                    with self.assertRaisesRegex(InterruptedError, "offline projection boundary"):
+                        runner._produce_stage(workflow["stages"][1])
+                self.assertEqual(projected["survey"]["design_brief"], brief())
+                self.assertEqual(projected["survey"]["search"], original_search)
+                self.assertEqual(json.loads(Path(workflow["stages"][1]["config_path"]).read_text()), descriptor)
+
     def test_topic_pivot_archives_and_clears_downstream_live_lineage(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)
@@ -16608,6 +16631,148 @@ class ComposerWorkflowTests(unittest.TestCase):
                 self.assertEqual(adapted["survey"]["search"]["max_api_calls"], 32)
             finally:
                 runner.close()
+
+    def test_survey_continuation_preserves_implementation_envelope(self):
+        from scisaurus.tests.test_material_development import brief
+        search = {
+            "max_works": 120, "max_analyzed_works": 12, "challenge_reserve": 5,
+            "queries_per_role": 3, "results_per_query": 10, "max_api_calls": 900,
+            "max_full_texts": 12, "expansion_rounds": 1,
+            "expansion_seed_count": 3, "saturation_rounds": 1,
+        }
+        request = {
+            "id": "implementation", "kind": "literature_search", "owner": "methods.survey",
+            "objective": "Resolve baseline implementation inputs.", "why": "The boundary needs a source.",
+            "success_condition": "The implementation input is source-bound.",
+            "evidence_needed": "The nearest baseline definition.",
+        }
+        with tempfile.TemporaryDirectory() as path:
+            runner = ComposerRunner(self._workflow(Path(path)))
+            try:
+                runner.continuation_cycles = 5
+                stage = {"id": "survey", "kind": "survey", "project_dir": path}
+                for implementation in (False, True):
+                    for recovery in (None, "quota", "provider"):
+                        with self.subTest(implementation=implementation, recovery=recovery):
+                            runner.context["survey"] = (
+                                {"quota_recovery": {"mode": "focused"}} if recovery == "quota"
+                                else {"provider_fallback": {"mode": "crossref_metadata"}}
+                                if recovery == "provider" else {})
+                            config = {"survey": {"revision": 1, "search": deepcopy(search), "seed_work_ids": []}}
+                            if implementation:
+                                config["survey"]["design_brief"] = brief()
+                            with patch.object(runner, "_requests_for_stage", return_value=[request]), \
+                                    patch.object(runner, "_paper_depth_profile", return_value=None), \
+                                    patch.object(runner, "_augment_full_text_routes"), \
+                                    patch.object(runner, "_prior_stage_project", return_value=None):
+                                actual = runner._adapt_continuation_config(stage, config)
+                            bounds = actual["survey"]["search"]
+                            self.assertEqual(actual["work_orders"], runner._follow_up_projection([request]))
+                            if recovery:
+                                self.assertEqual(bounds["expansion_rounds"], 0)
+                                self.assertEqual(bounds["max_works"], 40 if recovery == "quota" else 20)
+                                self.assertLessEqual(bounds["max_analyzed_works"], search["max_analyzed_works"])
+                            elif implementation:
+                                self.assertEqual(bounds, search)
+                                self.assertEqual(actual["survey"]["design_brief"], brief())
+                                self.assertEqual(actual["survey"]["revision"], 6)
+                            else:
+                                self.assertEqual(bounds["max_works"], 130)
+                                self.assertEqual(bounds["max_full_texts"], 17)
+                                self.assertEqual(bounds["max_api_calls"], 920)
+                                self.assertEqual(bounds["expansion_rounds"], 2)
+                                self.assertEqual(bounds["max_analyzed_works"], 13)
+                runner.context["survey"] = {}
+                config = {"survey": {"revision": 1, "search": deepcopy(search), "design_brief": brief()}}
+                with patch.object(runner, "_requests_for_stage", return_value=[]):
+                    self.assertEqual(runner._adapt_continuation_config(stage, deepcopy(config)), config)
+            finally:
+                runner.close()
+
+    def test_generation_capacity_recovery_requires_owned_truncated_review_and_larger_controls(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path)
+            workflow = self._workflow(root)
+            (root / "topic").mkdir()
+            workflow["stages"].insert(0, {"id": "topic", "kind": "topic_discovery",
+                "config_path": workflow["stages"][0]["config_path"], "project_dir": str(root / "topic"),
+                "depends_on": [], "estimate_seconds": 1, "bindings": [], "deadline_seconds": 10,
+                "reuse_completed": False, "reuse_output_path": None})
+            stage = workflow["stages"][1]
+            stage["depends_on"] = ["topic"]
+            project = stage["project_dir"]
+            model = {"protocol": "openai_compatible", "base_url": "http://127.0.0.1:1", "model": "fixture",
+                     "max_output_tokens": 8192, "max_input_tokens": 32768, "context_window_tokens": 65536}
+            requested = {"model": {**model, "max_output_tokens": 32768}}
+            Path(stage["config_path"]).write_text(json.dumps(requested))
+            with closing(ComposerRunner(workflow)) as runner, closing(ControlStore(project)) as child:
+                store = ArtifactStore(child)
+                def publish(lid, body, author="command.controller", inputs=()):
+                    return store.publish_artifact(logical_id=lid, artifact_type="note", author=author,
+                        body=canonical_bytes(body), media_type="application/json", inputs=list(inputs))
+                publish("inputs/run-config", {"model": model, "survey": {"question": "Fixture question?"}}, "principal")
+                task_id = "survey-survey-review-1"
+                usage = {"model_calls": 1, "input_tokens": 100, "output_tokens": 8192}
+                params = publish("command/contexts/" + task_id, {"role": "methods.survey-reviewer", "client": model,
+                    "prompt": json.dumps({"phase": "survey_review", "question": "Fixture question?"})})
+                response = {"finish_reason": "length", "text": "Unfinished response", "usage": usage}
+                publish("command/executions/" + task_id, response, "methods.survey-reviewer",
+                    inputs=[{"ref": params["artifact_ref"], "purpose": "subject"}])
+                error = "survey-review did not satisfy its evidence contract: model output must contain valid JSON"
+                publish("command/model-work/fixture", {"status": "blocked", "failure_class": "model_contract",
+                    "error": error, "feedback": {"finish_reason": "length", "previous_response": {"raw_text": response["text"]}}})
+                final = {"status": "blocked", "run_id": "owned-run", "error": "ModelWorkBlocked: " + error}
+                publish("command/results/final", final)
+                tasks = TaskManager(child)
+                tasks.create(task_id, "review", {}, "command.controller")
+                tasks.transition(task_id, "queued", "command.controller")
+                tasks.start_attempt(task_id, task_id + "-attempt", owner="command.controller", lease_ttl_seconds=60)
+                tasks.finish_attempt(task_id + "-attempt", "succeeded", usage=usage)
+                runner.tasks.create("owner", "production", {}, "command.composer")
+                runner.tasks.transition("owner", "queued", "command.composer")
+                runner.tasks.start_attempt("owner", "owner-attempt", owner="command.composer", lease_ttl_seconds=60,
+                    payload={"stage_id": "survey", "attempt_number": 1, "project_dir": project})
+                runner.tasks.finish_attempt("owner-attempt", "failed", usage=usage)
+                dossier = runner._publish("command/composer/failure-recovery/survey/attempt-1", "note", {
+                    "schema_version": "composer-failure-recovery-1", "stage_id": "survey", "stage_kind": "survey",
+                    "attempt_number": 1, "failure_class": "model_contract", "error": error,
+                    "project_dir": project, "input_sha256": "a" * 64, "observed_result": final}, "command.composer")
+                latest = {"attempt_number": 1, "attempt_id": "owner-attempt", "state": "failed",
+                    "failure_class": "model_contract", "failure_dossier_ref": dossier["artifact_ref"],
+                    "topic_id": "owned", "topic_cycle": 1, "project_dir": project}
+                record = {"kind": "survey", "failure_class": "model_contract", "attempt_count": 1,
+                    "task_id": "owner", "attempts": [latest]}
+                runner.context["topic"] = {"kind": "topic_discovery", "topic": {"id": "owned", "research_question": "Fixture question?"}, "topic_cycle": 1}
+                runner.context["survey"] = {"stage_id": "survey", "failure_class": "model_contract", "format_recovery": True,
+                    "failure_dossier_ref": dossier["artifact_ref"], "failure_recovery": {"attempt_number": 1,
+                        "failure_class": "model_contract", "recovery_mode": "format_repair_then_rerun"}}
+                runner.stage_records["survey"] = record
+                proof = runner._survey_generation_capacity_change(stage, record)
+                self.assertEqual(proof["previous_output_limit"], 8192)
+                self.assertEqual(proof["new_output_limit"], 32768)
+                original_head = ArtifactStore.head
+                for missing in ("inputs/run-config", "command/results/final"):
+                    def missing_head(store, logical_id):
+                        return None if logical_id == missing else original_head(store, logical_id)
+                    with patch.object(ArtifactStore, "head", missing_head):
+                        self.assertIsNone(runner._survey_generation_capacity_change(stage, record))
+                for capacity in (8192, 4096):
+                    with patch.object(runner, "_read_json_object", return_value={"model": {**model, "max_output_tokens": capacity}}):
+                        self.assertIsNone(runner._survey_generation_capacity_change(stage, record))
+                with patch.object(runner, "_read_json_object", return_value={"model": {**requested["model"], "model": "foreign"}}):
+                    with self.assertRaisesRegex(ValidationError, "routes or quotas"):
+                        runner._survey_generation_capacity_change(stage, record)
+                runner.context["topic"]["topic"]["research_question"] = "Foreign question?"
+                self.assertIsNone(runner._survey_generation_capacity_change(stage, record))
+                runner.context["topic"]["topic"]["research_question"] = "Fixture question?"
+                with child.tx() as conn:
+                    conn.execute("UPDATE attempts SET usage_json=? WHERE attempt_id=?",
+                        (json.dumps({"actual": {**usage, "output_tokens": 10}}), task_id + "-attempt"))
+                self.assertIsNone(runner._survey_generation_capacity_change(stage, record))
+                tasks.create("live", "review", {}, "command.controller")
+                tasks.transition("live", "queued", "command.controller")
+                tasks.start_attempt("live", "live-attempt", owner="command.controller", lease_ttl_seconds=60)
+                self.assertIsNone(runner._survey_generation_capacity_change(stage, record))
 
     def test_resume_invalidates_legacy_route_agnostic_specialist_cooldown(self):
         with tempfile.TemporaryDirectory() as path:

@@ -1262,8 +1262,8 @@ class CapabilityFoundryTests(unittest.TestCase):
             route = foundry._model_config_for_role(
                 "research.experiment-author", foundry.author_max_output_tokens)
 
-        self.assertEqual(route["max_output_tokens"], 24000)
-        self.assertEqual(route["max_input_tokens"], 238144)
+        self.assertEqual(route["max_output_tokens"], 32768)
+        self.assertEqual(route["max_input_tokens"], 229376)
         self.assertLessEqual(
             route["max_input_tokens"] + route["max_output_tokens"],
             route["context_window_tokens"],
@@ -1318,7 +1318,7 @@ class CapabilityFoundryTests(unittest.TestCase):
                 [call.kwargs["model"] for call in factory.call_args_list],
                 ["primary-author", "fallback-author"],
             )
-            self.assertTrue(all(call.kwargs["max_output_tokens"] == 24000
+            self.assertTrue(all(call.kwargs["max_output_tokens"] == 32768
                                 for call in factory.call_args_list))
 
     def test_author_format_failure_uses_bulk_route_before_premium_fallback(self):

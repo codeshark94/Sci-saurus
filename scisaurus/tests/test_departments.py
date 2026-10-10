@@ -36,6 +36,12 @@ class DepartmentRuntimeTests(unittest.TestCase):
         self.control.close()
         self.tmp.cleanup()
 
+    def test_default_role_output_capacity_covers_full_generation(self):
+        for department in default_organization()["departments"]:
+            for role in department["agent_roles"]:
+                self.assertGreaterEqual(role["quota"]["max_output_tokens_per_call"], 32768)
+                self.assertGreaterEqual(role["quota"]["max_output_tokens"], 3 * 32768)
+
     def test_default_charters_are_valid_and_durable(self):
         organization = validate_organization(default_organization())
         self.assertTrue(organization["allow_dynamic_proposals"])

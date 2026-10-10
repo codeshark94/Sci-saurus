@@ -16728,7 +16728,7 @@ class ComposerRunner:
                         reserve + 1,
                         min(int(search["max_analyzed_works"]), search["max_works"], 24),
                     )
-            else:
+            elif survey.get("design_brief") is None and provider_fallback is None:
                 # Expansion is deliberate and bounded. It increases
                 # discovery, full-text, and citation capacity together so the
                 # next gate does not simply see more abstracts while
@@ -16752,16 +16752,16 @@ class ComposerRunner:
                     search["max_works"] = min(1000, max(search.get("max_works", 1) + 10, 20))
                     search["max_full_texts"] = min(100, max(search.get("max_full_texts", 1) + 5, 5))
                     search["max_api_calls"] = min(1000, max(search.get("max_api_calls", 1) + 20, 40))
-            search["expansion_rounds"] = min(8, search.get("expansion_rounds", 0) + 1)
-            if "max_analyzed_works" in search:
-                # A continuation may widen discovery, but it must not turn a
-                # repair request into a wholesale remap of the catalog.  Keep
-                # the substantive-analysis increment small and independent of
-                # the provider page size; citation and full-text work are
-                # selected separately by the survey funnel.
-                increment = max(1, min(5, search.get("results_per_query", 1) // 10 or 1))
-                search["max_analyzed_works"] = min(
-                    search["max_works"], search["max_analyzed_works"] + increment)
+                search["expansion_rounds"] = min(8, search.get("expansion_rounds", 0) + 1)
+                if "max_analyzed_works" in search:
+                    # Discovery growth keeps the substantive-analysis increment
+                    # independent of provider page size.
+                    increment = max(1, min(5, search.get("results_per_query", 1) // 10 or 1))
+                    search["max_analyzed_works"] = min(
+                        search["max_works"], search["max_analyzed_works"] + increment)
+            # Implementation evidence retains its declared retrieval envelope.
+            # Follow-up ownership changes do not authorize wider discovery;
+            # quota and provider recovery can still narrow that envelope.
             survey["revision"] = int(survey.get("revision", 1)) + self.continuation_cycles
             self._augment_full_text_routes(config, self._prior_stage_project("survey", self.context))
         elif kind == "experiment":
@@ -26098,6 +26098,10 @@ class ComposerRunner:
                 return context
         config = json.loads(Path(stage["config_path"]).read_text())
         declared_model_execution_config = deepcopy(config.get("model"))
+        if kind == "survey":
+            # Continuation policy depends on the authoritative topic's
+            # evidence purpose, not the generic descriptor's template fields.
+            config = self._apply_topic_to_survey_config(stage, config)
         config = self._adapt_continuation_config(stage, config)
         if isinstance(config.get("model"), dict):
             config["model"] = load_model_config(config["model"])
@@ -26330,9 +26334,7 @@ class ComposerRunner:
                 result["research_program_path"] = str(research_program_path.resolve())
             output_path.write_bytes(canonical_bytes(result))
         elif kind in {"survey", "experiment"}:
-            if kind == "survey":
-                config = self._apply_topic_to_survey_config(stage, config)
-            elif kind == "experiment":
+            if kind == "experiment":
                 # Capability authoring runs inside topic projection. Freeze
                 # the downstream journal floor first so its generated
                 # executor is required to emit the analysis ledger that the
@@ -27581,6 +27583,8 @@ class ComposerRunner:
                 return True
             if self._resume_experiment_review_context_capacity(stage, record, completed):
                 return True
+            if self._resume_survey_generation_capacity(stage, record, completed, by_id):
+                return True
             if record.get("failure_class") == "operational_recovery":
                 continue
             error_text = str(record.get("error") or "")
@@ -27750,6 +27754,132 @@ class ComposerRunner:
                 record["recovery_admitted"] = True
                 return True
         return False
+
+    def _survey_generation_capacity_change(self, stage, record):
+        """Prove a larger generation envelope for the exact failed review owner."""
+        if stage.get("kind") != "survey" or record.get("failure_class") != "model_contract":
+            return None
+        context = self.context.get(stage["id"], {})
+        history = record.get("attempts", [])
+        latest = history[-1] if isinstance(history, list) and history else {}
+        identity = self._current_topic_identity()
+        if (not isinstance(identity, dict) or latest.get("attempt_number") != record.get("attempt_count")
+                or not self._failed_attempt_owns_recovery(stage["id"], context, latest, identity)):
+            return None
+        attempt = self.tasks.get_attempt(latest["attempt_id"])
+        payload = attempt.get("payload", {})
+        project = latest.get("project_dir")
+        if (attempt.get("state") != "failed" or attempt.get("task_id") != record.get("task_id")
+                or payload.get("stage_id") != stage["id"] or payload.get("project_dir") != project
+                or payload.get("attempt_number") != latest["attempt_number"]):
+            return None
+        _, _, dossier = self._read_verified_artifact_json(latest["failure_dossier_ref"])
+        requested = self._read_json_object(Path(stage["config_path"])) or {}
+        from scisaurus.runtime.models import resumed_model_execution_config, model_route_candidates
+        database = (Path(project) / "state/control.sqlite").resolve()
+        if not database.is_file():
+            return None
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            store = ArtifactStore(SimpleNamespace(dir=project, _conn=connection))
+            def read(manifest):
+                raw = store.read_body(manifest["body_hash"])
+                if hashlib.sha256(raw).hexdigest() != manifest["body_hash"]:
+                    raise StateError("generation capacity evidence differs from its immutable digest")
+                return json.loads(raw)
+            retained = store.head("inputs/run-config")
+            if not isinstance(retained, dict):
+                return None
+            original = read(retained)
+            model = resumed_model_execution_config(original["model"], requested.get("model"))
+            topic_match = self._topic_context_for_stage(stage)
+            topic = topic_match[1].get("topic", {}) if isinstance(topic_match, tuple) else {}
+            final_record = store.head("command/results/final")
+            if not isinstance(final_record, dict):
+                return None
+            final = read(final_record)
+            if (retained.get("author") != "principal" or final_record.get("author") != "command.controller"
+                    or original["survey"]["question"] != topic.get("research_question")
+                    or final.get("status") != "blocked" or final.get("run_id") != dossier.get("observed_result", {}).get("run_id")
+                    or final.get("error") != dossier.get("observed_result", {}).get("error")
+                    or connection.execute("SELECT 1 FROM attempts WHERE state='started' LIMIT 1").fetchone()
+                    or connection.execute("SELECT 1 FROM reservations WHERE state='reserved' LIMIT 1").fetchone()):
+                return None
+            executions = connection.execute(
+                "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/executions/survey-survey-review-%' "
+                "ORDER BY created_at DESC LIMIT 1").fetchall()
+            if not executions:
+                return None
+            execution = store.get(executions[0]["artifact_ref"])
+            result = read(execution)
+            failures = connection.execute(
+                "SELECT artifact_ref FROM artifacts WHERE logical_id LIKE 'command/model-work/%' ORDER BY created_at DESC LIMIT 1").fetchall()
+            if not failures:
+                return None
+            failure_record = store.get(failures[0]["artifact_ref"])
+            failure = read(failure_record)
+            feedback = failure.get("feedback", {})
+            previous = feedback.get("previous_response", {})
+            if (failure_record.get("author") != "command.controller" or failure.get("status") != "blocked"
+                    or failure.get("failure_class") != "model_contract" or feedback.get("finish_reason") != "length"
+                    or not isinstance(previous, dict) or previous.get("raw_text") != result.get("text")
+                    or final.get("error") != "ModelWorkBlocked: " + str(failure.get("error"))):
+                return None
+            task_id = execution["artifact_id"].removeprefix("command/executions/")
+            receipts = connection.execute("SELECT state,usage_json FROM attempts WHERE task_id=? ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchall()
+            params_record = store.get(execution["inputs"][0]["ref"])
+            params = read(params_record)
+            prompt = json.loads(params["prompt"])
+            client = params.get("client", {})
+            old_limit = client.get("max_output_tokens")
+            if (execution.get("author") != "methods.survey-reviewer" or params.get("role") != "methods.survey-reviewer"
+                    or prompt.get("phase") != "survey_review" or prompt.get("question") != original["survey"]["question"]
+                    or result.get("finish_reason") != "length" or type(old_limit) is not int
+                    or type(result.get("usage", {}).get("output_tokens")) is not int
+                    or result["usage"]["output_tokens"] < old_limit or not receipts or receipts[0]["state"] != "succeeded"
+                    or json.loads(receipts[0]["usage_json"]).get("actual") != result.get("usage")):
+                return None
+            candidates = [candidate for candidate in model_route_candidates(model, role=params["role"])
+                if all(candidate.get(key) == client.get(key) for key in ("protocol", "base_url", "model"))
+                and type(candidate.get("max_output_tokens")) is int and candidate["max_output_tokens"] > old_limit]
+            if not candidates:
+                return None
+            return {"stage_id": stage["id"], "project_dir": project, "attempt_number": latest["attempt_number"],
+                "failure_dossier_ref": latest["failure_dossier_ref"], "input_ref": retained["artifact_ref"],
+                "input_sha256": retained["body_hash"], "execution_ref": execution["artifact_ref"],
+                "execution_sha256": execution["body_hash"], "context_ref": params_record["artifact_ref"],
+                "context_sha256": params_record["body_hash"], "previous_output_limit": old_limit,
+                "failure_ref": failure_record["artifact_ref"], "failure_sha256": failure_record["body_hash"],
+                "requested_model_sha256": hashlib.sha256(canonical_bytes(model)).hexdigest(),
+                "new_output_limit": candidates[0]["max_output_tokens"]}
+
+    def _resume_survey_generation_capacity(self, stage, record, completed, by_id):
+        proof = self._survey_generation_capacity_change(stage, record)
+        if proof is None:
+            return False
+        signature = hashlib.sha256(canonical_bytes(proof)).hexdigest()
+        if self.format_recovery_ledger.get(signature, {}).get("status") in {"dispatched", "exhausted"}:
+            return False
+        receipt = self._publish("command/survey-generation-capacity/" + signature, "note", proof,
+            "command.composer", subjects=[proof["failure_dossier_ref"]])
+        prior = deepcopy(self.context[stage["id"]])
+        context = deepcopy(prior)
+        request = self._format_contract_recovery_request(stage, context)
+        request["id"] = "generation-capacity-" + signature[:32]
+        context.update(status="research_expansion_required", review_status="survey_integrity_repair",
+            resume_scope="integrated_review", format_recovery_dispatched=False,
+            format_recovery_signature=signature, research_requests=[request], research_expansion_requests=[],
+            generation_capacity_admission_ref=receipt["artifact_ref"])
+        self.context[stage["id"]] = context
+        self.format_recovery_ledger[signature] = {"stage_id": stage["id"], "status": "pending",
+            "capacity_admission_ref": receipt["artifact_ref"]}
+        if not self._begin_continuation(completed, by_id):
+            self.context[stage["id"]] = prior
+            return False
+        self.stage_records[stage["id"]].update(status="retrying", recovery_admitted=True,
+            project_dir=proof["project_dir"], resume_scope="integrated_review")
+        return True
 
     def _reconcile_restored_topic_refinement_failure(self, completed, by_id):
         """Reclassify a saved parent-identity violation as a scientific repair.

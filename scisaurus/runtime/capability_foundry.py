@@ -2356,7 +2356,7 @@ class CapabilityFoundry:
     def __init__(self, model_config, *, runtime_python, workspace_root, registry_root, repo_root,
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
                  model_timeout_seconds=None, reviewer_client=None, validator_client=None,
-                 author_max_output_tokens=24000, reviewer_max_output_tokens=12000,
+                 author_max_output_tokens=32768, reviewer_max_output_tokens=32768,
                  author_backend=None):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)

@@ -102,6 +102,19 @@ zero permits initial acquisition, one permits one further citation/search level.
 Reads beyond that scope are retained as deferred, not silently treated as reviewed
 or irrelevant. A specific missing critical input can require a separately scoped
 follow-up. Ordinary literature surveys keep their broader exploration policy.
+Continuation orders retain the implementation survey's declared search envelope;
+they do not automatically increase catalog, analysis or traversal limits. Topic
+projection precedes continuation policy so a generic descriptor receives the
+selected concept's evidence purpose before its resource bounds are derived.
+Provider and quota recovery may narrow this envelope.
+
+Default model routes and specialist per-call allowances support 32,768 output
+tokens. Topic field repairs and maturity reviews use the configured route's
+capacity. Foundry authoring, independent validation, and review share this
+baseline; provider context windows reserve both input and output. Historical
+receipts and immutable inputs retain their original limits and usage. An
+exhausted aggregate review can reopen only with an owned truncated receipt
+and a verified larger execution envelope, without restarting acquisition.
 
 Fresh project creation explicitly supplies a deep-analysis budget even when a
 template omits `max_analyzed_works`: the default decision slice is 12 works or

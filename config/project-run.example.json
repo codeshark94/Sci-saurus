@@ -21,7 +21,7 @@
     "base_url": "runtime_required",
     "model": "runtime_required",
     "timeout_seconds": 180,
-    "max_output_tokens": 8192,
+    "max_output_tokens": 32768,
     "auth_env": null
   },
   "limits": {

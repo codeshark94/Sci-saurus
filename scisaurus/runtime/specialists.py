@@ -24,6 +24,7 @@ from scisaurus.core.schema import canonical_bytes, json_object
 from scisaurus.core.source_spans import SPAN_EVIDENCE_FIELDS
 from scisaurus.runtime.evidence import scientific_input_recovery_contract
 from scisaurus.runtime.execution_policy import enforce_model_cost_limits
+from scisaurus.runtime.departments import ROLE_OUTPUT_TOKENS_PER_CALL
 from scisaurus.runtime.models import (
     ModelCallError,
     ModelClient,
@@ -2824,7 +2825,7 @@ class SpecialistDispatcher:
             output_budget = legacy_per_call * (max_call_attempts or 1)
             output_per_call = legacy_per_call
         if type(output_budget) is not int or output_budget <= 0:
-            output_budget = 8192 * (max_call_attempts or 1)
+            output_budget = ROLE_OUTPUT_TOKENS_PER_CALL * (max_call_attempts or 1)
         if output_per_call is None:
             output_per_call = output_budget
         if type(output_per_call) is not int or output_per_call <= 0:

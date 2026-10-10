@@ -5457,7 +5457,7 @@ class TopicDiscoveryRunner:
         self.deadline_seconds = float(deadline_seconds) if deadline_seconds is not None else None
 
     def _client(self, role, *, seed=None, deadline=None, sampling_overrides=None,
-                max_output_tokens=None, route_index=None):
+                route_index=None):
         if self.author_client is not None and role == "topic_discovery":
             self.author_client.timeout_seconds = self.author_client.config["timeout_seconds"]
             if deadline is not None:
@@ -5542,10 +5542,6 @@ class TopicDiscoveryRunner:
                 self.model_config, role=role,
                 overrides=overrides or None,
             )
-        if type(max_output_tokens) is int and max_output_tokens > 0:
-            configured_output = config.get("max_output_tokens")
-            config["max_output_tokens"] = min(configured_output, max_output_tokens) \
-                if type(configured_output) is int else max_output_tokens
         # TopicBudget charges one logical dispatch.  Do not hide additional
         # provider requests inside ModelClient retries; bounded repair is
         # owned by this runner and is recorded as a separate event.
@@ -5629,7 +5625,6 @@ class TopicDiscoveryRunner:
             "topic_discovery",
             deadline=deadline,
             sampling_overrides={"temperature": 0.2, "top_p": 0.85, "presence_penalty": 0.0},
-            max_output_tokens=2400,
         )
         prompt = _topic_missing_field_repair_prompt(package, targets, runtime_context)
         budget.before_model_call(
@@ -7555,11 +7550,6 @@ class TopicDiscoveryRunner:
                             {"temperature": 0.1, "top_p": 0.85}
                             if review_attempt else None
                         ),
-                        # The maturity contract is six compact JSON fields.
-                        # A large cap made the flash reviewer spend its
-                        # response on prose and terminate at length, forcing
-                        # an avoidable second call on every candidate.
-                        max_output_tokens=900,
                     )
                     maturity_payload = json.loads(_maturity_review_prompt(
                         objective, package, refinement_context=refinement_context,
