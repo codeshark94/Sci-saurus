@@ -5,7 +5,7 @@ index 1937f4a1dc..08c9244485 100644
 @@ -289,6 +289,14 @@ export class HarnessClient {
      return result.messageId
    }
- 
+
 +  /** Restore a durable session before sending another prompt. */
 +  async resume(sessionId: string): Promise<void> {
 +    const result = await this.request('session/resume', { sessionId })
@@ -44,7 +44,7 @@ index 533b5f23c5..0177f8c2b5 100644
 @@ -44,6 +44,15 @@ export interface SessionPromptResult {
    messageId: string
  }
- 
+
 +/** Restore a persisted session without creating a replacement identity. */
 +export interface SessionResumeParams {
 +  sessionId: string
@@ -56,7 +56,7 @@ index 533b5f23c5..0177f8c2b5 100644
 +
  /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
  export type SdkRunStatus = 'ok' | 'error'
- 
+
 @@ -101,5 +110,6 @@ export interface HarnessSdkNotificationMap {
  export interface HarnessSdkRequestMap {
    'initialize': { params: InitializeParams; result: InitializeResult }
@@ -80,7 +80,7 @@ index 195caa908d..a92e450ab3 100644
 @@ -142,6 +144,31 @@ export class HarnessSdkJsonRpcServer {
      return { messageId: message.id }
    }
- 
+
 +  /** Restore one persisted agent under the configured route and server ownership. */
 +  async resume(params: SessionResumeParams): Promise<SessionResumeResult> {
 +    const id = params.sessionId
@@ -124,7 +124,7 @@ index 495f1d90f4..93edd80011 100644
 +++ b/packages/sdk/server/tests/server.spec.ts
 @@ -109,6 +109,39 @@ async function settleSubagent(
  }
- 
+
  describe('HarnessSdkJsonRpcServer', () => {
 +  it('restores persisted history through an explicit resume boundary', { timeout: 15_000 }, async () => {
 +    const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-resume-'))
