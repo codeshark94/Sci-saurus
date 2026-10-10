@@ -56,6 +56,13 @@ Completed literature is reused with its exact provenance; an implementation
 repair belongs to its author and does not restart the whole survey. A completed
 response-format repair closes independently of a remaining scientific hold.
 
+An authorized concept pilot hands the retained reference collection to DSH
+without further search planning, per-order literature adjudication or a second
+aggregate approval. Open requirements remain unfulfilled implementation inputs;
+the reference handoff is not a novelty verdict or design approval. DSH retains
+the reference design separately from the current editable design and checks
+critical physical inputs before executing the affected calculation.
+
 The general research and manuscript stage graph remains available for missions
 that require it. It is not a compulsory publication sequence for every design
 iteration.

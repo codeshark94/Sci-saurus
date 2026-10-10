@@ -557,6 +557,45 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_implementation_reference_handoff_skips_paid_followup_and_recollection(self):
+        from scisaurus.tests.test_material_development import brief
+        config = survey_config(self.endpoint)
+        config["survey"]["design_brief"] = brief()
+        order = self.follow_up_order()
+        runner = self.runtime(config, work_orders=[order])
+        runner._initialize(); runner._setup()
+        runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+        runner._map(); runner._accept_survey(); runner._nominate()
+        runner._complete_countersearch_scope(); runner._assess()
+        pair = (runner.survey_ref, runner.assessment_ref)
+        calls = runner.model_calls_dispatched
+        runner.resume_session = {"reopened_scopes": ["operations"]}
+        with patch.object(runner, "_record_model_execution_controls"), \
+             patch.object(runner, "_setup", side_effect=AssertionError("repeated setup")), \
+             patch.object(runner, "_prepare_follow_up", side_effect=AssertionError("repeated discovery")), \
+             patch.object(runner, "_resolve_follow_up", side_effect=AssertionError("literature adjudication")):
+            result = runner._run()
+        self.assertEqual(result["status"], "completed", result.get("error"))
+        self.assertEqual((result["survey_ref"], result["assessment_ref"]), pair)
+        self.assertEqual(runner.model_calls_dispatched, calls)
+        self.assertEqual(result["implementation_reference_handoff"]["open_work_orders"], [order])
+        self.assertIsNone(result["follow_up_result"])
+
+    def test_reference_handoff_preserves_integrity_and_refuted_boundary(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime()
+        runner.score["design_brief"] = brief()
+        runner.survey_ref = "artifact:kb/surveys/current@1"
+        runner.assessment_ref = "artifact:kb/gap-assessments/current@1"
+        runner.score_ref = "artifact:command/scores/example@1"
+        with patch.object(runner.gate, "require_current"), patch.object(runner.gate, "require_current_assessment"), \
+             patch.object(runner, "_body", side_effect=[{"state": "refuted_by_prior_work", "survey_ref": runner.survey_ref},
+                                                      {"score_ref": runner.score_ref}]), \
+             patch.object(runner.store, "get", return_value={}):
+            self.assertIsNone(runner._implementation_reference_handoff())
+        with patch.object(runner.gate, "require_current", side_effect=ValidationError("stale evidence")):
+            with self.assertRaisesRegex(ValidationError, "stale"):
+                runner._implementation_reference_handoff()
     def test_partial_implementation_batch_retains_rows_and_requests_only_unresolved(self):
         from scisaurus.tests.test_material_development import brief
         for mode in ("batch-missing", "batch-invalid"):
@@ -774,7 +813,7 @@ class TestSurveyRunner(unittest.TestCase):
         runner.nomination_record = None
         names = {row["name"] for row in runner._required_model_work()}
         self.assertIn("gap-assessment", names)
-        self.assertTrue(any(name.startswith("follow-up-disposition-") for name in names))
+        self.assertFalse(any(name.startswith("follow-up-disposition-") for name in names))
         self.assertNotIn("counter-plan", names)
         self.assertNotIn("survey-review:countersearch", names)
         with self.assertRaises(StateError):

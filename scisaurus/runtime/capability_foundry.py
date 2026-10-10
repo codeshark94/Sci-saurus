@@ -2046,6 +2046,8 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
     topic = ({key: _bounded_repair_text(topic[key], 1200)
               for key in topic_fields if key in topic}
              if isinstance(topic, dict) else {})
+    if isinstance(brief, dict) and isinstance(brief.get("topic"), dict) and "design_brief" in brief["topic"]:
+        topic["design_brief"] = _preserve_response_value(brief["topic"]["design_brief"])
     orders = configured_input.get("work_orders", [])
     if not isinstance(orders, list):
         orders = []
@@ -2086,6 +2088,11 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
     if (isinstance(brief, dict) and "topic_review_obligations_sha256" in brief
             and brief["topic_review_obligations_sha256"] != obligations_sha256):
         raise ValidationError("topic review obligation fingerprint does not match its exact content")
+    handoffs = brief.get("implementation_reference_handoffs") if isinstance(brief, dict) else None
+    if handoffs is not None and (not isinstance(handoffs, list)
+            or any(not isinstance(item, dict) for item in handoffs)):
+        raise ValidationError("implementation reference handoffs must be a list of objects")
+    handoffs = _preserve_response_value(handoffs) if handoffs is not None else None
     output_contract = {"updates": {
         "executor_source": (
             "optional {'edits':[{'old':unique_text,'new':replacement}]} or a fingerprinted duplicate-only "
@@ -2166,6 +2173,9 @@ def authoring_patch_prompt(*, brief, required_intent, configured_input,
             "repair_evidence_frontier_sha256": frontier_sha256,
             "topic_review_obligations": obligations,
             "topic_review_obligations_sha256": obligations_sha256,
+            "implementation_reference_handoffs": handoffs,
+            "implementation_reference_handoffs_sha256": hashlib.sha256(canonical_bytes(handoffs)).hexdigest()
+                if handoffs is not None else None,
             "repair_plan_sha256": (hashlib.sha256(canonical_bytes(selected_plan)).hexdigest()
                                    if selected_plan is not None else None),
         },

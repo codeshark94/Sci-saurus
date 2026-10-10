@@ -9546,6 +9546,14 @@ class ComposerRunner:
     def _settle_stage_work_orders(self, stage, context, outcome):
         """Resolve owned work through the department ledger and retain other owners' inputs."""
         self._mark_research_requests_attempted(stage)
+        if (stage.get("kind") == "survey" and context.get("status") in {"completed", "accepted"}
+                and self._validated_implementation_reference_handoff(stage, context) is not None):
+            self.department_activity.append({"cycle": self.continuation_cycles,
+                "action": "carry_open_reference_requirements_to_implementation",
+                "stage_id": stage["id"],
+                "handoff_ref": context["implementation_reference_handoff"]["ref"],
+                "work_orders": deepcopy(context["implementation_open_work_orders"])})
+            return
         if not self.active_research_requests:
             return
         if context.get("preserve_work_orders"):
@@ -10459,6 +10467,8 @@ class ComposerRunner:
         if (stage.get("kind") != "survey" or not isinstance(result, dict)
                 or result.get("status") not in {"completed", "accepted"}):
             return result
+        if self._validated_implementation_reference_handoff(stage, result) is not None:
+            return result
         outstanding = [request for request in self._requests_for_stage(stage)
                        if request.get("kind") == "literature_expansion"
                        and not self._survey_request_was_fulfilled(stage["project_dir"], result, request)]
@@ -10469,6 +10479,72 @@ class ComposerRunner:
                            "research_requests": deepcopy(outstanding),
                            "research_expansion_requests": deepcopy(outstanding)})
         return result
+
+    def _implementation_reference_stage(self, stage):
+        if stage.get("kind") != "survey" or not self._allows_provisional_progress():
+            return False
+        topic_stage = self._topic_stage_for_survey(stage)
+        context = self.context.get(topic_stage["id"], {}) if topic_stage else {}
+        if context.get("intake_mode") != "concept":
+            return False
+        from scisaurus.runtime.material_development import validate_design_brief
+        validate_design_brief(context.get("topic", {}).get("design_brief"))
+        return True
+
+    def _validated_implementation_reference_handoff(self, stage, result):
+        handoff = result.get("implementation_reference_handoff") if isinstance(result, dict) else None
+        if handoff is None or not self._allows_provisional_progress():
+            return None
+        from scisaurus.runtime.material_development import implementation_reference_handoff, validate_design_brief
+        from scisaurus.runtime.survey_config import project_survey_evidence_work_orders
+        from scisaurus.core.surveys import SurveyGate
+        topic_stage = self._topic_stage_for_survey(stage)
+        topic = self.context.get(topic_stage["id"], {}).get("topic", {}) if topic_stage else {}
+        project = Path(result.get("project_dir") or stage["project_dir"]).resolve()
+        owner_paths = {Path(path).resolve() for path in (stage.get("project_dir"),
+            self.stage_records.get(stage["id"], {}).get("project_dir")) if isinstance(path, str)}
+        if (result.get("status") not in {"completed", "accepted"}
+                or result.get("survey_current") is not True
+                or result.get("assessment_current") is not True
+                or not isinstance(handoff, dict) or not isinstance(handoff.get("ref"), str)
+                or project not in owner_paths
+                or topic.get("research_question") != handoff.get("question")):
+            raise StateError("implementation reference handoff differs from the current design or evidence")
+        validate_design_brief(topic.get("design_brief"))
+        with closing(sqlite3.connect((project / "state/control.sqlite").as_uri() + "?mode=ro", uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            control = SimpleNamespace(dir=str(project), _conn=connection)
+            store = ArtifactStore(control)
+            gate = SurveyGate(control, store)
+            record, raw = gate._artifact(handoff["ref"])
+            body = json.loads(raw)
+            _, config_raw = gate._artifact(store.head("inputs/run-config")["artifact_ref"])
+            config = json.loads(config_raw)
+            gate.require_current(result["survey_ref"])
+            gate.require_current_assessment(result["assessment_ref"])
+            assessment = json.loads(store.read_body(store.get(result["assessment_ref"])["body_hash"]))
+            _, survey_raw = gate._artifact(result["survey_ref"])
+            survey = json.loads(survey_raw)
+            _, score_raw = gate._artifact(survey["score_ref"])
+            score = json.loads(score_raw)["survey"]
+            if (assessment.get("survey_ref") != result["survey_ref"]
+                    or score["question"] != config["survey"]["question"]
+                    or score.get("design_brief") != config["survey"].get("design_brief")):
+                raise StateError("implementation reference handoff has mismatched scientific input")
+            expected = implementation_reference_handoff(question=config["survey"]["question"],
+                design_brief=config["survey"]["design_brief"], survey_ref=result["survey_ref"],
+                assessment_ref=result["assessment_ref"], assessment_state=assessment["state"],
+                work_orders=result["work_orders"], project_dir=str(project))
+            inputs = {item["ref"] for item in record["inputs"]}
+            if (record.get("author") != "command.controller" or record.get("artifact_type") != "note"
+                    or body != expected or handoff != {"ref": record["artifact_ref"], **body}
+                    or body["assessment_state"] != result.get("gap_state")
+                    or not {result["survey_ref"], result["assessment_ref"]} <= inputs
+                    or project_survey_evidence_work_orders(self._survey_producer_work_orders(stage))
+                       != self._follow_up_projection(body["open_work_orders"])):
+                raise StateError("implementation reference handoff lacks exact current ownership")
+        return handoff
 
     def _gate_free_topic_survey(self, result, *, stage=None):
         """Hold a free-topic mission until its question survives literature review.
@@ -10483,6 +10559,27 @@ class ComposerRunner:
             return result
         if result.get("status") not in {"completed", "accepted", "research_expansion_required"}:
             return result
+        if stage is not None:
+            handoff = self._validated_implementation_reference_handoff(stage, result)
+            if handoff is not None:
+                pilot = deepcopy(result)
+                pilot["topic_admission"] = ("exploratory_pilot" if result["gap_state"] == "insufficient_evidence"
+                                            else "provisional_supported_for_experiment")
+                pilot["carried_maturity_requirements"] = deepcopy(
+                    self._topic_maturity_requirement_scope(
+                        self.context.get(topic_stage["id"], {}).get("topic"),
+                        self.context.get(topic_stage["id"], {}))["active"])
+                pilot["implementation_open_work_orders"] = deepcopy(handoff["open_work_orders"])
+                pilot["implementation_design_binding"] = {
+                    "reference_handoff_ref": handoff["ref"],
+                    "reference_design_sha256": hashlib.sha256(canonical_bytes(handoff["design_brief"])).hexdigest(),
+                    "current_topic_sha256": hashlib.sha256(canonical_bytes(self.context[topic_stage["id"]]["topic"])).hexdigest(),
+                    "current_design_sha256": hashlib.sha256(canonical_bytes(self.context[topic_stage["id"]]["topic"]["design_brief"])).hexdigest(),
+                    "scope": "References support the unchanged question. Revised design applicability must be checked during implementation; this is not design approval.",
+                }
+                pilot["carried_maturity_requirements"].append(
+                    "Preliminary references do not establish novelty or performance; open implementation requirements remain unfulfilled.")
+                return pilot
         if stage is not None:
             obligation = self._topic_review_obligation(stage)
             if obligation is not None and not self._topic_review_obligation_is_closed(stage, result, obligation):
@@ -15812,6 +15909,16 @@ class ComposerRunner:
                 if obligation is not None:
                     topic_obligations.append({"obligation": obligation,
                         "reviewed_closure": deepcopy(self.context.get(survey_stage["id"], {}).get("follow_up_result"))})
+                survey_context = self.context.get(survey_stage["id"], {})
+                handoff = self._validated_implementation_reference_handoff(survey_stage, survey_context)
+                if handoff is not None:
+                    binding = survey_context.get("implementation_design_binding")
+                    if (not isinstance(binding, dict)
+                            or binding.get("reference_handoff_ref") != handoff["ref"]
+                            or binding.get("current_topic_sha256") != hashlib.sha256(canonical_bytes(selected)).hexdigest()):
+                        raise StateError("implementation handoff is not bound to the authored design")
+                    brief.setdefault("implementation_reference_handoffs", []).append({
+                        "reference_packet": deepcopy(handoff), "design_binding": deepcopy(binding)})
             if topic_obligations:
                 brief["topic_review_obligations"] = _preserve_response_value(topic_obligations)
             if review_contract is not None:
@@ -20028,6 +20135,16 @@ class ComposerRunner:
         return False
 
     def _survey_attempt_was_accepted(self, stage_id, attempt, run):
+        if isinstance(run.get("implementation_reference_handoff"), dict):
+            stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
+            try:
+                project = run.get("project_dir") or run["project_id"]
+                return (stage is not None and stage["kind"] == "survey"
+                        and isinstance(attempt.get("project_dir"), str)
+                        and Path(attempt["project_dir"]).resolve() == Path(project).resolve()
+                        and self._validated_implementation_reference_handoff(stage, {**run, "project_dir": project}) is not None)
+            except (KeyError, TypeError, ValueError, OSError, NotFoundError, ValidationError, StateError, ConflictError):
+                return False
         rows = self.departments._assignment_task_rows(
             stage_id=stage_id, attempt_number=attempt.get("attempt_number"))
         verifier = next((item for item in rows if item.get("assignment_phase") == "verifier"), None)
@@ -22805,6 +22922,12 @@ class ComposerRunner:
                 }
                 if stage["kind"] == "survey":
                     target = "faithful bounded implementation literature for concept development, with unresolved novelty explicitly retained for an authorized exploratory pilot"
+                    concept_scope["development_scope"]["blocking_requirements"] = (
+                        "Check captured-source integrity and exact reference handoff only. "
+                        "Do not require per-paper reviews, novelty decisions or independent completion "
+                        "of design and execution work orders in this reference stage. "
+                        "Preserve exact assigned obligations unchanged for the DSH implementation; do not mark them fulfilled. "
+                        "The experiment's physical-input, execution and result-validation gates own their resolution.")
         return {**concept_scope, "current_stage_id": stage["id"],
             "obligation_scope": {"topic_ids": topic_ids, "stage_work_kinds": {
                 item["id"]: work_kinds[item["kind"]] for item in self.workflow["stages"] if item["id"] in descendants},
@@ -31383,7 +31506,7 @@ class ComposerRunner:
                                     })).hexdigest(),
                                 },
                                 deadline_seconds=self._stage_remaining(attempt_stage),
-                                active_role_ids=self._active_stage_role_ids(
+                                active_role_ids=[] if self._implementation_reference_stage(stage) else self._active_stage_role_ids(
                                     stage, stage_context=self.context.get(stage_id),
                                     descriptor=json.loads(Path(stage["config_path"]).read_text())),
                             )
@@ -31557,9 +31680,12 @@ class ComposerRunner:
                             merged_usage["by_role"] = deepcopy(
                                 specialist_bundle.get("usage", {}).get("by_role", {}))
                             context["usage"] = merged_usage
-                            specialist_verifier = self._run_specialist_verifier(
-                                attempt_stage, stage_assignment, descriptor,
-                                specialist_bundle, context, stage_result=context)
+                            reference_handoff = (self._validated_implementation_reference_handoff(attempt_stage, context)
+                                if stage["kind"] == "survey" and context.get("status") in {"completed", "accepted"}
+                                else None)
+                            specialist_verifier = (None if reference_handoff is not None else
+                                self._run_specialist_verifier(attempt_stage, stage_assignment, descriptor,
+                                    specialist_bundle, context, stage_result=context))
                             if specialist_verifier is not None:
                                 context["specialist_verifier"] = deepcopy(specialist_verifier)
                                 verifier_usage = self._specialist_usage([specialist_verifier])

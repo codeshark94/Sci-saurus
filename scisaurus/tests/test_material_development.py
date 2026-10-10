@@ -34,6 +34,22 @@ def concept_candidates():
 
 
 class MaterialDevelopmentTests(unittest.TestCase):
+    def test_reference_handoff_carries_requirements_without_scientific_fulfillment(self):
+        from scisaurus.runtime.material_development import implementation_reference_handoff
+        design = brief(); orders = [{"id": "measurement", "objective": "Check the baseline"}]
+        packet = implementation_reference_handoff(question="Compare responses", design_brief=design,
+            survey_ref="artifact:kb/surveys/current@1", assessment_ref="artifact:kb/gap-assessments/current@1",
+            assessment_state="insufficient_evidence", work_orders=orders, project_dir="/tmp/references")
+        self.assertEqual(packet["assessment_state"], "insufficient_evidence")
+        self.assertEqual(packet["open_work_orders"], orders)
+        self.assertIn("not fulfilled", packet["completion_boundary"])
+        orders[0]["objective"] = "changed"; design["baseline"] = "changed"
+        self.assertEqual(packet["open_work_orders"][0]["objective"], "Check the baseline")
+        self.assertNotEqual(packet["design_brief"], design)
+        with self.assertRaises(ValidationError):
+            implementation_reference_handoff(question="Compare responses", design_brief=brief(),
+                survey_ref=packet["survey_ref"], assessment_ref=packet["assessment_ref"],
+                assessment_state="refuted_by_prior_work", work_orders=[], project_dir="/tmp/references")
     def test_concept_comparison_spans_supported_nonstructural_physics(self):
         candidates = concept_candidates()
         laboratory = {"design_families": [{"id": "pattern"}],

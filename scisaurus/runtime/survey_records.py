@@ -47,7 +47,7 @@ MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-follow-up-response-contract-18"
+SURVEY_RESPONSE_CONTRACT_REVISION = "implementation-reference-handoff-19"
 CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-3"
 CURRENT_MAP_REVIEW_PROTOCOLS = frozenset({
     "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL,

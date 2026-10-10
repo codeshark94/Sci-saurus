@@ -628,10 +628,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _initialize_survey(self, project_dir, config, *, on_progress, resume_policy,
                            provider_fallback, model_call_budget_scopes, model_budget_delegation, work_orders,
                            review_obligations, model_execution_config):
-        from scisaurus.runtime.survey_config import validate_survey_work_orders
-        orders = validate_survey_work_orders(
+        from scisaurus.runtime.survey_config import project_survey_evidence_work_orders
+        self.work_orders = project_survey_evidence_work_orders(
             config.get("work_orders") if work_orders is None else work_orders)
-        self.work_orders = [order for order in orders if order["kind"] == "literature_expansion"]
         self.follow_up_ref = None
         self.follow_up_result = None
         self._follow_up_decisions = set()
@@ -1119,6 +1118,34 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         }, "methods.evidence-verifier", subjects=[self.follow_up_ref, self.survey_ref,
                                                    self.assessment_ref, *executions, *completion_executions])
         self.follow_up_result = {"ref": record["artifact_ref"], **value}
+
+    def _implementation_reference_handoff(self):
+        if self.score.get("design_brief") is None or not self.survey_ref or not self.assessment_ref:
+            return None
+        self.gate.require_current(self.survey_ref)
+        self.gate.require_current_assessment(self.assessment_ref)
+        assessment = self._body(self.store.get(self.assessment_ref))
+        survey = self._body(self.store.get(self.survey_ref))
+        if assessment.get("survey_ref") != self.survey_ref or survey.get("score_ref") != self.score_ref:
+            raise StateError("implementation reference handoff has mismatched survey, assessment or score")
+        if assessment["state"] == "refuted_by_prior_work":
+            return None
+        from scisaurus.runtime.material_development import implementation_reference_handoff
+        body = implementation_reference_handoff(question=self.score["question"],
+            design_brief=self.score["design_brief"], survey_ref=self.survey_ref,
+            assessment_ref=self.assessment_ref, assessment_state=assessment["state"],
+            work_orders=self.work_orders, project_dir=str(self.dir.resolve()))
+        logical = "command/implementation-reference-handoffs/" + hashlib.sha256(canonical_bytes(body)).hexdigest()
+        record = self.store.head(logical)
+        if record is None:
+            record = self._publish(logical, "note", body, "command.controller",
+                subjects=[self.score_ref, self.survey_ref, self.assessment_ref,
+                          *([self.follow_up_ref] if self.follow_up_ref else [])])
+        manifest, raw = self.gate._artifact(record["artifact_ref"])
+        if (manifest.get("author") != "command.controller" or manifest["artifact_type"] != "note"
+                or json.loads(raw) != body):
+            raise StateError("retained implementation reference handoff differs from its owned evidence")
+        return {"ref": record["artifact_ref"], **body}
 
     def _plan_work_budget(self):
         """Fit the discoverable work budget to the configured review reserve.
@@ -2131,7 +2158,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if not self._countersearch_active:
                     required.append({"name": "survey-review:countersearch", "phase": "survey_review", "actor": "methods.survey-reviewer"})
             required.append({"name": "gap-assessment", "phase": "gap_assessment", "actor": "methods.novelty-verifier"})
-        if self.work_orders and self.follow_up_result is None:
+        if self.work_orders and self.follow_up_result is None and self.score.get("design_brief") is None:
             for order in self.work_orders:
                 identity = hashlib.sha256(canonical_bytes(order)).hexdigest()
                 if identity not in self._follow_up_decisions:
@@ -5918,6 +5945,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _run(self):
         status, error, decision = "blocked", None, "insufficient_evidence"
         failure = None
+        reference_handoff = None
         try:
             if self.resume_session:
                 self._record_model_execution_controls()
@@ -5925,6 +5953,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 self._initialize()
             if not self.resume_session and not self.time_policy.snapshot()["initial_hard_limit_feasible"]:
                 raise ValidationError("configured survey stages do not fit the hard deadline; no external work dispatched")
+            reference_handoff = self._implementation_reference_handoff()
             retained_follow_up_discovery = (
                 bool(self.work_orders) and self.resume_session is not None
                 and (self.counter_queries_complete or self.follow_up_discovery_current)
@@ -5935,9 +5964,12 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                     not self.survey_ref or self.nomination is None or not self.countersearch_complete))
             if self.resume_session and "operations" in self.resume_session["reopened_scopes"]:
                 needs_operations = True
+            if reference_handoff is not None:
+                needs_operations = False
             if needs_operations:
                 self._setup()
-            if self.work_orders and self.resume_session and not retained_follow_up_discovery:
+            if (reference_handoff is None and self.work_orders and self.resume_session
+                    and not retained_follow_up_discovery):
                 self._prepare_follow_up()
             if self.assessment_ref:
                 decision = self._body(self.store.get(self.assessment_ref))["state"]
@@ -5958,7 +5990,9 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if not self.countersearch_complete:
                     self._complete_countersearch_scope()
                 decision = self._assess()
-            self._resolve_follow_up()
+            reference_handoff = self._implementation_reference_handoff()
+            if self.score.get("design_brief") is None:
+                self._resolve_follow_up()
             status = "completed"
         except (Exception, KeyboardInterrupt) as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -6022,6 +6056,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "failure": failure,
             "work_orders": deepcopy(self.work_orders), "follow_up_ref": self.follow_up_ref,
             "follow_up_result": deepcopy(self.follow_up_result),
+            "implementation_reference_handoff": reference_handoff,
             "incumbent_ref": self.incumbent,
             "score_ref": getattr(self, "score_ref", None), "survey_ref": self.survey_ref, "survey_current": current,
             "assessment_ref": self.assessment_ref, "assessment_current": assessment_current,

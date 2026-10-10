@@ -8,6 +8,35 @@ DESIGN_BRIEF_REVISION = "material-design-brief-1"
 CONCEPT_CANDIDATE_COUNT = 3
 
 
+def implementation_reference_handoff(*, question, design_brief, survey_ref,
+                                     assessment_ref, assessment_state, work_orders, project_dir):
+    """Carry preliminary references and open requirements into implementation."""
+    validate_design_brief(design_brief)
+    if (not isinstance(question, str) or not question.strip()
+            or not all(isinstance(ref, str) and ref.startswith("artifact:")
+                       for ref in (survey_ref, assessment_ref))
+            or assessment_state not in {"eligible_for_experiment", "insufficient_evidence"}
+            or not isinstance(work_orders, list)
+            or any(not isinstance(order, dict) or not isinstance(order.get("id"), str)
+                   for order in work_orders)):
+        raise ValidationError("implementation reference handoff requires current evidence and owned requirements")
+    return {
+        "schema_version": "implementation-reference-handoff-1",
+        "source_project_dir": str(project_dir),
+        "question": question, "design_brief": deepcopy(design_brief),
+        "survey_ref": survey_ref, "assessment_ref": assessment_ref,
+        "assessment_state": assessment_state,
+        "open_work_orders": deepcopy(work_orders),
+        "completion_boundary": (
+            "Preliminary reference collection is complete. Open requirements are not fulfilled. "
+            "Use the captured references to implement the smallest baseline and pilot; resolve "
+            "design definitions, dependencies and physical inputs in that implementation. "
+            "Missing implementation-critical inputs must block the affected calculation, not trigger "
+            "a general literature campaign. Novelty and performance remain unverified. "
+            "Actual execution, independent recalculation and scientific result review remain required."),
+    }
+
+
 def scope_workflow_to_experiments(workflow):
     """Retain experiment goals and their declared prerequisite closure."""
     scoped = deepcopy(workflow)

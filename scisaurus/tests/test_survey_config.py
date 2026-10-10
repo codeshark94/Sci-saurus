@@ -30,6 +30,19 @@ def survey_config():
 
 
 class TestSurveyConfig(unittest.TestCase):
+    def test_evidence_projection_preserves_scientific_orders_and_excludes_controller_recovery(self):
+        from scisaurus.runtime.survey_config import project_survey_evidence_work_orders
+        scientific = {"id": "evidence", "kind": "literature_expansion", "owner": "survey",
+                      "objective": "Resolve inputs", "why": "Physical model", "success_condition": "Source captured",
+                      "evidence_needed": "Public reference"}
+        recovery = {**scientific, "id": "retry", "kind": "recovery"}
+        source = [recovery, scientific]
+        before = deepcopy(source)
+        self.assertEqual(project_survey_evidence_work_orders(source), [scientific])
+        self.assertEqual(source, before)
+        with self.assertRaises(ValidationError):
+            project_survey_evidence_work_orders([{**recovery, "owner": ""}, scientific])
+
     def test_example_is_inert_and_activated_config_is_copied(self):
         with self.assertRaisesRegex(ValidationError, "explicitly true"):
             load_survey_config(EXAMPLE)

@@ -321,6 +321,21 @@ class CapabilityFoundryTests(unittest.TestCase):
         self.assertEqual(prompt["repair_request"]["repair_plan"], plan)
         self.assertEqual(prompt["repair_request"]["repair_plan_sha256"], digest)
 
+    def test_authoring_patch_preserves_exact_reference_handoff_and_current_design(self):
+        from scisaurus.tests.test_material_development import brief
+        design = brief()
+        handoffs = [{"reference_packet": {"open_work_orders": [{"id": "unresolved", "objective": "Exact requirement " * 200}],
+                                          "source_project_dir": "/captured/references"},
+                     "design_binding": {"current_design_sha256": "a" * 64}}]
+        prompt = authoring_patch_prompt(brief={"topic": {"design_brief": design},
+            "implementation_reference_handoffs": handoffs}, required_intent={}, configured_input={},
+            candidate={"executor_source": "def run(): pass", "validator_source": "def check(): pass", "experiment_intent": {}},
+            feedback="Check baseline", validation_context={}, validation_feedback={}, format_repair={})
+        self.assertEqual(prompt["repair_request"]["implementation_reference_handoffs"], handoffs)
+        self.assertEqual(prompt["repair_request"]["implementation_reference_handoffs_sha256"],
+                         hashlib.sha256(canonical_bytes(handoffs)).hexdigest())
+        self.assertEqual(prompt["topic"]["design_brief"], design)
+
     def test_authoring_repair_preserves_long_structured_evidence_and_all_mismatches(self):
         feedback = {"gate": "adversarial_review", "decision": "rejected",
                     "findings": [{"severity": "blocking", "finding": f"issue-{i}",

@@ -96,6 +96,58 @@ class _ComposerTestSpecialistClient:
 
 
 class ComposerWorkflowTests(unittest.TestCase):
+    def test_reference_acceptance_reuses_structural_proof_without_reviving_verifier(self):
+        with tempfile.TemporaryDirectory() as path:
+            with closing(ComposerRunner(self._workflow(Path(path)))) as runner:
+                stage = runner.workflow["stages"][0]
+                run = {"project_dir": stage["project_dir"], "implementation_reference_handoff": {"ref": "artifact:handoff@1"}}
+                attempt = {"project_dir": stage["project_dir"]}
+                with patch.object(runner, "_validated_implementation_reference_handoff", return_value=run["implementation_reference_handoff"]), \
+                     patch.object(runner.departments, "_assignment_task_rows", side_effect=AssertionError("retired verifier")):
+                    self.assertTrue(runner._survey_attempt_was_accepted(stage["id"], attempt, run))
+                    raw_run = {"project_id": run["project_dir"], "implementation_reference_handoff": run["implementation_reference_handoff"]}
+                    self.assertTrue(runner._survey_attempt_was_accepted(stage["id"], attempt, raw_run))
+                    self.assertFalse(runner._survey_attempt_was_accepted(stage["id"], {"project_dir": path}, run))
+                with patch.object(runner, "_validated_implementation_reference_handoff", side_effect=StateError("stale handoff")):
+                    self.assertFalse(runner._survey_attempt_was_accepted(stage["id"], attempt, run))
+                from scisaurus.core.errors import ConflictError
+                with patch.object(runner, "_validated_implementation_reference_handoff", side_effect=ConflictError("stale assessment")):
+                    self.assertFalse(runner._survey_attempt_was_accepted(stage["id"], attempt, run))
+
+    def test_reference_handoff_precedes_literature_obligations_without_fulfilling_them(self):
+        from scisaurus.tests.test_material_development import brief
+        with tempfile.TemporaryDirectory() as path:
+            workflow = self._workflow(Path(path))
+            topic_stage = {**workflow["stages"][0], "id": "topic", "kind": "topic_discovery"}
+            workflow["stages"].insert(0, topic_stage)
+            workflow["stages"][1]["depends_on"] = ["topic"]
+            workflow["progression_policy"] = "forward_first"
+            with closing(ComposerRunner(workflow)) as runner:
+                runner.context["topic"] = {"intake_mode": "concept", "topic": {
+                    "id": "concept", "research_question": "Compare response", "design_brief": brief()}}
+                stage = runner.workflow["stages"][1]
+                self.assertTrue(runner._implementation_reference_stage(stage))
+                orders = [{"id": "missing", "kind": "literature_expansion", "objective": "Verify physical inputs"}]
+                handoff = {"ref": "artifact:command/handoff@1", "open_work_orders": deepcopy(orders), "design_brief": brief()}
+                runner.active_research_requests = deepcopy(orders)
+                for state, admission in (("insufficient_evidence", "exploratory_pilot"),
+                                          ("eligible_for_experiment", "provisional_supported_for_experiment")):
+                    result = {"status": "completed", "gap_state": state, "survey_current": True,
+                              "assessment_current": True, "implementation_reference_handoff": handoff}
+                    with patch.object(runner, "_validated_implementation_reference_handoff", return_value=handoff), \
+                         patch.object(runner, "_topic_review_obligation", side_effect=AssertionError("literature re-adjudication")), \
+                         patch.object(runner, "_topic_maturity_requirement_scope", return_value={"active": ["Open definition"], "out_of_scope": []}), \
+                         patch.object(runner, "_mark_research_requests_attempted"), \
+                         patch.object(runner.departments, "resolve_work_orders", side_effect=AssertionError("false fulfillment")):
+                        self.assertIs(runner._gate_survey_work_orders(stage, result), result)
+                        pilot = runner._gate_free_topic_survey(result, stage=stage)
+                        self.assertEqual(pilot["topic_admission"], admission)
+                        self.assertEqual(pilot["implementation_open_work_orders"], orders)
+                        runner._settle_stage_work_orders(stage, pilot, "completed")
+                        self.assertEqual(runner.active_research_requests, orders)
+                runner.workflow["progression_policy"] = "evidence_first"
+                self.assertFalse(runner._implementation_reference_stage(stage))
+
     def test_review_recovery_distinguishes_scheduled_retry_from_dispatched_producer(self):
         with tempfile.TemporaryDirectory() as path:
             control = ControlStore(path); self.addCleanup(control.close)

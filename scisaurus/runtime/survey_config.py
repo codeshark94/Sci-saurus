@@ -48,6 +48,12 @@ def validate_search_plan(value, max_queries):
         search_query(query)
 
 
+def project_survey_evidence_work_orders(value):
+    """Separate scientific acquisition requirements from controller recovery."""
+    return [order for order in validate_survey_work_orders(value)
+            if order["kind"] == "literature_expansion"]
+
+
 def validate_survey_work_orders(value):
     if value is None:
         return []
