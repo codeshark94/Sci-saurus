@@ -30,6 +30,7 @@ import time
 import traceback
 import uuid
 from types import SimpleNamespace
+from scisaurus.runtime.development_session import development_session_binding
 
 from scisaurus.core.errors import (
     ConflictError, NotFoundError, ProviderConfigurationError, ProviderRateLimitError, QuotaExceededError, StateError,
@@ -15921,6 +15922,7 @@ class ComposerRunner:
                 model_timeout_seconds=configured_model_timeout,
                 author_backend=configured.get("author_backend"),
                 laboratory=execution_laboratory,
+                development_session=development_session_binding(self.root),
             )
             foundry_input = {}
             if software_assessment is not None:
@@ -23347,6 +23349,7 @@ class ComposerRunner:
                 software_laboratory=getattr(self, "laboratory_binding", None),
                 software_author_backend=((software_author or {}).get("author_backend")),
                 software_author_runtime_python=((software_author or {}).get("runtime_python")),
+                development_session=development_session_binding(self.root),
                 on_progress=lambda event: self._specialist_progress(stage["id"], {
                     **event, "assignment_attempt_number": assignment_number,
                 }, assignment=stage_assignment),
@@ -26437,7 +26440,8 @@ class ComposerRunner:
             runner = TopicDiscoveryRunner(model, deadline_seconds=stage_deadline,
                 author_backend=(producer or {}).get("author_backend"),
                 author_root=str(self.root / "topic-production"),
-                runtime_python=(producer or {}).get("runtime_python"))
+                runtime_python=(producer or {}).get("runtime_python"),
+                development_session=development_session_binding(self.root))
             topic_checkpoint_usage = {}
             maturity_rounds = descriptor.get("maturity_review_rounds", 0)
             # Journal-oriented free-topic missions target a research paper,

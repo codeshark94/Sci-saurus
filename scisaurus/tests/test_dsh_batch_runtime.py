@@ -9,11 +9,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 from scisaurus.runtime.dsh_batch import DshBatchError, DshBatchRunner, sha256
+from scisaurus.runtime.development_session import development_session_binding
 
 
 @unittest.skipUnless(os.environ.get("SCISAURUS_DSH_CONFIG"), "explicit pinned DSH deployment required")
 class RuntimeTests(unittest.TestCase):
-    def exercise(self, *, orphan=False, failure=False):
+    def exercise(self, *, orphan=False, failure=False, persistent=False):
         requests = []
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -36,7 +37,7 @@ class RuntimeTests(unittest.TestCase):
                     self.wfile.flush()
                 event({"id": "mock-" + str(len(requests)), "model": "offline-model",
                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}}]})
-                if len(requests) == 1:
+                if len(requests) == 1 or persistent and len(requests) == 3:
                     command = "printf 'offline proof' > answer.txt"
                     if orphan:
                         command = "sleep 60 >/dev/null 2>&1 & echo $! > child.pid; " + command
@@ -71,7 +72,8 @@ class RuntimeTests(unittest.TestCase):
                 config.update(composition=str(path), model="offline-model", auth_env="DSH_OFFLINE_KEY", timeout_seconds=30)
                 config["pinned_files"][str(path)] = sha256(path)
                 config["read_roots"].append(temp)
-                runner = DshBatchRunner(config, root=Path(temp) / "jobs")
+                runner = DshBatchRunner(config, root=Path(temp) / "jobs",
+                    development_session=development_session_binding(temp) if persistent else None)
                 kwargs = dict(inputs={"spec.json": '{"frozen":true}'}, outputs=["answer.txt"])
                 if failure:
                     with self.assertRaises(DshBatchError) as raised:
@@ -85,6 +87,18 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(len(requests), 2)
                 self.assertTrue(all(r["model"] == "offline-model" for r in requests))
                 self.assertTrue(all(r["thinking"] == {"type": "disabled"} for r in requests))
+                if persistent:
+                    second = runner.run("Continue the first design; use bash to produce answer.txt", **kwargs)
+                    self.assertEqual(second["files"]["answer.txt"], b"offline proof")
+                    self.assertEqual(second["usage"], result["usage"])
+                    self.assertEqual(len(requests), 4)
+                    history = json.dumps(requests[2]["messages"])
+                    self.assertIn('Use bash to produce answer.txt', history)
+                    self.assertIn('File produced.', history)
+                    receipts = [json.loads(Path(v["receipt"]).read_text()) for v in (result, second)]
+                    self.assertEqual(receipts[0]['session_id'], receipts[1]['session_id'])
+                    self.assertNotEqual(receipts[0]['message_id'], receipts[1]['message_id'])
+                    self.assertNotEqual(receipts[0]['pid'], receipts[1]['pid'])
                 if orphan:
                     pid = int((Path(result["receipt"]).parent / "work/child.pid").read_text())
                     with self.assertRaises(ProcessLookupError):
@@ -101,6 +115,9 @@ class RuntimeTests(unittest.TestCase):
 
     def test_failed_provider_dispatch_charged_once(self):
         self.exercise(failure=True)
+
+    def test_persisted_history_resumes_in_a_new_process_without_recounting(self):
+        self.exercise(persistent=True)
 
 
 if __name__ == "__main__":

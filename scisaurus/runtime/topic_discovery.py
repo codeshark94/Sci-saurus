@@ -5530,7 +5530,8 @@ class TopicDiscoveryRunner:
     """Generate one bounded, validated free-topic proposal."""
 
     def __init__(self, model, *, deadline_seconds=None, author_backend=None,
-                 author_root=None, runtime_python=None, checkpoint_callback=None):
+                 author_root=None, runtime_python=None, checkpoint_callback=None,
+                 development_session=None):
         self.model_config = deepcopy(model)
         self._route_cursors = {}
         self._active_topic_budget = None
@@ -5545,7 +5546,8 @@ class TopicDiscoveryRunner:
                 raise ValidationError("delegated topic production requires a workspace and runtime")
             from scisaurus.runtime.dsh_batch import DshStructuredProducerClient
             self.author_client = DshStructuredProducerClient(
-                author_backend, root=author_root, runtime_python=runtime_python)
+                author_backend, root=author_root, runtime_python=runtime_python,
+                development_session=development_session)
         if (deadline_seconds is not None and
                 (type(deadline_seconds) not in (int, float) or not math.isfinite(deadline_seconds)
                  or deadline_seconds <= 0)):

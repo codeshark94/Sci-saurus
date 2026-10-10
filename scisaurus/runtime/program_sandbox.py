@@ -17,6 +17,7 @@ candidate as fully admitted.  Isolation strength is never silently downgraded.
 from __future__ import annotations
 
 import os
+import json
 import resource
 import selectors
 import shutil
@@ -217,7 +218,8 @@ def _sandbox_read_paths(command, workspace):
     return sorted(str(path) for path in roots if path.exists()), sorted(str(path) for path in files)
 
 
-def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=(), temporary_workspace=None):
+def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=(), temporary_workspace=None,
+                    directory_sync_paths=()):
     """Return a deny-by-default Seatbelt profile for one throwaway workspace."""
     workspace = str(Path(workspace).resolve())
     read_roots, read_files = _sandbox_read_paths(command, workspace)
@@ -266,6 +268,12 @@ def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=
         ])
     if allow_network:
         lines.append("(allow network*)")
+    for value in directory_sync_paths:
+        path = Path(value)
+        if not path.is_absolute() or not path.is_dir():
+            raise ValidationError("directory synchronization paths must be existing absolute directories")
+        lines.append('(allow file-read-data (require-all (literal ' +
+                     json.dumps(str(path.resolve())) + ') (vnode-type DIRECTORY)))')
     return "\n".join(lines)
 
 

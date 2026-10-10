@@ -1,0 +1,164 @@
+diff --git a/packages/sdk/client/src/client.ts b/packages/sdk/client/src/client.ts
+index 1937f4a1dc..08c9244485 100644
+--- a/packages/sdk/client/src/client.ts
++++ b/packages/sdk/client/src/client.ts
+@@ -289,6 +289,14 @@ export class HarnessClient {
+     return result.messageId
+   }
+ 
++  /** Restore a durable session before sending another prompt. */
++  async resume(sessionId: string): Promise<void> {
++    const result = await this.request('session/resume', { sessionId })
++    if (!isRecord(result) || result.sessionId !== sessionId) {
++      throw new SdkProtocolError(`session/resume returned a different identity: ${JSON.stringify(result)}`)
++    }
++  }
++
+   /**
+    * Send one JSON-RPC request and await its result.
+    * @param method - the wire method name.
+diff --git a/packages/sdk/protocol/src/index.ts b/packages/sdk/protocol/src/index.ts
+index 5f0aaca21d..6dd80fc0fe 100644
+--- a/packages/sdk/protocol/src/index.ts
++++ b/packages/sdk/protocol/src/index.ts
+@@ -20,6 +20,8 @@ export type {
+   SessionStatusNotification,
+   SessionPromptParams,
+   SessionPromptResult,
++  SessionResumeParams,
++  SessionResumeResult,
+   SubagentFinishedNotification,
+   SubagentStartedNotification,
+ } from './types.ts'
+diff --git a/packages/sdk/protocol/src/types.ts b/packages/sdk/protocol/src/types.ts
+index 533b5f23c5..0177f8c2b5 100644
+--- a/packages/sdk/protocol/src/types.ts
++++ b/packages/sdk/protocol/src/types.ts
+@@ -1,5 +1,5 @@
+ /**
+- * Named wire types for the DeepSeek Harness SDK runtime protocol: the three
++ * Named wire types for the DeepSeek Harness SDK runtime protocol: the four
+  * request/result pairs and the four server-to-client notification payloads
+  * exchanged over the newline-delimited JSON-RPC stdio transport. The server
+  * plugin (`@deepseek-ai/dsh-sdk-jsonrpc-server`) and SDK clients share these shapes;
+@@ -44,6 +44,15 @@ export interface SessionPromptResult {
+   messageId: string
+ }
+ 
++/** Restore a persisted session without creating a replacement identity. */
++export interface SessionResumeParams {
++  sessionId: string
++}
++
++export interface SessionResumeResult {
++  sessionId: string
++}
++
+ /** Deployment-mapped SDK outcome: `ok` for an accepted result, `error` otherwise. */
+ export type SdkRunStatus = 'ok' | 'error'
+ 
+@@ -101,5 +110,6 @@ export interface HarnessSdkNotificationMap {
+ export interface HarnessSdkRequestMap {
+   'initialize': { params: InitializeParams; result: InitializeResult }
+   'session/prompt': { params: SessionPromptParams; result: SessionPromptResult }
++  'session/resume': { params: SessionResumeParams; result: SessionResumeResult }
+   'shutdown': { params: undefined; result: Record<string, never> }
+ }
+diff --git a/packages/sdk/server/src/server.ts b/packages/sdk/server/src/server.ts
+index 195caa908d..a92e450ab3 100644
+--- a/packages/sdk/server/src/server.ts
++++ b/packages/sdk/server/src/server.ts
+@@ -21,6 +21,8 @@ import type {
+   SessionEventNotification,
+   SessionPromptParams,
+   SessionPromptResult,
++  SessionResumeParams,
++  SessionResumeResult,
+   SubagentFinishedNotification,
+   SubagentStartedNotification,
+ } from '@deepseek-ai/dsh-sdk-protocol'
+@@ -142,6 +144,31 @@ export class HarnessSdkJsonRpcServer {
+     return { messageId: message.id }
+   }
+ 
++  /** Restore one persisted agent under the configured route and server ownership. */
++  async resume(params: SessionResumeParams): Promise<SessionResumeResult> {
++    const id = params.sessionId
++    if (typeof id !== 'string' || !id.trim()) throw new TypeError('resume requires a nonempty sessionId')
++    if (this.shuttingDown || this.sessions.has(id) || this.sessionCreations.has(id)) {
++      throw new Error(`session is already owned or server is shutting down: ${id}`)
++    }
++    const creation = this.ctx.agents.resume({
++      resumeSessionId: SessionId(id),
++      agentOptions: { provider: this.provider, model: this.model,
++        ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens } },
++    }).then(handle => {
++      const rec = { handle }
++      this.sessions.set(id, rec)
++      return rec
++    })
++    this.sessionCreations.set(id, creation)
++    try {
++      await creation
++      return { sessionId: id }
++    } finally {
++      this.sessionCreations.delete(id)
++    }
++  }
++
+   /**
+    * Dispose server-owned agents, adapter, and subscriptions to quiescence.
+    * The surrounding context remains running.
+@@ -193,6 +220,8 @@ export class HarnessSdkJsonRpcServer {
+         return this.initialize(params as unknown as InitializeParams)
+       case 'session/prompt':
+         return this.prompt(params as unknown as SessionPromptParams)
++      case 'session/resume':
++        return this.resume(params as unknown as SessionResumeParams)
+       case 'shutdown':
+         return this.shutdown()
+       default:
+diff --git a/packages/sdk/server/tests/server.spec.ts b/packages/sdk/server/tests/server.spec.ts
+index 495f1d90f4..93edd80011 100644
+--- a/packages/sdk/server/tests/server.spec.ts
++++ b/packages/sdk/server/tests/server.spec.ts
+@@ -109,6 +109,39 @@ async function settleSubagent(
+ }
+ 
+ describe('HarnessSdkJsonRpcServer', () => {
++  it('restores persisted history through an explicit resume boundary', { timeout: 15_000 }, async () => {
++    const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-resume-'))
++    const llmServer = await mockCompletionServer()
++    vi.stubEnv('DEEPSEEK_API_KEY', 'test-key')
++    vi.stubEnv('DEEPSEEK_BASE_URL', llmServer.url)
++    let ctx = await makeHarness(storageDir)
++    try {
++      let transport = new FakeTransport()
++      let server = new HarnessSdkJsonRpcServer(ctx, transport)
++      const init = { cwd: storageDir, provider: 'deepseek-official', model: 'dsagent-model' }
++      await server.initialize(init)
++      await server.prompt({ sessionId: 'development', contentBlocks: [{ type: 'text', text: 'first design' }] })
++      await vi.waitFor(() => expect(transport.notifications.findLast(n => n.method === 'session.status')?.params?.status).toBe('idle'))
++      await server.shutdown()
++      await ctx.fiber.dispose()
++      ctx = await makeHarness(storageDir)
++      transport = new FakeTransport()
++      server = new HarnessSdkJsonRpcServer(ctx, transport)
++      await server.initialize(init)
++      await expect(server.handleRequest('session/resume', { sessionId: 'development' })).resolves.toEqual({ sessionId: 'development' })
++      await expect(server.resume({ sessionId: 'development' })).rejects.toThrow('already owned')
++      await server.prompt({ sessionId: 'development', contentBlocks: [{ type: 'text', text: 'continue design' }] })
++      await vi.waitFor(() => expect(llmServer.requests).toHaveLength(2))
++      expect(JSON.stringify(llmServer.requests[1])).toContain('first design')
++      expect(JSON.stringify(llmServer.requests[1])).toContain('continue design')
++      await vi.waitFor(() => expect(transport.notifications.findLast(n => n.method === 'session.status')?.params?.status).toBe('idle'))
++      await server.shutdown()
++    } finally {
++      await ctx.fiber.dispose()
++      await rm(storageDir, { recursive: true, force: true })
++    }
++  })
++
+   it('creates a harness agent and calls the configured OpenAI-compatible endpoint', { timeout: 15_000 }, async () => {
+     const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-'))
+     const llmServer = await mockCompletionServer()

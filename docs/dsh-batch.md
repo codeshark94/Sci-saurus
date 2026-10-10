@@ -1,17 +1,27 @@
 # DSH engineering batches
 
 Sci-whale can delegate a file-based engineering work order to DSH over its
-unattended JSON-RPC interface. Each batch uses one fresh session and one fixed
+unattended JSON-RPC interface. A project development session uses one fixed
 provider/model composition. File editing, shell execution and local repair are
 owned by DSH. Sci-whale owns the job receipt, immutable inputs, admission and
 independent scientific validation.
 
 ## Deployment
 
+Project continuation requires the SDK's explicit `session/resume` interface.
+The compatible patch is [session-resume.patch](../scripts/dsh/session-resume.patch),
+based on DSH commit `cffa619a9a861ca305e6d64ba8ee29afc0630550` (MIT license).
+In that checkout, inspect and apply the patch with `git apply --check` followed
+by `git apply`; other revisions require a reviewed adaptation. Run the SDK
+client/server tests and build with `pnpm run build:lib` before preparing pins.
+Do not rebuild a pinned backend while a managed worker is running.
+
 Build the DSH checkout's JSON-RPC runtime libraries first. Prepare a configuration
 with `scripts/prepare-dsh-batch.py`: supply `--dsh-root`, `--output`, `--model`,
 `--base-url`, `--auth-env`, `--max-output-tokens`, `--context-window` and
-`--timeout-seconds`. `--reasoning` defaults to `off`. Credentials remain in the
+`--timeout-seconds`. `--reasoning` defaults to `off`. `--vision` declares image
+input and enables the local attachment service used by `read_image`; enable it
+only for a verified image-capable provider route. Credentials remain in the
 named environment variable. The generated composition declares only one model,
 disables provider retries and subagents, and treats token exhaustion as failure.
 Runtime entry files, compiled workspace libraries, dependency lock and composition
@@ -34,8 +44,26 @@ stderr, source/input/output hashes, token usage and terminal receipt beside a
 disposable writable workspace. `model_calls` counts started model steps, including
 pre-dispatch preparation failures; it is not a billing or HTTP-request count.
 No GUI is required. Multiple work orders can be
-submitted sequentially by an external batch queue; sessions never share writable
-files or conversation state.
+submitted sequentially by an external batch queue. Standalone batches start
+fresh; managed development assignments use the project history described below.
+
+## Project development history
+
+Managed concept production, source-definition repair, software selection and
+executor authoring use one serialized project session and writable workspace.
+Each assignment still has its own immutable inputs, output archive, transport
+receipt and usage delta. The SDK's explicit `session/resume` restores persisted
+history after a process boundary; reusing a session ID without resuming is not
+equivalent. The project manifest pins backend configuration and every settled
+receipt. Altered inputs or archived outputs, another project owner, configuration
+drift and unsettled dispatches block continuation.
+
+Only prior producer evidence is added to the worker's read roots. Independent
+validator sessions receive their blinded assignments in separate workspaces and
+never receive the development handle. Scientific reviews remain independent.
+An interrupted dispatch preserves its unknown outcome and blocks automatic
+continuation; explicit reconciliation must establish its settled ownership before
+the history can advance. No stage transition refunds or recounts earlier usage.
 
 ## Production responsibilities
 
@@ -51,8 +79,8 @@ Scientific software controller operations continue within the same DSH session,
 workspace and dispatch slot. Each completed turn exports either a tool request or
 the final structured selection. The controller executes the declared operation,
 then provides a new read-only assignment containing its bound receipts. Workspace
-scripts and session history survive the exchange; independent work orders and
-validator sessions remain isolated.
+scripts and session history survive the exchange and subsequent development
+assignments; validator sessions remain isolated.
 Final selection contract corrections also continue in that session. Each distinct
 diagnostic permits one correction; an unchanged failure terminates with its paid
 response and usage retained. Corrections preserve the current scientific evidence
@@ -120,6 +148,13 @@ are read-only under `sandbox-exec`; only the disposable work directory is writab
 Network access is available for the provider and engineering acquisition. Inputs
 should contain only the evidence needed by that worker. Validator workspaces must
 never be included in the author read roots.
+
+Durable image attachments require syncing their directory entries. The DSH
+sandbox permits read-only handles to exact ancestor directories for that
+operation; it does not grant reads of files or writes outside the workspace.
+Visual inspection supports geometry, mesh and figure diagnostics. Quantitative
+material fractions and scientific outcomes still require solver-bound raw data
+and independent recalculation.
 
 Successful SDK transport and an agent's final answer do not establish scientific
 success. Missing output, token exhaustion, transport interruption and gate rejection

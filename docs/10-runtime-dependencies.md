@@ -20,7 +20,7 @@ see [solver selection](145-metamaterial-solvers.md).
 | Continuum, Python 3.12 | `config/environments/continuum.yml` | SfePy, numerical analysis and full field extraction |
 | Waves, Python 3.12 | `config/environments/waves.yml` | Serial Meep and MPB; no MPI or GPU claim |
 | CAD | External FreeCAD application bundle | Own interpreter and native libraries; profile binds the installed bundle |
-| DSH | External DSH checkout, its dependency lock and compiled libraries | Fixed provider/model composition per isolated session; runtime hashes pinned by preparation |
+| DSH | External DSH checkout, its dependency lock and compiled libraries | Fixed provider/model composition; project development history and separate validator sessions; runtime hashes pinned by preparation |
 | Desktop build | `desktop/package-lock.json`, `desktop/src-tauri/Cargo.lock`, `desktop/requirements-build.txt` | Tauri and PyInstaller backend packaging; scientific runtimes remain external |
 | Extended solvers | `scripts/laboratory/containers/Dockerfile.*` plus installed native Elmer | Pinned Linux images and native solver inventory; local Docker daemon required for containers |
 
@@ -30,6 +30,20 @@ bind the actual scientific runtime. Reprovision after any dependency change;
 a package with the same version but changed executable or native content is drift.
 Node and Rust use their committed lockfiles. Keep control and solver dependency
 graphs separate rather than installing all packages into the desktop backend.
+
+## Platform support
+
+| Surface | Current boundary |
+|---|---|
+| Reference execution | macOS, POSIX process/resource APIs and `sandbox-exec`; CI exercises this path |
+| Windows native | Not supported as a complete research runtime; `fcntl`/`resource`, sandbox policy and executable paths need a Windows backend |
+| WSL/Linux | Not an attested replacement for the reference host; Linux sandboxing, CAD/runtime profiles and end-to-end execution need validation |
+| Scientific tools | Separate native environments, external applications and locally built Docker images; setup does not install this whole stack |
+| Atomistic tools | LAMMPS, Quantum ESPRESSO and ASE are not provisioned or attested by the current laboratory profiles |
+
+Docker recipes describe build inputs; execution uses already installed images
+with `--pull=never`. A clone, dependency recipe or desktop build does not establish
+that every scientific tool is installed or usable on another host.
 
 ## Control and analysis
 

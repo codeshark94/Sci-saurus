@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -135,22 +136,39 @@ def terminate_tree(process):
 class DshBatchRunner:
     """One fresh session per work order, with controller-owned receipts."""
 
-    def __init__(self, config, *, root, runtime_read_roots=(), laboratory=None):
+    def __init__(self, config, *, root, runtime_read_roots=(), laboratory=None,
+                 development_session=None):
         self.config = validate_batch_config(config)
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.runtime_read_roots = [str(Path(p).resolve()) for p in runtime_read_roots]
         self.laboratory = laboratory
+        from scisaurus.runtime.development_session import DevelopmentSession
+        self.development_session = (DevelopmentSession(development_session)
+                                    if development_session is not None else None)
 
     def run(self, task, *, inputs, seed_files=None, outputs, deadline=None, exchange=None):
         deadline = min(deadline if deadline is not None else math.inf,
                        time.monotonic() + self.config["timeout_seconds"])
+        lease = (self.development_session.lease(self.config, deadline)
+                 if self.development_session is not None else nullcontext(None))
+        with lease as development:
+            try:
+                return self._dispatch(task, inputs=inputs, seed_files=seed_files,
+                                      outputs=outputs, deadline=deadline, exchange=exchange,
+                                      development=development)
+            finally:
+                if development is not None and development.state.get("active_job"):
+                    development.settle(development.state["active_job"])
+
+    def _dispatch(self, task, *, inputs, seed_files, outputs, deadline, exchange, development):
         # One DSH session has sequential model steps. Keep its slot until the
         # process tree is reaped, including periods spent editing and executing.
         try:
             with model_dispatch_slot(deadline=deadline) as slot:
                 return self._run(task, inputs=inputs, seed_files=seed_files,
-                                 outputs=outputs, deadline=deadline, dispatch_slot=slot, exchange=exchange)
+                                 outputs=outputs, deadline=deadline, dispatch_slot=slot, exchange=exchange,
+                                 development=development)
         except DshBatchError:
             raise
         except (ValidationError, TimeoutError, OSError) as exc:
@@ -171,7 +189,8 @@ class DshBatchRunner:
                 raise
             raise DshBatchError(str(exc), receipt=receipt, usage=usage) from exc
 
-    def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot, exchange=None):
+    def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot, exchange=None,
+             development=None):
         ensure_run_allowed()
         config = validate_batch_config(self.config)
         verify_batch_runtime(config)
@@ -194,14 +213,24 @@ class DshBatchRunner:
         if remaining <= 0:
             raise ValidationError("DSH batch has no mission time remaining")
         job = self.root / uuid.uuid4().hex
-        work, frozen = job / "work", job / "input"
-        work.mkdir(parents=True)
+        job.mkdir()
+        work = development.root / "work" if development is not None else job / "work"
+        frozen = job / "input"
+        work.mkdir(parents=True, exist_ok=development is not None)
         frozen.mkdir()
         def write_files(root, files):
             for name, data in files.items():
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_symlink() or not path.parent.resolve().is_relative_to(root.resolve()):
+                    raise ValidationError("batch file escapes its contained workspace")
                 path.write_bytes(data if isinstance(data, bytes) else data.encode())
+        for name in outputs:
+            path = work / name
+            if path.is_symlink() or not path.parent.resolve().is_relative_to(work):
+                raise ValidationError("batch output escapes its contained workspace")
+            if path.exists():
+                path.unlink()
         write_files(frozen, inputs)
         write_files(work, seed_files or {})
         for path in frozen.rglob("*"):
@@ -211,7 +240,9 @@ class DshBatchRunner:
         receipt = job / "receipt.json"
         journal = job / "events.jsonl"
         state = {"schema_version": "dsh-batch-receipt-1", "status": "prepared",
-                 "session_id": uuid.uuid4().hex, "config_sha256": hashlib.sha256(canonical_bytes(config)).hexdigest(),
+                 "job_directory": str(job.resolve()),
+                 "session_id": (development.state["session_id"] if development is not None else uuid.uuid4().hex),
+                 "config_sha256": hashlib.sha256(canonical_bytes(config)).hexdigest(),
                  "provider": config["provider"], "model": config["model"], "input_sha256": bound,
                  "task_sha256": hashlib.sha256(task.encode()).hexdigest(), "outputs": {},
                  "seed_sha256": {name: sha256(work / name) for name in seed_files or {}},
@@ -226,6 +257,11 @@ class DshBatchRunner:
             tmp.write_bytes(canonical_bytes(state))
             tmp.replace(receipt)
         save()
+        if development is not None:
+            state["development_session"] = {"binding": deepcopy(development.binding),
+                "resumed": development.resume, "prior_receipts": deepcopy(development.state["calls"])}
+            save()
+            development.bind_job(receipt)
         credential = os.environ.get(config["auth_env"])
         if not credential:
             state.update(status="not_dispatched", error="credential environment reference is unset")
@@ -239,7 +275,12 @@ class DshBatchRunner:
         surface = (self.laboratory.execution_surface(work) if self.laboratory else {})
         env.update(surface.get("environment", {}))
         profile = sandbox_profile(work, config["command"], allow_network=True,
-            read_only_paths=[str(frozen), *config["read_roots"], *self.runtime_read_roots, *surface.get("read_only_paths", ())])
+            read_only_paths=[str(frozen), *config["read_roots"], *self.runtime_read_roots,
+                             *(development.read_roots if development is not None else []),
+                             *surface.get("read_only_paths", ())],
+            # Durable attachment storage fsyncs each ancestor directory entry.
+            # Exact directory handles do not admit file contents below them.
+            directory_sync_paths=work.parents)
         # DSH supervises detached shell groups. It must be able to inspect
         # processes and signal members of its own inherited Seatbelt domain.
         profile += "\n(allow process-info*)\n(allow signal (target same-sandbox))\n"
@@ -262,9 +303,14 @@ class DshBatchRunner:
         received = False
         message_id = None
         pending_events = []
-        prompt_id = 2
+        prompt_id = 3 if development is not None and development.resume else 2
+        resume_pending = prompt_id == 3
         current_task, current_input = task, frozen
-        completed_turns = set()
+        prior_history = development.transport_history if development is not None else []
+        completed_turns = {turn for row in prior_history for turn in row.get("transport_turns", [])}
+        prior_messages = {message for row in prior_history
+                          for message in [row.get("message_id"), *(t.get("message_id") for t in row.get("turns", []))]
+                          if message is not None}
         selector = None
         buffers = {"stdout": bytearray()}
         calls_seen = set()
@@ -285,6 +331,8 @@ class DshBatchRunner:
             event = params.get("event", {})
             data = event.get("data", {})
             identity = (params.get("sessionId"), data.get("turn"), data.get("step"))
+            if identity[1] in completed_turns:
+                return
             if event.get("type") == "step/start":
                 if identity not in calls_seen:
                     calls_seen.add(identity)
@@ -369,13 +417,24 @@ class DshBatchRunner:
                             if payload.get("error"):
                                 raise RuntimeError(f"DSH protocol error: {payload['error']}")
                             if payload.get("id") == 1:
-                                send(2, "session/prompt", {"sessionId": state["session_id"],
+                                if prompt_id == 3:
+                                    send(2, "session/resume", {"sessionId": state["session_id"]})
+                                else:
+                                    send(prompt_id, "session/prompt", {"sessionId": state["session_id"],
+                                    "contentBlocks": [{"type": "text", "text":
+                                        f"Immutable task files: {frozen}\nWritable workspace: {work}\n" + task}]})
+                            elif payload.get("id") == 2 and resume_pending:
+                                if payload.get("result", {}).get("sessionId") != state["session_id"]:
+                                    raise RuntimeError("DSH resume returned a foreign session")
+                                resume_pending = False
+                                send(prompt_id, "session/prompt", {"sessionId": state["session_id"],
                                     "contentBlocks": [{"type": "text", "text":
                                         f"Immutable task files: {frozen}\nWritable workspace: {work}\n" + task}]})
                             elif payload.get("id") == prompt_id:
                                 message_id = payload["result"]["messageId"]
-                                if exchange is not None and (not isinstance(message_id, str) or not message_id
-                                        or any(row["message_id"] == message_id for row in state["turns"])):
+                                if (not isinstance(message_id, str) or not message_id
+                                        or message_id in prior_messages
+                                        or any(row["message_id"] == message_id for row in state.get("turns", []))):
                                     raise RuntimeError("DSH continuation has no fresh message owner")
                                 for item in pending_events:
                                     done |= owned_event(item)
@@ -447,6 +506,13 @@ class DshBatchRunner:
                 raise RuntimeError("DSH final output changed after its completed turn")
             for name in outputs:
                 state["outputs"][name] = hashlib.sha256(files[name]).hexdigest()
+            archive = job / "outputs"
+            archive.mkdir()
+            write_files(archive, files)
+            for path in archive.rglob("*"):
+                if path.is_file():
+                    path.chmod(0o444)
+            state.update(output_directory="outputs", message_id=message_id)
             state.update(status="completed", finish_reason=finish)
             if exchange is not None:
                 state["outcome_known"] = True
@@ -482,6 +548,8 @@ class DshBatchRunner:
                 except Exception as fallback_error:
                     cleanup_errors.append(fallback_error)
             state["process_reaped"] = process.poll() is not None
+            state["transport_turns"] = sorted({identity[1] for identity in calls_seen
+                if identity[0] == state["session_id"] and type(identity[1]) is int})
             for resource in (selector, process.stdin, process.stdout, process.stderr):
                 if resource is None:
                     continue
@@ -507,7 +575,7 @@ class DshBatchRunner:
 class DshAuthorClient:
     """Import source files into the existing independent admission pipeline."""
 
-    def __init__(self, config, *, root, runtime_python, laboratory=None):
+    def __init__(self, config, *, root, runtime_python, laboratory=None, development_session=None):
         self.config = validate_batch_config(config)
         self.model = config["model"]
         self.timeout_seconds = config["timeout_seconds"]
@@ -516,7 +584,8 @@ class DshAuthorClient:
         self.laboratory = laboratory
         self.runtime_python = str(Path(runtime_python).absolute())
         self.runner = DshBatchRunner(config, root=root,
-            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)], laboratory=laboratory)
+            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)], laboratory=laboratory,
+            development_session=development_session)
 
     def complete(self, *, system, prompt):
         assignment = json.loads(prompt)
@@ -608,12 +677,15 @@ class DshAuthorClient:
 def read_completed_structured_producer(job, *, config_sha256):
     """Read immutable inputs and output from a settled structured producer."""
     job = Path(job)
+    receipt = json.loads((job / "receipt.json").read_bytes())
+    output_directory = receipt.get("output_directory", "work")
+    if output_directory not in {"outputs", "work"}:
+        raise ValidationError("completed producer output archive is invalid")
     paths = [job, *(job / name for name in (
-        "receipt.json", "input", "work", "input/assignment.json",
-        "input/system-contract.txt", "work/response.json"))]
+        "receipt.json", "input", output_directory, "input/assignment.json",
+        "input/system-contract.txt", output_directory + "/response.json"))]
     if any(path.is_symlink() for path in paths):
         raise ValidationError("completed producer evidence is symlinked")
-    receipt = json.loads((job / "receipt.json").read_bytes())
     assignment = json.loads((job / "input/assignment.json").read_bytes())
     if (receipt.get("schema_version") != "dsh-batch-receipt-1"
             or receipt.get("status") != "completed" or receipt.get("process_reaped") is not True
@@ -631,7 +703,7 @@ def read_completed_structured_producer(job, *, config_sha256):
     for name, digest in receipt["input_sha256"].items():
         if hashlib.sha256((job / "input" / name).read_bytes()).hexdigest() != digest:
             raise ValidationError("completed producer input digest differs")
-    output = (job / "work/response.json").read_bytes()
+    output = (job / output_directory / "response.json").read_bytes()
     if hashlib.sha256(output).hexdigest() != receipt.get("outputs", {}).get("response.json"):
         raise ValidationError("completed producer output digest differs")
     return receipt, assignment, (job / "input/system-contract.txt").read_text(), json.loads(output)
@@ -642,14 +714,15 @@ class DshStructuredProducerClient:
 
     deliverable_label = "structured producer"
 
-    def __init__(self, config, *, root, runtime_python):
+    def __init__(self, config, *, root, runtime_python, development_session=None):
         self.config = validate_batch_config(config)
         self.model = config["model"]
         self.timeout_seconds = config["timeout_seconds"]
         self.max_output_tokens = config["max_output_tokens"]
         self.runtime_python = str(Path(runtime_python).absolute())
         self.runner = DshBatchRunner(config, root=root,
-            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)])
+            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)],
+            development_session=development_session)
 
     def task(self, assignment):
         return (
@@ -711,8 +784,10 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
 
     deliverable_label = "software producer"
 
-    def __init__(self, config, *, root, runtime_python, tool_exchange=None, final_exchange=None):
-        super().__init__(config, root=root, runtime_python=runtime_python)
+    def __init__(self, config, *, root, runtime_python, tool_exchange=None, final_exchange=None,
+                 development_session=None):
+        super().__init__(config, root=root, runtime_python=runtime_python,
+                         development_session=development_session)
         self.tool_exchange = tool_exchange
         self.final_exchange = final_exchange
 

@@ -65,8 +65,10 @@ critical physical inputs before executing the affected calculation.
 Before observations exist, implementation repairs return directly to DSH without
 a separate design-review panel or its call reservation. Independent executable
 admission, recalculation and review of observed scientific results remain required.
-Software tool requests share one DSH session and workspace across controller
-responses, retaining scripts, exact tool receipts and paid usage between turns.
+Concept production, definition repair, software selection and executor authoring
+share a project-owned DSH history and workspace. Controller tool exchanges retain
+scripts, exact receipts and paid usage between turns. Independent validators and
+scientific reviewers remain isolated.
 
 The general research and manuscript stage graph remains available for missions
 that require it. It is not a compulsory publication sequence for every design
@@ -140,6 +142,11 @@ probes and model limits.
 ## Quick start
 
 Install the control runtime; this does not install scientific solvers or enable model dispatch:
+
+The verified execution host is macOS. This repository is not a Windows
+all-in-one installer: native sandboxing, CAD paths and solver profiles require
+platform support, and Windows/WSL execution has not been validated. See the
+[platform boundaries](docs/10-runtime-dependencies.md#platform-support).
 
 ```bash
 sh scripts/setup-runtime.sh

@@ -2391,7 +2391,7 @@ class CapabilityFoundry:
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
                  model_timeout_seconds=None, reviewer_client=None, validator_client=None,
                  author_max_output_tokens=32768, reviewer_max_output_tokens=32768,
-                 author_backend=None, laboratory=None):
+                 author_backend=None, laboratory=None, development_session=None):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
         self.workspace_root = Path(workspace_root)
@@ -2408,6 +2408,7 @@ class CapabilityFoundry:
         self.reviewer_client = reviewer_client
         self.validator_client = validator_client
         self.laboratory = laboratory
+        self.development_session = development_session
         self.author_backend = None
         if author_backend is not None:
             from scisaurus.runtime.dsh_batch import validate_batch_config, DshValidatorClient
@@ -2621,7 +2622,8 @@ class CapabilityFoundry:
                 raise ValidationError("DSH batch cannot bypass an explicit per-call allowance; an admission-aware provider relay is required")
             from scisaurus.runtime.dsh_batch import DshAuthorClient
             client = DshAuthorClient(self.author_backend, root=self.workspace_root / "dsh-jobs",
-                                     runtime_python=self.runtime_python, laboratory=self.laboratory)
+                                     runtime_python=self.runtime_python, laboratory=self.laboratory,
+                                     development_session=self.development_session)
         elif client is None:
             author_route_configs = self._format_model_routes(author_role, self.author_max_output_tokens)
             client = ModelClient(**_artifact_generation_config(author_route_configs[0]))

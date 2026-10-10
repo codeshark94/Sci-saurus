@@ -2302,7 +2302,8 @@ class SpecialistDispatcher:
     def __init__(self, model_config, *, provider_pools=None, max_parallel=4,
                  deadline=None, on_progress=None, provider_cooldowns=None,
                  software_workspace=None, software_laboratory=None,
-                 software_author_backend=None, software_author_runtime_python=None):
+                 software_author_backend=None, software_author_runtime_python=None,
+                 development_session=None):
         if not isinstance(model_config, dict):
             raise ValidationError("specialist model config must be an object")
         if type(max_parallel) is not int or max_parallel < 1:
@@ -2319,6 +2320,7 @@ class SpecialistDispatcher:
         self.provider_pools = deepcopy(provider_pools or {})
         self.software_workspace = software_workspace
         self.software_laboratory = software_laboratory
+        self.development_session = development_session
         # A file-based DSH software producer is an explicit lab-only backend.
         # It replaces the technical producer's direct model route; the
         # independent scientific reviewer/verifier never uses it.
@@ -2895,7 +2897,8 @@ class SpecialistDispatcher:
                             if software_tools is not None else {})
         engineering_client = (producer_client(
             self.software_author_backend, root=str(self.software_workspace) + "/dsh-producer",
-            runtime_python=self.software_author_runtime_python, **producer_options) if dsh_producer else None)
+            runtime_python=self.software_author_runtime_python,
+            development_session=self.development_session, **producer_options) if dsh_producer else None)
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
         quota["max_input_tokens"] = max_input_tokens

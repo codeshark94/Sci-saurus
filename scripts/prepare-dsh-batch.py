@@ -21,6 +21,7 @@ parser.add_argument("--reasoning", choices=["off", "low", "medium", "high", "max
 parser.add_argument("--max-output-tokens", type=int, required=True)
 parser.add_argument("--context-window", type=int, required=True)
 parser.add_argument("--timeout-seconds", type=float, required=True)
+parser.add_argument("--vision", action="store_true", help="Enable an attested image-capable route and durable read_image tool")
 args = parser.parse_args()
 root = Path(args.dsh_root).resolve()
 output = Path(args.output).resolve()
@@ -31,6 +32,7 @@ if not entry.is_file() or not node.is_file():
     parser.error("build the DSH JSON-RPC runtime and install Node before preparing its deployment")
 model = {"id": args.model, "contextWindow": args.context_window,
          "maxTokens": args.max_output_tokens,
+         "input": ["text", "image"] if args.vision else ["text"],
          "reasoningEfforts": {"off": None, ("high" if args.reasoning == "off" else args.reasoning):
                               "high" if args.reasoning == "off" else args.reasoning}}
 composition = [
@@ -44,11 +46,13 @@ composition = [
     {"id": "subprocess", "name": "@deepseek-ai/dsh-subprocess-local"},
     {"id": "bash", "name": "@deepseek-ai/dsh-bash-local"},
     {"id": "agent", "name": "@deepseek-ai/dsh-agent-spine-demo", "config": {
-        "persona": "You are an engineering worker. Read the task files, edit files, execute, inspect errors and repair. Preserve scientific inputs and report limitations.",
+        "persona": "You are an engineering worker. Read the task files, edit files, execute, inspect errors and repair. Preserve scientific inputs and report limitations." +
+                   (" Inspect generated geometry, mesh and field images with read_image when useful. Use raw numerical observations for quantitative checks." if args.vision else ""),
         "workspaceContext": False, "skills": {"enabled": False},
         "toolBash": {"enableRunInBackground": False}, "toolJobs": False}},
     {"id": "sessions", "name": "@deepseek-ai/dsh-session-persistence-jsonl", "config": {"root": ".sessions"}},
     {"id": "checkpoints", "name": "@deepseek-ai/dsh-session-checkpoint-policy"},
+    *([{"id": "attachments", "name": "@deepseek-ai/dsh-attachment-local"}] if args.vision else []),
     {"id": "fs", "name": "@deepseek-ai/dsh-fs-local"},
     {"id": "fs-policy", "name": "@deepseek-ai/dsh-fs-observation-policy"},
     {"id": "tools", "name": "@deepseek-ai/dsh-tool-fs"},
