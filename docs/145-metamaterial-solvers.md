@@ -85,3 +85,16 @@ pilot rather than being represented as already completed.
 See [runtime dependencies](10-runtime-dependencies.md) for installation and
 [laboratory preparation](140-metamaterial-laboratory.md) for profiles, probes,
 attestation and artifact transfer.
+
+## Atomistic tools
+
+The current attested laboratory labels do not include an atomistic DFT or MD
+runtime. An unrelated module or library with a similar name does not attest an
+atomistic workflow. LAMMPS, Quantum ESPRESSO and ASE are potential additions;
+they are not currently declared as available execution capabilities.
+
+Provisioning must include executable/version receipts, an analytic or published
+small reference calculation, resource bounds, and the exact potential or
+pseudopotential provenance. Material applicability, finite-size/convergence
+limits and any exchange with continuum fields must be explicit. Installing a
+binary alone does not admit a multiscale claim.

@@ -80,8 +80,9 @@ The rejection and acquired evidence are retained for the DSH producer to revise
 the complete comparison. Missing source coverage does not establish novelty.
 
 An explicit operator reselection at a stopped checkpoint reopens the concept
-stage and its dependent closure. The immutable instruction preserves the original
-mission deadline, cumulative usage and prior artifacts. This selection revision
+stage and its dependent closure. The immutable instruction preserves cumulative
+usage, prior artifacts and the active execution-control policy. Deadline changes
+are admitted separately from scientific selection. This selection revision
 does not claim that the previous concept was experimentally refuted.
 The subsequent survey uses the exact brief to seek model validity, material
 parameters, implementation methods, competing designs and verification evidence. It admits the concept provisionally to literature evidence,
@@ -119,6 +120,20 @@ final scientific claims retain the independent gates. A completed design alone
 does not establish novelty or publication readiness.
 
 ## Execution boundaries
+
+A source challenge classified as `known_design_variant` retires that causal
+mechanism from the next concept comparison. Its original feedback remains
+evidence, but improvement requests for that old design are not specifications
+for its replacement. The next independent challenge receives the retired
+design and rejection to distinguish a new mechanism from renamed geometry,
+an added metric or stronger controls. `insufficient_evidence` remains a separate
+request for missing evidence or a clearer definition.
+
+Functional combinations may be proposed without a pre-existing frontier
+bibliography. They require explicit physical interfaces and currently attested
+formulations. A small component or combined pilot with matched single-function
+controls or an ablation tests the performance hypothesis; a list of solver names
+does not establish synergy or novelty.
 
 Topic feasibility names native solvers by their exact attested runtime labels.
 Native capabilities remain separate from host imports and the pinned downstream
@@ -438,3 +453,36 @@ gates. The backend composition remains pinned, deadlines apply to the entire
 session, and each session occupies one of the shared three model dispatch slots.
 Experiment feasibility estimates count model calls inside the scientific
 execution itself, excluding controller production and review work.
+
+## Active-time allocation
+
+A stopped managed mission can receive an immutable operator execution-control
+policy through `DashboardService.set_mission_time_policy`. The original scientific
+workflow and input artifacts remain unchanged. For example:
+
+```python
+{"mode": "unbounded", "support_seconds": 18000, "design_fraction_target": 0.95}
+```
+
+An unbounded mission has no total wall deadline. Every admitted stage, model
+request and program still has a finite execution window. Survey, argument and
+paper stages share one cumulative active-time allowance across failed attempts,
+retries and resumes. Supported pauses do not consume it; interrupted intervals
+are conservatively reconciled against their admitted execution fence. Exhaustion
+stops further support dispatch instead of opening a fresh allowance. Applying the
+same policy is idempotent; changing an allocation requires an explicit accounting
+migration.
+
+The measured design fraction is an operational target, not an admission gate.
+Topic/design and experiment stages form the design category; survey and writing
+stages form support. This stage accounting does not resolve individual tool
+activity inside a delegated design task. No extra simulation or waiting is added
+to manufacture the target fraction.
+
+Implementation-context literature batches independent source-fidelity reviews
+into one receipt while preserving a separate exact verdict for every assigned
+entry. The admission gate checks each current entry, relationship, source window
+and model reply against that original receipt. Aggregate context review remains
+independent. A cached receipt is reused only for identical source-bound inputs;
+this batching does not assert novelty, complete coverage or successful physics.
+Ordinary research surveys keep their existing review flow.

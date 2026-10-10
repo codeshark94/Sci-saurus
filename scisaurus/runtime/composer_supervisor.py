@@ -38,7 +38,7 @@ TERMINAL_STATUSES = frozenset({"completed", "candidate_needs_review"})
 STOP_REASONS = frozenset({
     "hard_deadline", "required_stage_window_does_not_fit_remaining_deadline",
     "provider_configuration", "provider_rate_limit", "missing_stage_input", "stage_quota_exhausted",
-    "workflow_validation", "operational_state", "operator_stage_boundary",
+    "workflow_validation", "operational_state", "operator_stage_boundary", "support_time_exhausted",
 })
 SUPERVISOR_SCHEMA_VERSION = "composer-supervisor-3"
 DEFAULT_WATCHDOG_SECONDS = 300.0
@@ -188,6 +188,8 @@ def _provider_retry_delay(blocker, now_epoch):
 
 
 def _remaining(result):
+    if isinstance(result, dict) and result.get("mission_time_policy", {}).get("mode") == "unbounded":
+        return math.inf
     value = result.get("remaining_seconds") if isinstance(result, dict) else None
     value = _finite_number(value)
     return value if value is not None else 0.0
@@ -548,10 +550,17 @@ class ComposerSupervisor:
             "signature": signature,
         }
 
+    def _mission_time_fields(self):
+        progress = self._live_snapshot().get("progress", {})
+        return {key: deepcopy(progress[key]) for key in
+            ("mission_time_policy", "mission_time_policy_ref", "mission_time_allocation") if key in progress}
+
     def _watchdog_remaining(self, snapshot, *, authorized_deadline=None):
         if authorized_deadline is not None:
             return max(0.0, authorized_deadline - time.time())
         progress = snapshot.get("progress", {}) if isinstance(snapshot, dict) else {}
+        if progress.get("mission_time_policy", {}).get("mode") == "unbounded":
+            return None
         value = progress.get("remaining_seconds") if isinstance(progress, dict) else None
         value = _finite_number(value)
         deadline = _finite_number(progress.get("deadline_at_epoch"))
@@ -568,6 +577,8 @@ class ComposerSupervisor:
         if authorized_deadline is not None:
             return authorized_deadline <= time.time()
         progress = snapshot.get("progress", {})
+        if progress.get("mission_time_policy", {}).get("mode") == "unbounded":
+            return False
         deadline = _finite_number(progress.get("deadline_at_epoch"))
         if deadline is not None:
             return deadline <= time.time()
@@ -583,6 +594,7 @@ class ComposerSupervisor:
         return {
             "status": "blocked",
             "phase": phase,
+            **{key: deepcopy(progress[key]) for key in ("mission_time_policy", "mission_time_policy_ref", "mission_time_allocation") if key in progress},
             "remaining_seconds": self._watchdog_remaining(snapshot, authorized_deadline=authorized_deadline),
             "stages": deepcopy(progress.get("stages", {})),
             "active_research_requests": deepcopy(
@@ -894,6 +906,7 @@ class ComposerSupervisor:
             "status": "blocked",
             "stop_reason": stop_reason,
             "remaining_seconds": self._watchdog_remaining(self._live_snapshot()),
+            **self._mission_time_fields(),
             "blockers": [blocker],
         }
 
@@ -923,8 +936,8 @@ class ComposerSupervisor:
                 # let the next resume reconcile durable child attempts.
                 result = {
                     "status": "blocked",
-                    "remaining_seconds": max(
-                    0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
+                    "remaining_seconds": self._watchdog_remaining(self._live_snapshot()),
+                    **self._mission_time_fields(),
                     "blockers": [{"stage_id": "workflow",
                                   "reason": f"{type(exc).__name__}: {exc}",
                                   "recoverable": not isinstance(exc, ValidationError),
@@ -1236,8 +1249,8 @@ class ComposerSupervisor:
         except Exception as exc:
             result = {
                 "status": "blocked",
-                "remaining_seconds": max(
-                    0.0, float(self.workflow.get("time_policy", {}).get("hard_seconds", 0))),
+                "remaining_seconds": self._watchdog_remaining(self._live_snapshot()),
+                **self._mission_time_fields(),
                 "blockers": [{"stage_id": "workflow", "reason": f"{type(exc).__name__}: {exc}"}],
             }
             if isinstance(exc, ValidationError):

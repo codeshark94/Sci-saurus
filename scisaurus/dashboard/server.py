@@ -2703,7 +2703,8 @@ class DashboardSnapshot:
             live_value.get("usage") if isinstance(live_value.get("usage"), dict) else {})
         deadline_at = live_value.get("deadline_at_epoch")
         workflow_policy = self.workflow.get("time_policy") if isinstance(self.workflow.get("time_policy"), dict) else {}
-        deadline_seconds = live_value.get("deadline_seconds") or workflow_policy.get("hard_seconds")
+        deadline_seconds = (None if live_value.get("mission_time_policy", {}).get("mode") == "unbounded"
+                            else live_value.get("deadline_seconds") or workflow_policy.get("hard_seconds"))
         remaining = live_value.get("remaining_seconds")
         if remaining is None and isinstance(deadline_at, (int, float)):
             remaining = max(0, deadline_at - datetime.now(timezone.utc).timestamp())
@@ -3409,6 +3410,23 @@ class DashboardService:
             return {"status": "started", "project": project_dir.name,
                     "workflow_path": str(workflow_path), "pid": process.pid,
                     "resume": resume, "command": command, "log_path": str(log_path)}
+
+    def set_mission_time_policy(self, project_ref, policy):
+        """Apply an execution-control allocation to a stopped managed mission."""
+        project_dir = self._resolve_project(project_ref)
+        workflow_path, workflow = self._workflow(project_dir)
+        project_id = Path(workflow["project_id"]).expanduser().resolve()
+        if not project_id.is_relative_to(project_dir) or not workflow_path.resolve().is_relative_to(project_dir):
+            raise ValueError("workflow ownership must stay inside its managed project")
+        with self._run_lock(project_id):
+            if self._composer_processes(workflow_path):
+                raise ValueError("stop the owning supervisor before time policy revision")
+            from scisaurus.runtime.composer import ComposerRunner
+            runner = ComposerRunner(workflow, resume=True, control_only=True)
+            try:
+                return runner.set_mission_time_policy(policy)
+            finally:
+                runner.close()
 
     def reselect_concepts(self, project_ref, criteria):
         """Revise concept selection while preserving a stopped mission ledger."""

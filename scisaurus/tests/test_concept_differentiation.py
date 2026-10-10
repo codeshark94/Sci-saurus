@@ -101,11 +101,42 @@ class ConceptDifferentiationTests(unittest.TestCase):
                 'Develop a useful material', candidate_count=3, intake_mode='concept', max_attempts=2, bibliography={}, sampling_seed=3)
         self.assertEqual([c['assignment'] for c in calls], ['free_topic_discovery', 'concept_closest_design_challenge', 'refine_topic_discovery', 'concept_closest_design_challenge'])
         self.assertEqual(calls[2]['closest_design_evidence'], [source])
+        self.assertEqual(calls[2]['repair_specification']['action'], 'replace_known_mechanism')
+        self.assertNotIn('required_changes', calls[2]['repair_specification'])
+        self.assertEqual(calls[2]['source_challenge']['required_changes'], review('known_design_variant')['required_changes'])
+        self.assertIn('Discard the retired', calls[2]['refinement_instruction'])
+        self.assertNotIn('Address every required_changes', calls[2]['refinement_instruction'])
+        rules = ' '.join(calls[2]['constraints'])
+        self.assertNotIn('explicitly address every item', rules)
+        self.assertNotIn('keep the parent', rules)
+        self.assertNotIn('repair the reviewed direction', rules)
+        self.assertIn('new concept selection', rules)
+        self.assertEqual(calls[3]['retired_concept']['candidate'], calls[2]['retired_direction'])
+        self.assertEqual(calls[3]['retired_concept']['source_challenge']['concept_differentiation']['assessment'], 'known_design_variant')
         self.assertEqual(len(result['candidates']), 3)
         self.assertEqual(result['source_challenge']['concept_differentiation']['assessment'], 'substantive_hypothesis')
         self.assertEqual(result['novelty_status'], 'unverified')
         self.assertEqual(sampling.call_count, 2)
         self.assertFalse(sampling.call_args.kwargs['prefer_recent'])
+
+    def test_concept_combination_does_not_require_seed_evidence_before_proposal(self):
+        from scisaurus.runtime.topic_discovery import topic_prompt
+        payload = json.loads(topic_prompt('A useful multifunctional design', 3, intake_mode='concept'))
+        rules = ' '.join(payload['constraints'])
+        self.assertNotIn('do not couple several mechanisms', rules)
+        self.assertIn('field or parameter interfaces', rules)
+        self.assertIn('single-function controls or mechanism ablations', rules)
+        ordinary = json.loads(topic_prompt('A scientific comparison', 3))
+        self.assertIn('do not couple several mechanisms', ' '.join(ordinary['constraints']))
+
+    def test_retired_mechanism_is_bound_to_current_challenge_prompt(self):
+        retired = {'candidate': {'id': 'prior', 'mechanism': 'Known mechanism'}, 'source_challenge': review('known_design_variant')}
+        context = {'topic_intake_mode': 'concept', 'retired_concept': retired}
+        payload = json.loads(_source_challenge_prompt({'id': 'replacement'}, [], context))
+        self.assertEqual(payload['retired_concept'], retired)
+        self.assertIn('return known_design_variant', ' '.join(payload['output_constraints']))
+        retired['candidate']['mechanism'] = 'tampered'
+        self.assertNotEqual(payload['retired_concept'], retired)
 
     def test_targeted_search_retains_classic_closest_design(self):
         class Bibliography:
@@ -141,6 +172,7 @@ class ConceptDifferentiationTests(unittest.TestCase):
                 deadline, usage = runner.deadline_epoch, deepcopy(runner.usage)
                 result = runner.reselect_concepts('Prioritize substantive new useful functions within attested tools.')
                 self.assertEqual(result['deadline_at_epoch'], deadline)
+                self.assertEqual(runner.status, 'paused')
                 self.assertEqual(runner.usage, usage)
                 self.assertIn('survey', result['reopened_stage_ids'])
                 context = runner._topic_refinement_context(workflow['stages'][0])

@@ -4445,7 +4445,13 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
         candidate_contract["design_brief"] = design_brief_contract()
         constraints = [item for item in constraints if not item.startswith((
             "use recent_papers", "anchor every candidate", "domain is mandatory",
-            "do not introduce a mechanism"))]
+            "do not introduce a mechanism", "keep one primary phenomenon"))]
+        constraints.append(
+            "Keep one primary performance claim and a coherent causal mechanism. Useful combinations of "
+            "physical functions are eligible when their field or parameter interfaces are explicit and "
+            "each required formulation is supported by currently attested tools. Compare a combination "
+            "against matched single-function controls or mechanism ablations; naming several solvers "
+            "does not establish synergy. Begin with the smallest discriminating component or combined test.")
         constraints.append(
             "Choose the design concept before literature acquisition. The differentiation is a hypothesis, "
             "not an established novelty claim. Do not require supplied frontier seeds or citations; "
@@ -4639,6 +4645,18 @@ def topic_prompt(objective, candidate_count, *, recent_papers=None, frontier_see
                 "Exact deterministic validation error to repair: "
                 + validation_error[:2048]
             )
+    elif (refinement_context and intake_mode == "concept"
+          and refinement_context.get("mode") == "concept_reselection"):
+        constraints.extend([
+            "This is a new concept selection, not a repair of the prior design. Treat supplied retired "
+            "designs as negative examples and preserve their evidence without preserving their mechanism or phenomenon.",
+            "Compare the configured number of distinct causal mechanisms within the attested tools. "
+            "The operator selection criteria govern the objective; old-design improvement requests do not.",
+            "A replacement may retain the same research_form or evidence_mode when appropriate. "
+            "Changing category labels is not a change of physical mechanism.",
+            "Keep the first performance hypothesis test small. Closest-design evidence is context, "
+            "not a requirement for a completed literature synthesis or proven novelty before a pilot.",
+        ])
     elif refinement_context:
         constraints.extend([
             "this is a topic refinement pass, not a cosmetic rewrite: use the parent topic and the supplied survey feedback as constraints",
@@ -5308,11 +5326,21 @@ def _source_challenge_prompt(selected, works, runtime_context):
             "Assess the actual design_brief and physical function. Interesting wording does not establish differentiation.",
             "Select substantive_hypothesis only for a concrete useful departure, plausible mechanism and decisive "
             "equal-constraint test supported by a comparison with closest supplied designs. Novelty remains unverified.",
-            "For known_design_variant or insufficient_evidence return decision refine and concrete required_changes. "
+            "For known_design_variant return decision refine and identify the familiar mechanism to replace; "
+            "do not prescribe parameter tuning, extra plots or stronger baselines as a rescue of that design. "
+            "For insufficient_evidence return decision refine and concrete missing evidence or definition changes. "
             "Do not admit solely because direct_comparison_match is false or executable-template scores pass.",
             "Missing abstracts or insufficient search coverage are evidence limitations, not proof of novelty. "
             "Do not demand optimized results or publication-ready novelty before the pilot.",
         ]
+        retired = (runtime_context or {}).get("retired_concept")
+        if retired is not None:
+            payload["retired_concept"] = deepcopy(retired)
+            payload["output_constraints"].append(
+                "The retired concept was classified as a known design variant. Compare the selected causal "
+                "mechanism with that exact design and its supplied rejection. Renaming, adding a performance "
+                "metric, tuning geometry or strengthening controls does not replace its mechanism. "
+                "If that mechanism survives, return known_design_variant; novelty remains unverified.")
     payload["output_constraints"].extend([
         "Use concise evidence-grounded JSON: rationale at most 60 words, each differentiation text at most 30 words, "
         "and at most four short required_changes. Preserve every required field.",
@@ -6616,6 +6644,8 @@ class TopicDiscoveryRunner:
                     error.rejected_topic_history = deepcopy(rejected_topic_history)
                     raise error
             if refinement_feedback is not None and not single_candidate_refinement:
+                replace_known_mechanism = (intake_mode == "concept" and isinstance(refinement_feedback, dict)
+                    and refinement_feedback.get("concept_differentiation", {}).get("assessment") == "known_design_variant")
                 # Refinement must keep the same package contract as the first
                 # generation.  A looser prompt here makes a capable model
                 # return a convenient wrapper such as ``selected_candidate``
@@ -6627,6 +6657,7 @@ class TopicDiscoveryRunner:
                     runtime_context=prompt_runtime_context,
                     refinement_context={
                         **(refinement_context or {}),
+                        **({"mode": "concept_reselection"} if replace_known_mechanism else {}),
                         "parent_topic": refinement_parent,
                         "refinement_feedback": refinement_feedback,
                     },
@@ -6648,6 +6679,17 @@ class TopicDiscoveryRunner:
                         "Retain valid evidence and the attested tool boundary; novelty remains unverified.")
                     refinement_payload["closest_design_evidence"] = deepcopy(recent_papers)
                     refinement_payload["source_challenge"] = deepcopy(refinement_feedback)
+                    known_variant = isinstance(refinement_feedback, dict) and refinement_feedback.get(
+                        "concept_differentiation", {}).get("assessment") == "known_design_variant"
+                    if known_variant:
+                        refinement_payload["retired_direction"] = deepcopy(refinement_parent)
+                        refinement_payload["refinement_instruction"] = (
+                            "Discard the retired direction's causal mechanism and compare the complete configured "
+                            "set of replacement concepts. Choose a different physical mechanism, not a renamed "
+                            "application, an extra function, parameter tuning or stronger controls around the same "
+                            "design. The source challenge's old-design improvement requests are historical evidence, "
+                            "not mandatory specifications for the replacements. Preserve the attested tool boundary "
+                            "and design a smallest useful pilot; novelty remains unverified.")
                 apply_salvage_prompt(refinement_payload)
                 if isinstance(refinement_feedback, dict) and refinement_feedback.get(
                         "require_frontier_seed_pivot") is True and intake_mode != "concept":
@@ -6663,7 +6705,12 @@ class TopicDiscoveryRunner:
                                     "changed_dimensions")
                         if key in refinement_feedback
                     }
-                    if refinement_payload["repair_specification"].get("required_changes"):
+                    replace_known_mechanism = intake_mode == "concept" and refinement_feedback.get(
+                        "concept_differentiation", {}).get("assessment") == "known_design_variant"
+                    if replace_known_mechanism:
+                        refinement_payload["repair_specification"].pop("required_changes", None)
+                        refinement_payload["repair_specification"]["action"] = "replace_known_mechanism"
+                    elif refinement_payload["repair_specification"].get("required_changes"):
                         refinement_payload["refinement_instruction"] += (
                             " Address every required_changes item explicitly in the selected candidate. "
                             "For any request for quantitative executability, include an operational variable "
@@ -7403,9 +7450,21 @@ class TopicDiscoveryRunner:
                             "author_response": deepcopy(retained["author_response"] if retained else response_evidence),
                             "review_responses": deepcopy(retained.get("review_responses", [])) if retained else [],
                         }
+                    challenge_context = runtime_context
+                    if retained and retained.get("retired_concept") is not None:
+                        challenge_context = {**(runtime_context or {}),
+                                             "retired_concept": deepcopy(retained["retired_concept"])}
+                    elif (intake_mode == "concept" and isinstance(refinement_feedback, dict)
+                            and refinement_feedback.get("concept_differentiation", {}).get("assessment")
+                            == "known_design_variant"):
+                        challenge_context = {**(runtime_context or {}), "retired_concept": {
+                            "candidate": deepcopy(refinement_parent),
+                            "source_challenge": deepcopy(refinement_feedback)}}
+                    if (challenge_context or {}).get("retired_concept") is not None:
+                        self._source_review_checkpoint["retired_concept"] = deepcopy(challenge_context["retired_concept"])
                     self._save_source_review_checkpoint(budget)
                     source_challenge = self._challenge_selected_topic(
-                        selected, candidate_prior_work, runtime_context,
+                        selected, candidate_prior_work, challenge_context,
                         seed=(generation_seed + 49979687) % MAX_PROVIDER_SEED,
                         deadline=deadline, usage=usage, budget=budget)
                     attempt_record["source_challenge"] = deepcopy(source_challenge)

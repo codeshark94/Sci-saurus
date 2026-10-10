@@ -1020,3 +1020,25 @@ def validate_assessment(value, sources, works, *, require_spans=False, windows=N
     if value["state"] == "eligible_for_experiment" and (not value["comparisons"] or any(
             row["relationship"] in ("solves", "uncertain") for row in value["comparisons"])):
         raise ValidationError("unresolved or solved comparisons cannot authorize experiment eligibility")
+
+
+def project_work_review_batch(prompt, reply, *, entry_ref, work_id):
+    """Select one receipt-bound review without synthesizing provider outputs."""
+    if prompt.get("phase") != "implementation_evidence_review_batch":
+        return prompt, reply
+    items, replies = prompt.get("entries"), reply.get("reviews")
+    if (not isinstance(items, list) or not isinstance(replies, list)
+            or set(reply) != {"reviews"} or len(items) != len(replies)
+            or any(not isinstance(item, dict) for item in [*items, *replies])):
+        raise ValidationError("batched implementation review has invalid exact entry coverage")
+    assigned_ids = [item.get("entry", {}).get("work_id") for item in items]
+    reply_ids = [item.get("work_id") for item in replies]
+    if (any(not isinstance(item, str) for item in [*assigned_ids, *reply_ids])
+            or len(set(assigned_ids)) != len(assigned_ids)
+            or len(set(reply_ids)) != len(reply_ids) or set(reply_ids) != set(assigned_ids)):
+        raise ValidationError("batched implementation review changed its assigned work identities")
+    matches = [item for item in items if item.get("entry_ref") == entry_ref]
+    rows = [item for item in replies if item.get("work_id") == work_id]
+    if len(matches) != 1 or len(rows) != 1 or matches[0].get("entry", {}).get("work_id") != work_id:
+        raise ValidationError("batched implementation review omitted its exact current entry")
+    return matches[0], {key: value for key, value in rows[0].items() if key != "work_id"}

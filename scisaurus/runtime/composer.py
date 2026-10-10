@@ -418,6 +418,10 @@ class ComposerStageDeadlineExceeded(ValidationError):
     """An admitted stage attempt consumed its execution grant."""
 
 
+class ComposerSupportTimeExceeded(ComposerStageDeadlineExceeded):
+    """The cumulative literature and writing allocation is exhausted."""
+
+
 class ComposerLateStageResult(ValidationError):
     """A stage returned an artifact only after the immutable mission wall."""
 
@@ -1089,6 +1093,8 @@ class ComposerRunner:
         self.deadline_epoch = self.started_epoch + float(self.workflow["time_policy"]["hard_seconds"])
         policy = self.workflow["time_policy"]
         self.deadline = self.started + float(policy["hard_seconds"])
+        self.mission_time_policy = None
+        self.mission_time_ledger = None
         self.next_checkpoint = self.started
         self.run_id = uuid.uuid4().hex
         # A fresh mission receives one entropy-backed exploration seed.  It is
@@ -1204,6 +1210,7 @@ class ComposerRunner:
                     raise ValidationError(
                         "composer resume workflow does not match the original immutable workflow")
             self._restore()
+            self._restore_mission_time_policy()
             if self._reconcile_topic_execution_bindings():
                 self._checkpoint("resume:separate_topic_execution_bindings", force=True)
             if workflow_extension is not None:
@@ -1338,6 +1345,133 @@ class ComposerRunner:
                 os.environ.pop(key, None)
         self._runtime_environment_after = None
 
+    def _checkpoint_stopped_control(self, phase):
+        """An operator revision records a paused frontier until explicit resume."""
+        if not self.control_only:
+            raise StateError("operator checkpoint requires control-only access")
+        control = self._read_json_object(self.root / "output/run-control.json") or {}
+        if control.get("stop_requested") is not True:
+            raise StateError("operator checkpoint requires an explicit stop")
+        if type(control.get("pid")) is int:
+            try:
+                os.kill(control["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise StateError("operator checkpoint cannot replace a live supervisor")
+        self.status = "paused"
+        self._checkpoint(phase, force=True)
+
+    def set_mission_time_policy(self, policy):
+        """Append an operator execution-control revision at a stopped frontier."""
+        from scisaurus.runtime.mission_time import validate_mission_time_policy
+        from scisaurus.runtime.run_control import save_control
+        policy = validate_mission_time_policy(policy)
+        if not self.control_only:
+            raise StateError("mission time revision requires stopped control-only access")
+        checkpoint, body = self._stopped_execution_checkpoint()
+        control = self._read_json_object(self.root / "output/run-control.json") or {}
+        if self._restored_execution_frontier.get("status") != "paused" or control.get("stop_requested") is not True:
+            raise StateError("mission time revision requires an explicitly stopped checkpoint")
+        if type(control.get("pid")) is int:
+            try:
+                os.kill(control["pid"], 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise StateError("mission time revision cannot replace a live supervisor")
+        if self.mission_time_policy is not None:
+            if policy != self.mission_time_policy:
+                raise StateError("a time allocation revision requires explicit cumulative accounting migration")
+            return {"policy_ref": self.mission_time_policy_ref, "policy": deepcopy(policy)}
+        record = self._publish("command/operator/mission-time-policy", "decision_note", {
+            "schema_version": "operator-mission-time-policy-1", "workflow_id": self.workflow["id"],
+            "policy": policy, "checkpoint_ref": checkpoint["artifact_ref"],
+            "checkpoint_sha256": checkpoint["body_hash"],
+            "previous_deadline_at_epoch": self.deadline_epoch,
+        }, "command.operator", subjects=[checkpoint["artifact_ref"]])
+        save_control(self.root / "output", {**control, "mission_time_policy_ref": record["artifact_ref"]})
+        self._restore_mission_time_policy()
+        self._checkpoint_stopped_control("operator:mission_time_policy")
+        return {"policy_ref": record["artifact_ref"], "policy": policy}
+
+    def _restore_mission_time_policy(self):
+        from scisaurus.runtime.mission_time import MissionTimeLedger
+        control = self._read_json_object(self.root / "output/run-control.json") or {}
+        ref = control.get("mission_time_policy_ref")
+        if ref is None:
+            if self.store.head("command/operator/mission-time-policy") is not None:
+                raise StateError("mission time policy is missing its operator control binding")
+            return
+        manifest, _, body = self._read_verified_artifact_json(ref)
+        checkpoint, _, prior = self._read_verified_artifact_json(body.get("checkpoint_ref"))
+        if (manifest.get("author") != "command.operator" or manifest.get("artifact_id") != "command/operator/mission-time-policy"
+                or body.get("schema_version") != "operator-mission-time-policy-1"
+                or body.get("workflow_id") != self.workflow["id"] or checkpoint.get("author") != "command.composer"
+                or checkpoint.get("body_hash") != body.get("checkpoint_sha256")
+                or prior.get("workflow_id") != self.workflow["id"]):
+            raise StateError("mission time policy has invalid immutable ownership")
+        state = getattr(self, "_restored_mission_time_state", {})
+        if self.mission_time_ledger is not None:
+            state = {**self._mission_time_snapshot(), "status": "paused"}
+        elif not state.get("mission_time_allocation"):
+            if self._interrupted_checkpoint_identity(state) != self._interrupted_checkpoint_identity(prior):
+                raise StateError("mission time accounting is missing from the current checkpoint")
+            state = prior
+        timing = state.get("mission_time_allocation", {})
+        used = timing.get("used_seconds")
+        if state.get("mission_time_policy_ref") not in (None, ref):
+            raise StateError("mission time accounting belongs to another policy")
+        head = self.store.head("command/operator/mission-time-policy")
+        if head is None or head["artifact_ref"] != ref:
+            raise StateError("mission time policy is not the current operator revision")
+        if timing.get("active_kind") is not None:
+            observed = timing.get("observed_at_epoch")
+            fence = timing.get("accounting_until_epoch")
+            if type(observed) not in (int, float) or type(fence) not in (int, float):
+                raise StateError("interrupted mission time accounting lacks its bounded execution interval")
+            used = deepcopy(used)
+            key = "support" if timing["active_kind"] in {"survey", "paper", "argument"} else "design"
+            interrupted_at = state.get("updated_at_epoch") if state.get("stop_reason") == "process_interrupted" else None
+            if type(interrupted_at) in (int, float) and math.isfinite(interrupted_at) and interrupted_at >= observed:
+                fence = min(fence, interrupted_at)
+            used[key] += max(0.0, min(time.time(), fence) - observed)
+        self.mission_time_policy = deepcopy(body["policy"])
+        self.mission_time_policy_ref = ref
+        self.mission_time_ledger = MissionTimeLedger(body["policy"], clock=self.clock, restored=used)
+        self.deadline_epoch = None
+        self.deadline = self.clock() + self._dispatch_time_window()
+
+    def _dispatch_time_window(self):
+        return max(float(stage["deadline_seconds"]) for stage in self.workflow["stages"])
+
+    def _mission_remaining_snapshot(self):
+        if self.mission_time_policy is not None:
+            return None
+        remaining = self.deadline - self.clock()
+        if type(self.deadline_epoch) in (int, float):
+            remaining = min(remaining, self.deadline_epoch - time.time())
+        return max(0.0, remaining)
+
+    def _mission_time_snapshot(self):
+        if self.mission_time_ledger is None:
+            return {}
+        return {"mission_time_policy": deepcopy(self.mission_time_policy),
+                "mission_time_policy_ref": self.mission_time_policy_ref,
+                "mission_time_allocation": {**self.mission_time_ledger.snapshot(),
+                    "observed_at_epoch": time.time(),
+                    "accounting_until_epoch": max([time.time(), *[
+                        record["attempt_deadline_at_epoch"] for record in self.stage_records.values()
+                        if record.get("status") == "running" and type(record.get("attempt_deadline_at_epoch")) in (int, float)
+                    ]])}}
+
+    def _switch_mission_activity(self, phase):
+        if self.mission_time_ledger is None:
+            return
+        stage_id = phase.split(":", 1)[0]
+        stage = next((item for item in self.workflow["stages"] if item["id"] == stage_id), None)
+        self.mission_time_ledger.switch(stage["kind"] if self.status == "running" and stage else None)
+
     def reselect_concepts(self, criteria):
         """Admit an explicit operator selection revision at a stopped frontier."""
         if not isinstance(criteria, str) or not criteria.strip():
@@ -1384,7 +1518,7 @@ class ComposerRunner:
                      if record.get("status") in STAGE_READY_STATUSES}
         if not self._begin_continuation(completed, by_id):
             raise StateError("concept reselection could not admit its scoped continuation")
-        self._checkpoint("operator:concept_reselection", force=True)
+        self._checkpoint_stopped_control("operator:concept_reselection")
         return {"operator_request_ref": operator["artifact_ref"], "cycle": self.continuation_cycles,
                 "reopened_stage_ids": sorted(self.reopened_stage_ids), "deadline_at_epoch": self.deadline_epoch}
 
@@ -5098,6 +5232,11 @@ class ComposerRunner:
         return candidate
 
     def _remaining(self):
+        if self.mission_time_policy is not None:
+            # Dispatch windows remain finite even when the mission has no wall.
+            window = self._dispatch_time_window()
+            self.deadline = self.clock() + window
+            return window
         remaining = self.deadline - self.clock()
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
             remaining = min(remaining, self.deadline_epoch - time.time())
@@ -5110,6 +5249,13 @@ class ComposerRunner:
         if isinstance(stage, str):
             stage = next(item for item in self.workflow["stages"] if item["id"] == stage)
         remaining = min(float(stage["deadline_seconds"]), self._remaining())
+        if self.mission_time_ledger is not None:
+            self.mission_time_ledger.switch(stage["kind"])
+            if stage["kind"] in {"survey", "paper", "argument"}:
+                support = self.mission_time_ledger.remaining_support()
+                if support <= 0:
+                    raise ComposerSupportTimeExceeded("cumulative literature and writing time allocation exhausted")
+                remaining = min(remaining, support)
         deadline = stage.get("attempt_deadline_at_epoch")
         if deadline is None:
             deadline = self.stage_records.get(stage["id"], {}).get("attempt_deadline_at_epoch")
@@ -5134,6 +5280,8 @@ class ComposerRunner:
 
     def _deadline_exhausted(self):
         """Return whether the immutable mission wall has been reached."""
+        if self.mission_time_policy is not None:
+            return False
         remaining = self.deadline - self.clock()
         if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
             remaining = min(remaining, self.deadline_epoch - time.time())
@@ -5141,6 +5289,8 @@ class ComposerRunner:
 
     def _extend_deadline(self, additional_seconds):
         """Apply an explicit human extension without mutating the workflow graph."""
+        if self.mission_time_policy is not None:
+            raise ValidationError("an unbounded mission has no deadline to extend")
         if not isinstance(additional_seconds, (int, float)) or isinstance(additional_seconds, bool) \
                 or not math.isfinite(additional_seconds) or additional_seconds <= 0:
             raise ValidationError("additional_seconds must be finite and positive")
@@ -5268,8 +5418,8 @@ class ComposerRunner:
             "stop_reason": stop_reason,
             "last_phase": self._progress_snapshot.get("phase", self.status),
             "elapsed_seconds": max(0.0, now - self.started),
-            "remaining_seconds": max(0.0, remaining),
-            "deadline_seconds": self.workflow["time_policy"]["hard_seconds"],
+            "remaining_seconds": self._mission_remaining_snapshot(), **self._mission_time_snapshot(),
+            "deadline_seconds": (None if self.mission_time_policy else self.workflow["time_policy"]["hard_seconds"]),
             "started_at_epoch": self.started_epoch,
             "deadline_at_epoch": self.deadline_epoch,
             "completed_stage_ids": completed,
@@ -5623,6 +5773,11 @@ class ComposerRunner:
             if (item.get("stop_reason") == "operator_stage_boundary"
                     and self.status == "paused" and stage_id == "workflow"
                     and item.get("boundary_stage_id") == self.stop_after_stage):
+                active.append(deepcopy(item))
+                continue
+            if (item.get("stop_reason") == "support_time_exhausted"
+                    and self.status == "paused" and self.mission_time_ledger is not None
+                    and self.mission_time_ledger.remaining_support() <= 0):
                 active.append(deepcopy(item))
                 continue
             if (item.get("stop_reason") == "process_interrupted"
@@ -8971,7 +9126,9 @@ class ComposerRunner:
         self.context[stage_id]["specialist_verifier"]["assignment_plan_ref"] = retained["prior_assignment_plan_ref"]
         self._reconcile_interrupted_stage_attempts()
         remaining = min(float(stage["deadline_seconds"]), self._remaining())
-        attempt_deadline = min(self.deadline_epoch, time.time() + remaining)
+        attempt_deadline = time.time() + remaining
+        if self.deadline_epoch is not None:
+            attempt_deadline = min(self.deadline_epoch, attempt_deadline)
         prior = deepcopy(self.stage_records[stage_id])
         history = self._archive_stage_attempt(prior, cycle=self.continuation_cycles,
                                                default_project_dir=stage["project_dir"])
@@ -17543,9 +17700,8 @@ class ComposerRunner:
         # Refresh the organization only on the Composer thread.  The live
         # ticker consumes the cached plain-data projection below.
         self.organization_snapshot = deepcopy(self.departments.snapshot())
-        remaining_snapshot = self.deadline - now
-        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
-            remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        self._switch_mission_activity(phase)
+        remaining_snapshot = self._mission_remaining_snapshot()
         self.state_revision += 1
         # Specialist callbacks publish a live card between stage-boundary
         # checkpoints.  Rebuilding ``stages`` from the durable stage records
@@ -17588,7 +17744,7 @@ class ComposerRunner:
             "run_id": self.run_id,
             "status": self.status, "phase": phase,
             "elapsed_seconds": max(0.0, now - self.started),
-            "remaining_seconds": max(0.0, remaining_snapshot),
+            "remaining_seconds": remaining_snapshot, **self._mission_time_snapshot(),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             "retry_policy": self._retry_policy(),
             "continuation_policy": self._continuation_policy(),
@@ -17632,7 +17788,7 @@ class ComposerRunner:
             _atomic_write_bytes(output / "progress.json", canonical_bytes(state))
         self.next_checkpoint = now + float(self.workflow["time_policy"]["checkpoint_seconds"])
         self.on_progress({"phase": state["phase"], "elapsed_seconds": round(state["elapsed_seconds"], 2),
-                          "remaining_seconds": round(state["remaining_seconds"], 2),
+                          "remaining_seconds": (round(state["remaining_seconds"], 2) if state["remaining_seconds"] is not None else None),
                           "stages": deepcopy(state.get("stages", {})),
                           "blockers": deepcopy(state.get("active_blockers", [])),
                           "active_blockers": deepcopy(state.get("active_blockers", [])),
@@ -17651,9 +17807,7 @@ class ComposerRunner:
         continue to be written by ``_checkpoint`` at stage boundaries.
         """
         now = self.clock()
-        remaining_snapshot = self.deadline - now
-        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
-            remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        remaining_snapshot = self._mission_remaining_snapshot()
         # The ticker must not read mutable Composer state while a specialist
         # callback is updating it.  It consumes the last complete checkpoint
         # and changes only the heartbeat fields for this atomic write.
@@ -17669,7 +17823,7 @@ class ComposerRunner:
                 "phase": (state.get("phase") if phase.endswith(":running")
                           and state.get("phase") == phase.split(":", 1)[0] + ":specialists" else phase),
                 "elapsed_seconds": max(0.0, now - self.started),
-                "remaining_seconds": max(0.0, remaining_snapshot),
+                "remaining_seconds": remaining_snapshot, **self._mission_time_snapshot(),
                 "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
             })
             self._overlay_child_progress(state)
@@ -17681,7 +17835,7 @@ class ComposerRunner:
             # live state instead of restoring the last stage-boundary snapshot.
             self._progress_snapshot = deepcopy(state)
         self.on_progress({"phase": state["phase"], "elapsed_seconds": round(state["elapsed_seconds"], 2),
-                          "remaining_seconds": round(state["remaining_seconds"], 2),
+                          "remaining_seconds": (round(state["remaining_seconds"], 2) if state["remaining_seconds"] is not None else None),
                           "stages": deepcopy(state.get("stages", {})),
                           "blockers": deepcopy(state.get("active_blockers", [])),
                           "active_blockers": deepcopy(state.get("active_blockers", [])),
@@ -17969,7 +18123,7 @@ class ComposerRunner:
             "deadline_extensions", "deadline_decisions", "continuation_cycles",
             "continuation_budget_baseline", "continuation_budget_used",
             "state_revision", "topic_history_path", "topic_history_scope",
-            "topic_history_entries",
+            "topic_history_entries", "mission_time_policy", "mission_time_policy_ref", "mission_time_allocation",
         ):
             if field in newer:
                 restored[field] = self._merge_cumulative_usage(
@@ -18197,6 +18351,7 @@ class ComposerRunner:
                     and live_checkpoint["organization"].get("schema_version") == self.departments.organization["schema_version"]):
                 self.organization_snapshot = deepcopy(live_checkpoint["organization"])
             self._progress_snapshot = deepcopy(live_checkpoint)
+        self._restored_mission_time_state = deepcopy(timing_state) if isinstance(timing_state, dict) else {}
         self._restore_context_from_stage_records()
         self._hydrate_provisional_handoffs()
         # Older Composer reports did not carry an epoch fence.  They retain
@@ -22667,16 +22822,14 @@ class ComposerRunner:
         ) if key in event}
         live["observed_at"] = now_iso()
         now = self.clock()
-        remaining_snapshot = self.deadline - now
-        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
-            remaining_snapshot = min(remaining_snapshot, self.deadline_epoch - time.time())
+        remaining_snapshot = self._mission_remaining_snapshot()
         self._end_child_activity(stage_id)
         with self._progress_lock:
             state = deepcopy(self._progress_snapshot)
             state.update({
                 "phase": f"{stage_id}:specialists",
                 "elapsed_seconds": max(0.0, now - self.started),
-                "remaining_seconds": max(0.0, remaining_snapshot),
+                "remaining_seconds": remaining_snapshot, **self._mission_time_snapshot(),
                 "started_at_epoch": self.started_epoch,
                 "deadline_at_epoch": self.deadline_epoch,
             })
@@ -30788,9 +30941,11 @@ class ComposerRunner:
                         task_id = task["task_id"]
                         attempt_id = f"{task_id}-{uuid.uuid4().hex}"
                         attempt_started = self.clock()
-                        attempt_seconds = min(float(stage["deadline_seconds"]), self._remaining())
-                        attempt_stage["attempt_deadline_at_epoch"] = min(
-                            self.deadline_epoch, time.time() + attempt_seconds)
+                        attempt_seconds = self._stage_remaining({**stage,
+                            "attempt_deadline_at_epoch": time.time() + float(stage["deadline_seconds"])})
+                        attempt_stage["attempt_deadline_at_epoch"] = (
+                            min(self.deadline_epoch, time.time() + attempt_seconds)
+                            if self.deadline_epoch is not None else time.time() + attempt_seconds)
                         self.tasks.start_attempt(
                             task_id, attempt_id, owner="command.composer",
                             lease_ttl_seconds=attempt_seconds,
@@ -31677,7 +31832,7 @@ class ComposerRunner:
                                 self._checkpoint(f"{stage_id}:{stop_reason}", force=True)
                                 return self._finish()
                             self._checkpoint(f"{stage_id}:retrying" if retry_open else f"{stage_id}:failed", force=True)
-                            if isinstance(exc, ComposerLateStageResult):
+                            if isinstance(exc, (ComposerLateStageResult, ComposerSupportTimeExceeded)):
                                 raise
                             if isinstance(exc, ComposerHardDeadlineExceeded):
                                 if isinstance(context, dict):
@@ -31934,6 +32089,13 @@ class ComposerRunner:
                 "paused_deadline" if had_research_activity else "blocked_deadline",
                 force=True)
             return self._finish()
+        except ComposerSupportTimeExceeded as exc:
+            self._settle_pending_stage_usage()
+            self.status = "paused"
+            self.blockers.append({"stage_id": "workflow", "reason": str(exc),
+                "stop_reason": "support_time_exhausted", "failure_class": "resource_fence"})
+            self._checkpoint("paused_support_time", force=True)
+            return self._finish()
         except KeyboardInterrupt as exc:
             self._settle_pending_stage_usage()
             # A process-level stop is a resumable pause, not a failed
@@ -31957,6 +32119,8 @@ class ComposerRunner:
             self.close()
 
     def _finish(self):
+        if self.mission_time_ledger is not None:
+            self.mission_time_ledger.switch(None)
         deadline_exhausted = self._deadline_exhausted()
         # A provider may return just after the fence even when admission was
         # valid.  Such an artifact remains inspectable, but the mission must
@@ -32003,7 +32167,7 @@ class ComposerRunner:
                     stop_reason = next((
                         item["stop_reason"] for item in active_blockers
                         if isinstance(item, dict) and item.get("stop_reason") in {
-                            "provider_configuration", "provider_rate_limit", "operator_stage_boundary"}
+                            "provider_configuration", "provider_rate_limit", "operator_stage_boundary", "support_time_exhausted"}
                     ), None)
                 if stop_reason is None and self.status in {"paused", "blocked"} and any(
                         isinstance(item, dict)
@@ -32026,9 +32190,7 @@ class ComposerRunner:
                 # The run report remains publishable even if a secondary
                 # progress projection encounters an I/O or ledger failure.
                 interim_error = f"{type(exc).__name__}: {exc}"
-        remaining_seconds = max(0.0, self.deadline - self.clock())
-        if isinstance(self.deadline_epoch, (int, float)) and math.isfinite(self.deadline_epoch):
-            remaining_seconds = max(0.0, min(remaining_seconds, self.deadline_epoch - time.time()))
+        remaining_seconds = self._mission_remaining_snapshot()
         active_blockers = self._active_blockers()
         result = {
             "schema_version": RUN_SCHEMA_VERSION, "run_id": self.run_id, "workflow_id": self.workflow["id"],
@@ -32066,8 +32228,8 @@ class ComposerRunner:
             "topic_history_scope": self.topic_history_scope,
             "topic_history_entries": len(self.topic_history.get("entries", [])),
             "started_at_epoch": self.started_epoch, "deadline_at_epoch": self.deadline_epoch,
-            "elapsed_seconds": elapsed, "remaining_seconds": remaining_seconds,
-            "deadline_seconds": self.workflow["time_policy"]["hard_seconds"],
+            "elapsed_seconds": elapsed, "remaining_seconds": remaining_seconds, **self._mission_time_snapshot(),
+            "deadline_seconds": (None if self.mission_time_policy else self.workflow["time_policy"]["hard_seconds"]),
             "release_status": (
                 "research_expansion_required" if self.status == "research_expansion_required"
                 else "review_rejected" if self.status == "review_rejected"

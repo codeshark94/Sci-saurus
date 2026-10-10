@@ -4984,6 +4984,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             obligations = self._review_obligations_for(wid)
             execution_ref = review["execution_ref"]
             _, _, prompt, reply = self.gate._model_review_execution(execution_ref, "methods.work-reviewer")
+            from scisaurus.runtime.survey_records import project_work_review_batch
+            prompt, reply = project_work_review_batch(prompt, reply, entry_ref=review["entry_ref"], work_id=wid)
             reply = normalize_check_envelope(reply, work_review_checks(review["relationship_refs"], obligations))
             validate_work_review(reply, review["relationship_refs"], entry=prompt.get("entry"), review_obligations=obligations)
             return (prompt.get("phase") == "work_review" and prompt.get("review_contract") == contract
@@ -5109,6 +5111,49 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             return False
         return (self._review_evidence_scope(wid, review=self._body(review))
                 == self._review_evidence_scope(wid))
+
+    def _dispatch_work_reviews(self, jobs, contract_blocks):
+        """One independent batch retains separate source-bound entry verdicts."""
+        if self.score.get("design_brief") is None:
+            return self._models_checked(jobs, stage="unit_review", task_kind="verification",
+                on_contract_blocked=lambda name, error: contract_blocks.append(error))
+        assignments = [job["assignment"] for job in jobs]
+        expected = {item["entry"]["work_id"] for item in assignments}
+        def normalize(value):
+            exact(value, {"reviews"}, "implementation evidence reviews")
+            rows = value["reviews"]
+            if not isinstance(rows, list) or len(rows) != len(jobs):
+                raise ValidationError("implementation evidence reviews require every exact assigned work")
+            by_id = {}
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("work_id"), str):
+                    raise ValidationError("implementation evidence review requires work_id")
+                if row["work_id"] in by_id:
+                    raise ValidationError("duplicate implementation evidence review work_id")
+                by_id[row["work_id"]] = {key: item for key, item in row.items() if key != "work_id"}
+            if set(by_id) != expected:
+                raise ValidationError("implementation evidence review work_ids differ from the assignment")
+            return {"reviews": [{"work_id": job["assignment"]["entry"]["work_id"],
+                **job["normalizer"](by_id[job["assignment"]["entry"]["work_id"]])} for job in jobs]}
+        def validate(value):
+            for job, row in zip(jobs, value["reviews"]):
+                job["validator"]({key: item for key, item in row.items() if key != "work_id"})
+        def integrate(value, execution):
+            for job, row in zip(jobs, value["reviews"]):
+                job["on_valid"]({key: item for key, item in row.items() if key != "work_id"}, execution)
+        assignment = {"phase": "implementation_evidence_review_batch",
+            "assignment": "Audit the supplied short implementation context in one batch.",
+            "entries": assignments,
+            "response_contract": {"top_level_fields": ["reviews"],
+                "reviews": "One object per exact work_id, with work_id plus that entry's exact response_contract fields."},
+            "instructions": "Return only {reviews:[{work_id,checks,rationale}]} (include critique_adjudications only where the entry requires it). "
+                "Execute each entry's source-bound checks using its captured text. Keep each result to one short sentence. "
+                "This establishes source fidelity of implementation context, not novelty or experimental success. "
+                "Do not demand a complete bibliography, final optimized design or results before the first pilot."}
+        self._models_checked([{"name": "implementation-evidence-review", "actor": "methods.work-reviewer",
+            "assignment": assignment, "normalizer": normalize, "validator": validate, "on_valid": integrate}],
+            stage="unit_review", task_kind="verification",
+            on_contract_blocked=lambda name, error: contract_blocks.append(error))
 
     def _review_work_claims(self):
         repair_rounds = self.config["limits"]["max_rounds"]
@@ -5246,8 +5291,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                                  value, refs, entry=entry, review_obligations=obligations),
                              "on_valid": integrate})
             if jobs:
-                self._models_checked(jobs, stage="unit_review", task_kind="verification",
-                                     on_contract_blocked=lambda name, error: contract_blocks.append(error))
+                self._dispatch_work_reviews(jobs, contract_blocks)
             if not rejected:
                 if contract_blocks:
                     raise contract_blocks[0]

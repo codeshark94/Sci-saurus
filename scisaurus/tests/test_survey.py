@@ -402,6 +402,10 @@ def simulated_survey_worker(kind, params, channel):
                                if row["target_ref"] == assignment["map"]["entry_refs"]["W101"] and row["field"] == "inclusion")
                     value["findings"] = [{"check_id": "map-support", "assertion_id": pin["assertion_id"],
                                           "rationale": "The included screening state requires adjudication."}]
+    elif phase == "implementation_evidence_review_batch":
+        value = {"reviews": [{"work_id": entry["entry"]["work_id"],
+            "checks": check_rows(entry["required_checks"]),
+            "rationale": "Each claim is supported or explicitly unknown."} for entry in assignment["entries"]]}
     elif phase == "work_review":
         if mode in {"review-malformed", "isolated-review-block"} and assignment["entry"]["work_id"] == "W101":
             value = {"checks": [{"check_id": "duplicate-check", "outcome": "passed",
@@ -545,6 +549,32 @@ def survey_config(endpoint, mode="pass"):
 
 
 class TestSurveyRunner(unittest.TestCase):
+    def test_implementation_batch_preserves_exact_receipts_and_cache(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime()
+        runner._initialize(); runner._setup()
+        runner._search(["recall", "independent terminology"], "research.search-planner", runner.score_ref)
+        runner._map()
+        runner.score["design_brief"] = brief()
+        runner._review_work_claims()
+        contexts = list(self.model_contexts(runner.control, runner.store))
+        batches = [prompt for _, prompt in contexts if prompt.get("phase") == "implementation_evidence_review_batch"]
+        self.assertEqual(len(batches), 1)
+        self.assertGreater(len(batches[0]["entries"]), 1)
+        self.assertEqual(len({runner._body(record)["execution_ref"] for record in runner.work_reviews.values()}), 1)
+        self.assertTrue(all(runner._work_review_current(wid) for wid in runner.analysis_records))
+        calls = runner.model_calls_dispatched
+        runner._review_work_claims()
+        self.assertEqual(runner.model_calls_dispatched, calls)
+        prompt = batches[0]
+        ref = next(iter(runner.work_reviews.values()))
+        record = runner._body(ref)
+        execution, context, original, reply = runner.gate._model_review_execution(record["execution_ref"], "methods.work-reviewer")
+        changed = deepcopy(original); changed["entries"][0]["entry_ref"] = "artifact:foreign@1"
+        with patch.object(runner.gate, "_model_review_execution", return_value=(execution,context,changed,reply)):
+            first = changed["entries"][0]["entry"]["work_id"]
+            self.assertFalse(runner._work_review_current(first))
+
     def test_follow_up_reference_inventory_distinguishes_hits_capacity_and_captures(self):
         order = self.follow_up_order("Compare W101 and W202; historical W303 is not required acquisition.")
         runner = self.runtime(work_orders=[order])
