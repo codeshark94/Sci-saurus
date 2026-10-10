@@ -725,6 +725,61 @@ class TestSurveyRunner(unittest.TestCase):
             value, _ = runner._counter_plan()
         self.assertEqual(value["queries"], ["recorded search"])
 
+    def test_implementation_capacity_limit_retains_unperformed_challenge_for_assessment(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime(work_orders=[self.follow_up_order("Compare retained closest designs.")])
+        self.addCleanup(runner.control.close)
+        runner.score["design_brief"] = brief()
+        runner.works = {f"W{index}": {} for index in range(runner.bounds["max_works"])}
+        runner.survey_ref = "artifact:kb/surveys/current@1"
+        runner.nomination_record = {"artifact_ref": "artifact:kb/gap-nomination@1"}
+        before = deepcopy(runner.works)
+        with patch.object(runner, "_countersearch", side_effect=AssertionError("no new campaign")), patch.object(runner, "_record") as record:
+            runner._complete_countersearch_scope()
+        limitation = record.call_args.args[2]
+        self.assertEqual(limitation["status"], "not_performed")
+        self.assertEqual(limitation["survey_ref"], runner.survey_ref)
+        self.assertEqual(limitation["nomination_ref"], runner.nomination_record["artifact_ref"])
+        self.assertEqual(limitation["observed"], runner.bounds["max_works"])
+        self.assertFalse(runner.countersearch_complete)
+        self.assertEqual(runner.works, before)
+        compact = runner._compact_gap_repair_assignment({"counter_search_limit": limitation})
+        self.assertEqual(compact["counter_search_limit"], limitation)
+
+    def test_implementation_capacity_policy_preserves_existing_plans_and_other_scopes(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime(work_orders=[self.follow_up_order("Compare retained closest designs.")])
+        self.addCleanup(runner.control.close)
+        runner.works = {f"W{index}": {} for index in range(runner.bounds["max_works"])}
+        self.assertIsNone(runner._countersearch_capacity_limit())
+        runner.score["design_brief"] = brief()
+        runner.counter_plan_record = {"artifact_ref": "retained"}
+        with patch.object(runner, "_countersearch") as search:
+            runner._complete_countersearch_scope()
+        search.assert_called_once_with()
+        runner.counter_plan_record = None
+        with patch.object(runner, "_require_follow_up_catalog_capacity", side_effect=QuotaExceededError(
+                "Other capacity", dimension="model_calls", limit=1, observed=1)):
+            with self.assertRaises(QuotaExceededError):
+                runner._countersearch_capacity_limit()
+
+    def test_capacity_limited_work_plan_reserves_assessment_and_keeps_obligations(self):
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runtime(work_orders=[self.follow_up_order("Compare retained closest designs.")])
+        self.addCleanup(runner.control.close)
+        runner.score["design_brief"] = brief()
+        runner.works = {f"W{index}": {} for index in range(runner.bounds["max_works"])}
+        runner.survey_ref = "artifact:kb/surveys/current@1"
+        runner._survey_acceptance_pending = False
+        runner.nomination_record = None
+        names = {row["name"] for row in runner._required_model_work()}
+        self.assertIn("gap-assessment", names)
+        self.assertTrue(any(name.startswith("follow-up-disposition-") for name in names))
+        self.assertNotIn("counter-plan", names)
+        self.assertNotIn("survey-review:countersearch", names)
+        with self.assertRaises(StateError):
+            runner._countersearch_capacity_limit()
+
     def test_empty_length_response_is_capacity_failure_and_resume_cannot_renew_it(self):
         runner = self.runtime()
         self.addCleanup(runner.control.close)

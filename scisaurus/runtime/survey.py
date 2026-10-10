@@ -46,6 +46,7 @@ from scisaurus.runtime.survey_records import (
     validate_follow_up_completion, follow_up_response_contract,
     follow_up_completion_basis, follow_up_completion_context, replay_follow_up_response,
     MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
+    validate_assessment_acquisition_scope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
     normalize_gap_assessment_envelope, validate_map,
     validate_survey_review, validate_assessment, validate_work_review, survey_review_response_contract,
@@ -2030,6 +2031,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "source_evidence_policy": _SOURCE_EVIDENCE_POLICY,
             **({"validation_feedback": feedback} if feedback else {}),
             "scientific_input_recovery": scientific_input_recovery_contract(),
+            **({"counter_search_limit": deepcopy(assignment["counter_search_limit"])}
+               if "counter_search_limit" in assignment else {}),
             **({"resume_boundary": assignment["resume_boundary"]}
                if "resume_boundary" in assignment else {}),
             **({"_contract_repair_boundary": assignment["_contract_repair_boundary"]}
@@ -2121,7 +2124,8 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if not self.assessment_ref:
             if self.nomination is None and self.score.get("proposed_gap") is None:
                 required.append({"name": "nominate", "phase": "nomination", "actor": "research.gap-proposer"})
-            if not self.countersearch_complete:
+            if (not self.countersearch_complete
+                    and not self._implementation_countersearch_is_capacity_limited()):
                 if self.counter_plan_record is None:
                     required.append({"name": "counter-plan", "phase": "counter_plan", "actor": "methods.novelty-challenger"})
                 if not self._countersearch_active:
@@ -5772,6 +5776,40 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         if not self.countersearch_complete:
             raise StateError("counter-search completion could not be bound to the accepted survey")
 
+    def _implementation_countersearch_is_capacity_limited(self):
+        """Use the acquisition fence for both dispatch and work reservation."""
+        if (self.score.get("design_brief") is None or self.countersearch_complete
+                or self.counter_plan_record is not None):
+            return False
+        try:
+            self._require_follow_up_catalog_capacity()
+        except QuotaExceededError as exc:
+            if exc.dimension != "max_works":
+                raise
+            return True
+        return False
+
+    def _countersearch_capacity_limit(self):
+        """Expose a bounded implementation campaign's unperformed acquisition."""
+        if not self._implementation_countersearch_is_capacity_limited():
+            return None
+        if not self.survey_ref or self.nomination_record is None:
+            raise StateError("counter-search capacity disposition requires its exact survey and nomination")
+        return {"status": "not_performed", "dimension": "max_works",
+                "limit": self.bounds["max_works"], "observed": len(self.works),
+                "survey_ref": self.survey_ref,
+                "nomination_ref": self.nomination_record["artifact_ref"]}
+
+    def _complete_countersearch_scope(self):
+        limitation = self._countersearch_capacity_limit()
+        if limitation is None:
+            self._countersearch()
+            return
+        identity = hashlib.sha256(canonical_bytes(limitation)).hexdigest()
+        self._record("command/counter-search-limits/" + identity, "note", limitation,
+                     "command.controller", subjects=[self.survey_ref,
+                                                      self.nomination_record["artifact_ref"]])
+
     def _assess(self):
         assessment_sources = self._assessment_source_context()
         resume_gap_assessment = bool(
@@ -5792,6 +5830,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "allowed_check_outcomes": ["passed", "failed", "insufficient_evidence", "check_failed"],
             "instructions": _GAP_ASSESSMENT_INSTRUCTIONS,
         }
+        acquisition_limit = self._countersearch_capacity_limit()
+        if acquisition_limit is not None:
+            assessment_assignment["counter_search_limit"] = acquisition_limit
+            assessment_assignment["instructions"] += (
+                " The current additional counter-search was not performed because its declared "
+                "catalog admission capacity is exhausted. Assess the retained evidence and disclose "
+                "this acquisition limit. It cannot establish eligible_for_experiment. A captured "
+                "prior solution may still refute the hypothesis under the ordinary evidence checks. "
+                "An insufficient_evidence decision records uncertainty; it does not authorize a pilot."
+            )
         if resume_gap_assessment:
             # A Composer continuation is an explicit new assessment attempt.
             # Keep the accepted survey and source catalogue, but give the
@@ -5824,6 +5872,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             # and exact source windows assembled above.
             assessment_assignment = self._compact_gap_repair_assignment(assessment_assignment)
         def validate_gap_assessment(value):
+            validate_assessment_acquisition_scope(value, acquisition_limit)
             validate_assessment(value, assessment_source_lookup, self.works,
                                 require_spans=True, windows=windows)
 
@@ -5907,7 +5956,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 if self.nomination is None:
                     self._nominate()
                 if not self.countersearch_complete:
-                    self._countersearch()
+                    self._complete_countersearch_scope()
                 decision = self._assess()
             self._resolve_follow_up()
             status = "completed"

@@ -1009,6 +1009,12 @@ def validate_work_review(value, relationship_refs, *, entry=None, review_obligat
                     "verify the absence of an admitted claim, not a nonexistent scientific assertion")
 
 
+def validate_assessment_acquisition_scope(value, limitation):
+    """Incomplete challenge acquisition cannot establish positive eligibility."""
+    if limitation is not None and value.get("state") == "eligible_for_experiment":
+        raise ValidationError("unperformed counter-search cannot establish experiment eligibility")
+
+
 def validate_assessment(value, sources, works, *, require_spans=False, windows=None):
     exact(value, {"state", "rationale", "comparisons", "checks", "evidence"}, "gap assessment")
     if value["state"] not in ("refuted_by_prior_work", "insufficient_evidence", "eligible_for_experiment"):

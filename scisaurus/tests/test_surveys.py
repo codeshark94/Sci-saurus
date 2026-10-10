@@ -1064,6 +1064,18 @@ class TestSurveyGate(unittest.TestCase):
                     overrides={"checks": checks(ASSESSMENT_CHECKS, outcome)})
                 self.assertEqual(self.commit(assessment)["artifact_ref"], assessment)
 
+    def test_unperformed_countersearch_cannot_authorize_positive_eligibility(self):
+        self.accept()
+        scope = {"status": "not_performed", "dimension": "max_works", "limit": 1, "observed": 1}
+        positive = self.assessment(prompt_overrides={"counter_search_limit": scope})
+        with self.assertRaisesRegex(ValidationError, "unperformed counter-search"):
+            self.commit(positive)
+        self.assertIsNone(self.store.accepted(self.store.get(positive)["artifact_id"]))
+        for state in ("insufficient_evidence", "refuted_by_prior_work"):
+            with self.subTest(state=state):
+                assessment = self.assessment(state=state, prompt_overrides={"counter_search_limit": scope})
+                self.assertEqual(self.commit(assessment)["artifact_ref"], assessment)
+
     def test_assessment_requires_an_exact_nomination_reference(self):
         self.accept()
         ref = self.assessment()

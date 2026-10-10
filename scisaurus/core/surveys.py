@@ -23,6 +23,7 @@ from scisaurus.runtime.survey_records import (
     normalize_check_envelope, normalize_gap_assessment_envelope, authoritative_source, has_section_heading,
     validate_work_review, validate_survey_review, normalize_survey_review_envelope,
     CURRENT_MAP_REVIEW_PROTOCOLS,
+    validate_assessment_acquisition_scope,
 )
 
 
@@ -723,6 +724,7 @@ class SurveyGate:
         _, context, reply = self._execution(body.get("execution_ref"), assessment["author"], survey_ref)
         context_body = self._json(self.store.read_body(context["body_hash"]), "assessment context")
         prompt = self._json(context_body.get("prompt"), "assessment prompt")
+        validate_assessment_acquisition_scope(body, prompt.get("counter_search_limit"))
         if (prompt.get("nomination_ref") != body["nomination_ref"]
                 or prompt.get("gap") != {key: nomination[key] for key in ("id", "statement")}):
             raise ValidationError("assessment dispatch must bind the exact nomination and gap statement")
