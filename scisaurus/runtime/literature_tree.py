@@ -10,7 +10,7 @@ from scisaurus.core.schema import canonical_bytes
 from scisaurus.core.errors import ModelContractError, ProviderRateLimitError, StateError, ValidationError
 from scisaurus.core.source_spans import (LEGACY_EVIDENCE_FIELDS, SPAN_EVIDENCE_FIELDS,
                                          bind, expand_evidence, index_evidence, validate as validate_span)
-from scisaurus.runtime.survey_config import search_query, work_id
+from scisaurus.runtime.survey_config import query_identity, search_query, work_id
 from scisaurus.runtime.survey_records import MAP_FIELDS, authoritative_source
 
 
@@ -415,6 +415,20 @@ class LiteratureTree:
                 "A read decision requests source capture, analysis, and independent checking; it is not scientific inclusion or verification. "
                 "A defer decision retains the candidate for later consideration. Metadata does not establish "
                 "mechanisms, measurements, novelty, or absence. Explain priority and relevance without inventing substantive findings."}
+        if self.score.get("design_brief") is not None:
+            limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
+            retained_reads = self._tree_retained_implementation_reads()
+            assignment["resources"]["deep_reading"] = {
+                "declared_limit": limit, "retained_substantive_count": len(existing),
+                "retained_read_count": len(retained_reads),
+                "remaining_new_reads": max(0, limit - len(retained_reads)),
+            }
+            assignment["instructions"] += (
+                " This is implementation evidence for a first pilot. The declared deep_reading allowance "
+                "applies cumulatively across discovery and counter-search. Prioritize only missing physical "
+                "inputs, verification/baseline definitions and closest competing mechanisms. "
+                "Defer other candidates; captured catalog records remain available. Order READ decisions by "
+                "scientific priority within remaining_new_reads; do not expand a publication bibliography.")
         basis = selection_basis(assignment)
         identity = node_id(basis)
         retained_input = self.store.head("kb/reading-selection-inputs/" + identity)
@@ -550,12 +564,13 @@ class LiteratureTree:
     def _tree_read(self, actions):
         actions = list(actions)
         reconsider = any(not action.get("selection_ref") for action in actions)
-        if reconsider:
+        if reconsider and self.score.get("design_brief") is None:
             seen = {action["id"] for action in actions}
             actions.extend(node for node in self.exploration_tree["nodes"] if node["kind"] == "acquisition"
                            and node.get("deferred_work_ids") and node.get("follow_up_ref") == self.follow_up_ref
                            and node["id"] not in seen)
         self._tree_select_reads(actions, reconsider=reconsider)
+        self._tree_admit_implementation_reads(actions)
         self._tree_admitted_reads = {self.aliases.get(wid, wid) for action in actions
                                      for wid in action.get("selected_work_ids", [])}
         decisions = [choice["work_id"] for ref in dict.fromkeys(action["selection_ref"] for action in actions)
@@ -621,6 +636,83 @@ class LiteratureTree:
                     parent["state"] = "pending"
         self._tree_save()
         self._checkpoint("exploration_read_reviewed", force=True)
+
+    def _tree_admit_implementation_reads(self, actions):
+        """Apply the cumulative workload allowance without editing model decisions."""
+        if self.score.get("design_brief") is None:
+            return
+        existing = {wid for wid, record in self.analysis_records.items()
+                    if any(self._body(record)[field]["text"] is not None for field in MAP_FIELDS)}
+        retained = self._tree_retained_implementation_reads()
+        limit = self.bounds.get("max_analyzed_works", self.bounds["max_works"])
+        priority = list(dict.fromkeys(choice["work_id"]
+            for ref in dict.fromkeys(action["selection_ref"] for action in actions)
+            for choice in self._body(self.store.get(ref))["candidates"] if choice["decision"] == "read"))
+        admitted = retained | set([wid for wid in priority if wid not in retained][:max(0, limit - len(retained))])
+        for action in actions:
+            available = {self.aliases.get(wid, wid) for wid in action["returned_work_ids"]}
+            requested = list(dict.fromkeys([*[wid for wid in priority if wid in available],
+                                             *sorted(retained & available)]))
+            deferred = sorted(set(requested) - admitted)
+            action.update(selected_work_ids=[wid for wid in requested if wid in admitted],
+                deferred_work_ids=sorted(available - admitted),
+                reading_admission={"declared_limit": limit,
+                    "retained_substantive_refs": sorted(self.analysis_records[wid]["artifact_ref"] for wid in existing),
+                    "retained_read_work_ids": sorted(retained),
+                    "admitted_work_ids": sorted(set(requested) & admitted),
+                    "selection_ref": action["selection_ref"], "budget_deferred_work_ids": deferred})
+        self._tree_save()
+
+    def _tree_retained_implementation_reads(self):
+        """Count admitted reads, including unsuccessful reads and interrupted siblings."""
+        retained = {wid for wid, record in self.analysis_records.items()
+                    if any(self._body(record)[field]["text"] is not None for field in MAP_FIELDS)}
+        for node in self.exploration_tree["nodes"]:
+            if node["kind"] != "acquisition":
+                continue
+            admission = node.get("reading_admission")
+            if admission is not None:
+                retained.update(admission["admitted_work_ids"])
+            elif node["state"] == "read":
+                retained.update(node.get("selected_work_ids", []))
+        return {self.aliases.get(wid, wid) for wid in retained}
+
+    def _tree_read_countersearch(self, record, plan):
+        """Screen the exact owned search receipts through the ordinary reading path."""
+        from scisaurus.runtime.survey import acquisition_succeeded
+        root = self.exploration_tree.get("root_id", self.exploration_tree["nodes"][0]["id"])
+        retained = {node["id"]: node for node in self.exploration_tree["nodes"]}
+        actions = []
+        queries = {query_identity(query) for query in plan["queries"]}
+        for ref in self.query_refs:
+            receipt = self.store.get(ref)
+            body = self._body(receipt)
+            if (body.get("plan_ref") != record["artifact_ref"]
+                    or body.get("role") != "methods.novelty-challenger"
+                    or not acquisition_succeeded(body)):
+                continue
+            request = body.get("request", {})
+            if (receipt.get("score_ref") != self.score_ref
+                    or receipt.get("author") != "methods.novelty-challenger"
+                    or request.get("operation") != "search"
+                    or query_identity(request.get("query", "")) not in queries):
+                raise StateError("counter-search reading receipt changed its owned score or query")
+            pin = {"kind": "acquisition", "parent_id": root,
+                   "plan_ref": record["artifact_ref"], "query_ref": ref}
+            identity = node_id(pin)
+            action = retained.get(identity)
+            if action is None:
+                action = {**pin, "id": identity, "depth": 1, "state": "captured",
+                    "request": deepcopy(body["request"]), "question": self.score["question"],
+                    "rationale": plan["rationale"], "follow_up_ref": self.follow_up_ref,
+                    "returned_work_ids": list(body["returned_work_ids"]),
+                    "new_unique_works": body["new_unique_works"]}
+                self.exploration_tree["nodes"].append(action)
+            actions.append(action)
+        if not actions:
+            raise StateError("counter-search has no owned captured receipts to screen")
+        self._tree_save()
+        self._tree_read(actions)
 
     def _tree_admitted_read_success(self, actions):
         identifiers = {action["id"] for action in actions}

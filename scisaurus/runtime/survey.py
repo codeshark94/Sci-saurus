@@ -3282,7 +3282,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                 continue
             if wid not in self.works or wid in self.full_text_attempted:
                 continue
-            if self.exploration_tree is None and len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
+            if (self.exploration_tree is None or self.score.get("design_brief") is not None) and len(self.full_text_attempted) >= self.bounds["max_full_texts"]:
                 self.gaps.append({"kind": "full_text_limit", "work_id": wid})
                 break
             self.full_text_attempted.add(wid)
@@ -3735,12 +3735,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             selected = {self.aliases.get(wid, wid) for action in self.exploration_tree["nodes"]
                         if action["kind"] == "acquisition"
                         for wid in action.get("selected_work_ids", [])}
+            if self.score.get("design_brief") is not None:
+                selected = self._tree_retained_implementation_reads()
             if self._tree_admitted_reads is not None:
                 selected = set(self._tree_admitted_reads)
-            if self._countersearch_active:
-                selected.update(self.aliases.get(wid, wid) for row in self.search_log
-                                if row.get("role") == "methods.novelty-challenger"
-                                for wid in row.get("returned_work_ids", []))
             selected.update(item["work_id"] for item in self.review_obligations)
             return (existing | selected) & set(self.work_records)
         def priority(wid):
@@ -4313,9 +4311,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "source_availability": [self._source_availability(wid) for wid in sorted({
                 gap["work_id"] for gap in self.gaps if gap.get("kind") == "full_text_failure"
                 and gap.get("work_id") in self.works})],
-            "deep_analysis_limit": (None if self.exploration_tree is not None else
+            "deep_analysis_limit": (None if self.exploration_tree is not None and self.score.get("design_brief") is None else
                                     self.bounds.get("max_analyzed_works", self.bounds["max_works"])),
-            "reading_selection_policy": ("model_decisions_with_call_token_and_time_limits" if self.exploration_tree is not None else
+            "reading_selection_policy": ("model_priority_with_cumulative_implementation_allowance" if self.score.get("design_brief") is not None else
+                                         "model_decisions_with_call_token_and_time_limits" if self.exploration_tree is not None else
                                          "legacy_analysis_limit"),
             "abstentions": abstentions,
             "source_windows": [{"source_ref": item["source_ref"], "available_chars": item["available_chars"], "window": item["window"]}
@@ -5751,9 +5750,13 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
         plan, record = self._counter_plan()
         self._search(plan["queries"], "methods.novelty-challenger", record["artifact_ref"],
                      admission="challenge")
-        self._complete_search_pages(admission="challenge")
-        self._full_texts()
+        if self.score.get("design_brief") is None:
+            self._complete_search_pages(admission="challenge")
         self._refresh_countersearch_state()
+        if self.exploration_tree is not None:
+            self._tree_read_countersearch(record, plan)
+        else:
+            self._full_texts()
         self._record(self._counter_acquisition_id(), "note", {
             "schema_version": "counter-search-acquisition-1",
             "question": self.score["question"], "plan_ref": record["artifact_ref"],

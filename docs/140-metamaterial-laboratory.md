@@ -108,6 +108,18 @@ projection precedes continuation policy so a generic descriptor receives the
 selected concept's evidence purpose before its resource bounds are derived.
 Provider and quota recovery may narrow this envelope.
 
+Implementation counter-search captures the first configured page of each authored
+query. It does not drain provider cursors to fill the catalog. Every captured page
+is bound to its exact plan and receipt and passes through the same reading
+selection as initial acquisition. A search hit alone never admits substantive
+reading. `max_analyzed_works` applies cumulatively across discovery and challenge;
+retained substantive entries consume this allowance. New reads follow the
+model's scientific priority, while excess choices and unread catalog records
+remain explicitly deferred. Model decisions, acquired sources and usage are
+preserved on resume. `max_full_texts` also bounds implementation source attempts.
+Deferred acquisition and incomplete pagination remain visible in coverage;
+these workload limits do not establish relevance, novelty or scientific validity.
+
 Default model routes and specialist per-call allowances support 32,768 output
 tokens. Topic field repairs and maturity reviews use the configured route's
 capacity. Foundry authoring, independent validation, and review share this

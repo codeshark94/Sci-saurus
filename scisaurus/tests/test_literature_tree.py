@@ -418,6 +418,7 @@ class TestExplorationContract(unittest.TestCase):
         from unittest.mock import Mock
         from scisaurus.runtime.literature_tree import LiteratureTree
         runner = object.__new__(LiteratureTree)
+        runner.score = {"question": "fixture"}
         runner.follow_up_ref = "follow-up"
         parent = {"id": "parent", "parent_id": "original-acquisition", "kind": "read", "work_id": "W1", "state": "superseded",
                   "decision": "expand", "follow_up_ref": "follow-up"}
@@ -441,6 +442,7 @@ class TestExplorationContract(unittest.TestCase):
         from unittest.mock import Mock
         from scisaurus.runtime.survey import SurveyRunner
         runner = object.__new__(SurveyRunner)
+        runner.score = {"question": "fixture"}
         runner._work_abstention_context = lambda entry, refs: None
         runner.follow_up_ref = None
         runner.work_records = {wid: {"artifact_ref": "work-" + wid} for wid in ("W1", "W2")}
@@ -572,6 +574,117 @@ class TestPromptProjection(unittest.TestCase):
 
 
 class TestExplorationExecution(unittest.TestCase):
+    def test_counter_receipts_require_read_selection_and_reuse_owned_nodes(self):
+        from unittest.mock import patch
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        plan = {"queries": ["independent terminology"], "rationale": "Screen a competing mechanism."}
+        record = runner._record("kb/test-counter-plan", "note", plan, "methods.novelty-challenger")
+        runner._search(plan["queries"], "methods.novelty-challenger", record["artifact_ref"], admission="challenge")
+        runner._countersearch_active = True
+        self.assertEqual(runner._analysis_selection(), set())
+        with patch.object(runner, "_tree_read") as read:
+            runner._tree_read_countersearch(record, plan)
+        actions = read.call_args.args[0]
+        self.assertTrue(actions)
+        self.assertEqual({action["query_ref"] for action in actions}, set(runner.query_refs))
+        self.assertTrue(all(action["plan_ref"] == record["artifact_ref"] for action in actions))
+        count = len(runner.exploration_tree["nodes"])
+        actions[0]["selection_ref"] = "retained-selection"
+        with patch.object(runner, "_tree_read") as read:
+            runner._tree_read_countersearch(record, plan)
+        self.assertEqual(len(runner.exploration_tree["nodes"]), count)
+        self.assertEqual(read.call_args.args[0][0]["selection_ref"], "retained-selection")
+        with self.assertRaisesRegex(StateError, "owned score or query"):
+            runner._tree_read_countersearch(record, {**plan, "queries": ["foreign query"]})
+        runner.control.close()
+
+    def test_implementation_read_allowance_retains_priority_decisions_and_existing_entries(self):
+        from unittest.mock import patch
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        runner.score["design_brief"] = brief(); runner.bounds["max_analyzed_works"] = 2
+        entry = {"work_id": "W101", **{field: {"text": "Retained checked field.", "evidence": []}
+                                      for field in ("problem", "approach", "finding", "limitations")}}
+        runner.analysis_records["W101"] = runner._record("kb/work-analyses/W101", "note", entry, "research.literature-mapper")
+        selection = {"rationale": "Prioritize the missing verification case.", "candidates": [
+            {"work_id": wid, "decision": "read", "rationale": "Implementation input."}
+            for wid in ("W301", "W201", "W101")]}
+        record = runner._record("kb/test-selection", "note", selection, "research.search-planner")
+        original = record["body_hash"]
+        actions = [{"selection_ref": record["artifact_ref"], "selected_work_ids": ["W201", "W301", "W101"],
+                    "returned_work_ids": ["W101", "W201", "W301", "W401"],
+                    "deferred_work_ids": ["W401"]}]
+        with patch.object(runner, "_tree_save"):
+            runner._tree_admit_implementation_reads(actions)
+            self.assertEqual(actions[0]["reading_admission"]["budget_deferred_work_ids"], ["W201"])
+            self.assertEqual(set(actions[0]["selected_work_ids"]), {"W301", "W101"})
+            self.assertEqual(actions[0]["deferred_work_ids"], ["W201", "W401"])
+            self.assertEqual(actions[0]["reading_admission"]["budget_deferred_work_ids"], ["W201"])
+            runner._tree_admit_implementation_reads(actions)
+            self.assertEqual(actions[0]["reading_admission"]["budget_deferred_work_ids"], ["W201"])
+        self.assertEqual(runner.store.get(record["artifact_ref"])["body_hash"], original)
+        self.assertEqual(runner._body(record), selection)
+        actions[0]["selected_work_ids"] = ["W201", "W301", "W101"]
+        runner.score.pop("design_brief")
+        runner._tree_admit_implementation_reads(actions)
+        self.assertEqual(actions[0]["selected_work_ids"], ["W201", "W301", "W101"])
+        runner.control.close()
+
+    def test_implementation_countersearch_does_not_drain_catalog_pages(self):
+        from unittest.mock import patch
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        for implementation in (True, False):
+            if implementation:
+                runner.score["design_brief"] = brief()
+            else:
+                runner.score.pop("design_brief")
+            plan = {"queries": ["independent terminology"], "rationale": "Compare baselines."}
+            record = runner._record("kb/test-counter-plan", "note", plan, "methods.novelty-challenger")
+            runner.nomination_record = record
+            runner.counter_plan_record = record; runner.counter_query_refs = []
+            runner.countersearch_complete = True
+            with patch.object(runner, "_counter_plan", return_value=(plan, record)), \
+                 patch.object(runner, "_search") as search, \
+                 patch.object(runner, "_complete_search_pages") as pages, \
+                 patch.object(runner, "_refresh_countersearch_state"), \
+                 patch.object(runner, "_tree_read_countersearch") as reads, \
+                 patch.object(runner, "_accept_survey"):
+                runner._countersearch()
+            self.assertEqual(pages.call_count, int(not implementation))
+            search.assert_called_once(); reads.assert_called_once_with(record, plan)
+        runner.control.close()
+
+    def test_implementation_read_allowance_is_shared_across_interrupted_siblings(self):
+        from unittest.mock import patch
+        from scisaurus.tests.test_material_development import brief
+        runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
+        runner.score["design_brief"] = brief(); runner.bounds["max_analyzed_works"] = 2
+        for wid in ("W101", "W102", "W201", "W301"):
+            runner.work_records[wid] = {"artifact_ref": "work-" + wid}
+        actions = []
+        for ids in (("W101", "W102"), ("W201", "W301")):
+            record = runner._record("kb/test-selection-" + ids[0], "note", {
+                "rationale": "Prioritize missing implementation evidence.", "candidates": [
+                    {"work_id": wid, "decision": "read", "rationale": "Input to check."} for wid in ids]},
+                "research.search-planner")
+            action = {"id": ids[0], "kind": "acquisition", "state": "captured",
+                "selection_ref": record["artifact_ref"], "returned_work_ids": list(ids),
+                "selected_work_ids": list(ids), "deferred_work_ids": []}
+            runner.exploration_tree["nodes"].append(action)
+            with patch.object(runner, "_tree_save"):
+                runner._tree_admit_implementation_reads([action])
+            actions.append(action)
+        self.assertEqual(actions[1]["selected_work_ids"], [])
+        self.assertEqual(actions[1]["reading_admission"]["budget_deferred_work_ids"], ["W201", "W301"])
+        runner._countersearch_active = True
+        self.assertEqual(runner._analysis_selection(), {"W101", "W102"})
+        with patch.object(runner, "_tree_save"):
+            runner._tree_admit_implementation_reads(actions)
+        self.assertEqual(runner._analysis_selection(), {"W101", "W102"})
+        self.assertEqual(actions[1]["reading_admission"]["budget_deferred_work_ids"], ["W201", "W301"])
+        runner.control.close()
+
     def test_planner_source_projection_retains_checked_quotes_beyond_prefix(self):
         from unittest.mock import patch
         runner = self.runner(); runner._initialize(); runner._setup(); runner._tree_load()
