@@ -25,8 +25,8 @@ REALIZATION_REVIEW_RULE = (
 )
 
 
-def review_execution_evidence(records, expected_input, candidate, *, normalize_output):
-    """Bind review sources and input to captured execution bytes, never workspace files."""
+def captured_execution_evidence(ref, result, expected_input):
+    """Verify a complete program receipt and recover its executed source snapshots."""
     from scisaurus.runtime.programs import _parse_object
 
     def capture(value):
@@ -36,49 +36,68 @@ def review_execution_evidence(records, expected_input, candidate, *, normalize_o
             body = base64.b64decode(value["body"], validate=True)
         except (ValueError, KeyError, TypeError) as exc:
             raise ValidationError("execution review byte capture is invalid") from exc
-        if (hashlib.sha256(body).hexdigest() != value.get("sha256")
+        if (type(value.get("bytes")) is not int
+                or hashlib.sha256(body).hexdigest() != value.get("sha256")
                 or len(body) != value.get("bytes")):
             raise ValidationError("execution review capture differs from its digest or length")
         return body
 
+    if not isinstance(result, dict) or not isinstance(expected_input, dict):
+        raise ValidationError("execution review requires an object receipt and frozen input")
+    metadata = result.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValidationError("execution review metadata must be an object")
+    if (result.get("outcome") != "ok" or metadata.get("process_returncode") != 0
+            or metadata.get("capture_truncated") is not False
+            or metadata.get("capture_incomplete") is not False):
+        raise ValidationError("execution review requires a complete successful program receipt")
+    stdin, stdout = capture(result.get("input_capture")), capture(result.get("capture"))
+    if (stdin != canonical_bytes(expected_input)
+            or canonical_bytes(result.get("input")) != stdin
+            or result.get("input_sha256") != hashlib.sha256(stdin).hexdigest()):
+        raise ValidationError("execution review input differs from the frozen study input")
+    document = _parse_object(stdout)
+    if (result.get("capture_sha256") != hashlib.sha256(stdout).hexdigest()
+            or canonical_bytes(document) != canonical_bytes(result.get("document"))):
+        raise ValidationError("execution review output differs from its captured document")
+    identity = metadata.get("command_identity", {})
+    if not isinstance(identity, dict) or not isinstance(identity.get("details"), dict):
+        raise ValidationError("execution review command identity must contain object details")
+    details = identity.get("details", {})
+    if hashlib.sha256(canonical_bytes(details)).hexdigest() != identity.get("sha256"):
+        raise ValidationError("execution review command identity is invalid")
+    sources = []
+    source_records = details.get("source_files", [])
+    if not isinstance(source_records, list):
+        raise ValidationError("execution review source files must be an array")
+    for source in source_records:
+        if not isinstance(source, dict) or not isinstance(source.get("path"), str):
+            raise ValidationError("execution review source must contain a file path")
+        body = capture(source.get("capture"))
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValidationError("execution review source is not UTF-8") from exc
+        sources.append({"path": source["path"], "sha256": hashlib.sha256(body).hexdigest(),
+                        "source": text})
+    if metadata.get("sandbox_required") is True and (
+            not sources or metadata.get("source_dispatch_mode") != "private_read_only_snapshot"):
+        raise ValidationError("execution review has no executed immutable source snapshot")
+    return {"execution_ref": ref, "command_identity_sha256": identity["sha256"],
+            "input_sha256": hashlib.sha256(stdin).hexdigest(),
+            "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+            "source_files": sources, "source_available": bool(sources),
+            "sandbox_mode": metadata.get("sandbox_mode")}
+
+
+def review_execution_evidence(records, expected_input, candidate, *, normalize_output):
+    """Bind review sources and input to captured execution bytes, never workspace files."""
     executions = []
     for ref, result in records:
-        metadata = result.get("metadata", {})
-        if (result.get("outcome") != "ok" or metadata.get("process_returncode") != 0
-                or metadata.get("capture_truncated") is not False
-                or metadata.get("capture_incomplete") is not False):
-            raise ValidationError("execution review requires a complete successful program receipt")
-        stdin, stdout = capture(result.get("input_capture")), capture(result.get("capture"))
-        if (stdin != canonical_bytes(expected_input)
-                or canonical_bytes(result.get("input")) != stdin
-                or result.get("input_sha256") != hashlib.sha256(stdin).hexdigest()):
-            raise ValidationError("execution review input differs from the frozen study input")
-        document = _parse_object(stdout)
-        if (result.get("capture_sha256") != hashlib.sha256(stdout).hexdigest()
-                or canonical_bytes(document) != canonical_bytes(result.get("document"))
-                or canonical_bytes(normalize_output(deepcopy(document))) != canonical_bytes(candidate)):
+        execution = captured_execution_evidence(ref, result, expected_input)
+        if canonical_bytes(normalize_output(deepcopy(result["document"]))) != canonical_bytes(candidate):
             raise ValidationError("execution review output differs from the current candidate")
-        identity = metadata.get("command_identity", {})
-        details = identity.get("details", {})
-        if hashlib.sha256(canonical_bytes(details)).hexdigest() != identity.get("sha256"):
-            raise ValidationError("execution review command identity is invalid")
-        sources = []
-        for source in details.get("source_files", []):
-            body = capture(source.get("capture"))
-            try:
-                text = body.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValidationError("execution review source is not UTF-8") from exc
-            sources.append({"path": source["path"], "sha256": hashlib.sha256(body).hexdigest(),
-                            "source": text})
-        if metadata.get("sandbox_required") is True and (
-                not sources or metadata.get("source_dispatch_mode") != "private_read_only_snapshot"):
-            raise ValidationError("execution review has no executed immutable source snapshot")
-        executions.append({"execution_ref": ref, "command_identity_sha256": identity["sha256"],
-                           "input_sha256": hashlib.sha256(stdin).hexdigest(),
-                           "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
-                           "source_files": sources, "source_available": bool(sources),
-                           "sandbox_mode": metadata.get("sandbox_mode")})
+        executions.append(execution)
     if not executions:
         raise ValidationError("execution review requires current execution receipts")
     return {"schema_version": "executed-study-review-1",

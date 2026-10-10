@@ -435,7 +435,7 @@ def _safe_value(value, *, depth=0):
                 continue
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
-                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
+                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence", "executed_study_evidence",
                             "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract", "completed_producer_evidence",
                             "topic", "candidate_topics", "frontier_seeds", "experiment_feasibility", "stage_evidence_scope"}:
                 output[key] = _preserve_response_value(item)
@@ -483,7 +483,7 @@ def _bounded_value(value, *, depth=0, max_depth=5, max_keys=64, max_items=24,
         for key, item in value.items():
             if str(key) in {"candidate_program", "prior_plan_review", "repair_evidence_request",
                             "repair_evidence_note", "repair_adjudication", "repair_contract",
-                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence",
+                            "prior_evidence_review", "evidence_experiment_intent", "foundry_execution_evidence", "executed_study_evidence",
                             "question_alignment", "admitted_model_definition", "evidence_plan", "study_evidence_contract", "completed_producer_evidence",
                             "topic", "candidate_topics", "frontier_seeds", "experiment_feasibility", "stage_evidence_scope"}:
                 output[key] = _preserve_response_value(item)
@@ -737,9 +737,7 @@ def _repair_candidate_program(repair_packet):
         "repair_subject_lineage": _bounded_value(
             repair_packet.get("repair_subject_lineage", repair_packet.get("failure_lineage", {})),
             max_depth=2, max_keys=12, max_items=8, max_text=400),
-        "experiment_intent": _bounded_value(
-            attempt.get("experiment_intent", {}), max_depth=5,
-            max_keys=24, max_items=12, max_text=1800),
+        "experiment_intent": _preserve_response_value(attempt.get("experiment_intent", {})),
         "admitted_model_definition": _preserve_response_value(
             repair_packet.get("admitted_model_definition", {"available": False})),
         "exact_execution_sources": source_files,
@@ -828,6 +826,7 @@ def _verifier_repair_packet(value, *, detail="full"):
         output["laboratory"] = _preserve_response_value(value["laboratory"])
     output["question_alignment"] = _preserve_response_value(value.get("question_alignment", {}))
     output["foundry_execution_evidence"] = _preserve_response_value(value.get("foundry_execution_evidence", {}))
+    output["executed_study_evidence"] = _preserve_response_value(value.get("executed_study_evidence", {}))
     output["failure_lineage"] = _bounded_value(
         value.get("failure_lineage", {}), max_depth=2,
         max_keys=12, max_items=8, max_text=400)
@@ -1742,6 +1741,7 @@ def repair_adjudication_evidence_document(repair_packet, reviewer_reports=(), *,
            if isinstance(repair_packet.get("laboratory"), dict) else {}),
         "repair_contract": _preserve_response_value(repair_packet.get("repair_contract", {})),
         "foundry_execution_evidence": _preserve_response_value(repair_packet.get("foundry_execution_evidence", {})),
+        "executed_study_evidence": _preserve_response_value(repair_packet.get("executed_study_evidence", {})),
         "plan_review_failure": _bounded_value(
             repair_packet.get("plan_review_failure", {}), max_depth=3,
             max_keys=12, max_items=8, max_text=1400),

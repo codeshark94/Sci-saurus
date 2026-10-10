@@ -219,9 +219,9 @@ EXPERIMENT_RESULT_METADATA_FIELDS = frozenset({
 MAX_EXPERIMENT_RESULT_PACKAGE_BYTES = 16 * 1024 * 1024
 CAPABILITY_REPAIR_SOURCE_CHARS = 64_000
 CAPABILITY_REPAIR_PANEL_SCHEMA_VERSION = "capability-repair-panel-8"
-CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-exact-citation-locations-18"
+CAPABILITY_REPAIR_PANEL_PROMPT_REVISION = "repair-plan-executed-study-evidence-19"
 SURVEY_EVIDENCE_REQUEST_POLICY_REVISION = 2
-CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v2"
+CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION = "immutable-research-evidence-v3"
 CAPABILITY_REPAIR_UNRESOLVED_SOURCE_FILES = 2
 CAPABILITY_REPAIR_PLAN_SCHEMA_VERSIONS = frozenset({
     "capability-repair-panel-6", "capability-repair-panel-7",
@@ -10922,7 +10922,7 @@ class ComposerRunner:
         if isinstance(value, dict):
             output = {}
             for index, (key, item) in enumerate(value.items()):
-                if str(key) in {"foundry_execution_evidence", "current_foundry_failure", "admitted_model_definition"}:
+                if str(key) in {"foundry_execution_evidence", "current_foundry_failure", "admitted_model_definition", "executed_study_evidence"}:
                     output[str(key)] = _preserve_response_value(item)
                     continue
                 if index >= max_keys:
@@ -11137,6 +11137,7 @@ class ComposerRunner:
                 packet.get("observed_result"), max_depth=4, max_keys=24, max_items=8, max_text=1600),
             "failure_observed_result": ComposerRunner._capability_repair_projection(
                 packet.get("failure_observed_result"), max_depth=4, max_keys=24, max_items=8, max_text=1600),
+            "executed_study_evidence": deepcopy(packet.get("executed_study_evidence", {})),
             "prior_specialist_reviews": reports,
             "prior_verifier": ComposerRunner._capability_repair_projection(
                 packet.get("prior_verifier"), max_depth=4, max_keys=20, max_items=8, max_text=1400),
@@ -13048,7 +13049,7 @@ class ComposerRunner:
                 }
             last_attempt["source_integrity"] = source_integrity
             foundry_failure = {
-                "status": verified_dossier.get("foundry_status") or "failed",
+                "status": verified_dossier.get("foundry_status") or "unavailable",
                 "attempts": verified_dossier.get("foundry_work_attempts"),
                 "feedback": verified_dossier.get("prior_foundry_feedback"),
                 "validation_context": verified_dossier.get("validation_context"),
@@ -13120,10 +13121,12 @@ class ComposerRunner:
                           if verified_dossier else None)
         executed_refs = (exact_observed.get("execution_refs")
                          if isinstance(exact_observed, dict) else None)
+        executed_study = (verified_dossier or {}).get("executed_study_evidence", {})
         snapshot_hashes = {item.get("sha256") for item in program_snapshot
                            if isinstance(item, dict) and item.get("sha256")}
         source_applicability = None
-        if isinstance(executed_refs, list) and executed_refs and candidate_source_files:
+        if (isinstance(executed_refs, list) and executed_refs and candidate_source_files
+                and executed_study.get("available") is not True):
             source_applicability = all(
                 isinstance(candidate_source_files.get(name), dict)
                 and candidate_source_files[name].get("expected_sha256") in snapshot_hashes
@@ -13304,6 +13307,11 @@ class ComposerRunner:
             }
         intent = foundry_failure.get("last_attempt")
         intent = intent.get("experiment_intent") if isinstance(intent, dict) else None
+        if executed_study.get("available") is True:
+            intent = deepcopy(executed_study["experiment_intent"])
+            foundry_failure["last_attempt"]["experiment_intent"] = deepcopy(intent)
+        packet["executed_study_evidence"] = {
+            key: deepcopy(value) for key, value in executed_study.items() if key != "source_files"}
         prior_measurements = [{
             "measurement_sha256": item.get("measurement_sha256"),
             "validation_decision": item.get("validation_decision"),
@@ -13452,7 +13460,7 @@ class ComposerRunner:
             "unresolved_execution_sources": unresolved_source_identity,
         })).hexdigest()
         complete_evidence = {name: packet.pop(name, {}) for name in (
-            "foundry_execution_evidence", "admitted_model_definition")}
+            "foundry_execution_evidence", "admitted_model_definition", "executed_study_evidence")}
         if "laboratory" in packet:
             complete_evidence["laboratory"] = packet.pop("laboratory")
         packet = self._capability_repair_projection(
@@ -14079,6 +14087,7 @@ class ComposerRunner:
         evidence = {
             "contract_revision": CAPABILITY_REPAIR_REVIEW_EVIDENCE_REVISION,
             "foundry_execution_evidence": packet.get("foundry_execution_evidence"),
+            "executed_study_evidence": packet.get("executed_study_evidence"),
             "admitted_model_definition": {key: admitted_model.get(key) for key in (
                 "available", "definition", "scientific_source_refs")},
             "topic": {key: topic.get(key) for key in (
@@ -24563,6 +24572,8 @@ class ComposerRunner:
                 "execution_evidence_materialized": False,
             }
 
+        executed_study = self._executed_dossier_evidence(
+            dossier_stage_id, dossier_attempt_number, dossier.get("observed_result"))
         foundry = dossier.get("foundry_work_snapshot")
         foundry = foundry if isinstance(foundry, dict) else {}
         dossier_attempt = foundry.get("last_attempt")
@@ -24655,6 +24666,11 @@ class ComposerRunner:
             source_entry = self._repair_source_evidence(
                 source, source_origin=source_origin, expected_sha256=expected_sha256)
             source_files[source_name.removesuffix("_source")] = source_entry
+        if executed_study.get("available") is True:
+            source_files = deepcopy(executed_study["source_files"])
+            integrity = {name: {"sha256": record["expected_sha256"],
+                                "characters": record["source_characters"], "truncated": False}
+                         for name, record in source_files.items()}
 
         observed = dossier.get("observed_result")
         if isinstance(observed, dict):
@@ -24776,6 +24792,7 @@ class ComposerRunner:
             "runtime": last_attempt.get("runtime"),
             "test_input": last_attempt.get("test_input"),
             "program_snapshot": dossier.get("program_snapshot", []),
+            "executed_study_evidence": executed_study,
             "prior_foundry_feedback": foundry.get("feedback"),
             "foundry_work_artifact_ref": foundry_cache_ref,
             "foundry_work_body_sha256": foundry_cache_body_hash,
@@ -24791,6 +24808,16 @@ class ComposerRunner:
             "repair_ledger": foundry_cache.get("repair_ledger", [])[-6:]
             if isinstance(foundry_cache.get("repair_ledger"), list) else [],
         }
+        if executed_study.get("available") is True:
+            evidence["experiment_intent"] = deepcopy(executed_study["experiment_intent"])
+            topic_ids = {item.get("topic_id") for item in authoritative_attempts
+                         if isinstance(item.get("topic_id"), str)}
+            if len(topic_ids) == 1:
+                evidence["topic_identity"] = {
+                    "topic_id": next(iter(topic_ids)),
+                    "research_question": executed_study["experiment_intent"]["research_question"],
+                    "domain": executed_study["experiment_intent"]["domain"],
+                }
         subject = dossier.get("repair_subject")
         if subject is None:
             subject = self._legacy_plan_repair_subject(
@@ -24831,7 +24858,7 @@ class ComposerRunner:
             for key in ("experiment_intent", "candidate_input_sha256", "validation_context_sha256",
                         "topic_identity", "source_integrity", "source_files", "foundry_execution_evidence",
                         "admitted_model_definition",
-                        "runtime", "test_input", "program_snapshot", "prior_foundry_feedback",
+                        "runtime", "test_input", "program_snapshot", "executed_study_evidence", "prior_foundry_feedback",
                         "foundry_work_artifact_ref", "foundry_work_body_sha256",
                         "foundry_work_body_verified", "foundry_work_identity_verified",
                         "foundry_work_unavailable_reason", "foundry_status", "foundry_work_attempts",
@@ -24843,11 +24870,136 @@ class ComposerRunner:
             evidence["scientific_observed_result"] = deepcopy(
                 origin.get("scientific_observed_result", origin.get("observed_result")))
         complete_evidence = {name: evidence.pop(name, {}) for name in (
-            "foundry_execution_evidence", "admitted_model_definition")}
+            "foundry_execution_evidence", "admitted_model_definition", "executed_study_evidence", "source_files")}
         projected = self._capability_repair_projection(
             evidence, max_depth=7, max_keys=40, max_items=12, max_text=20_000)
         projected.update(complete_evidence)
         return projected
+
+    def _executed_dossier_evidence(self, stage_id, attempt_number, observed):
+        """Recover an exact failed execution's evidence from its sealed child receipts."""
+        from scisaurus.runtime.review_evidence import (
+            captured_execution_evidence, review_execution_evidence, review_observation_table)
+        from scisaurus.runtime.capability_registry import experiment_validation_payload
+        from scisaurus.runtime.experiment import normalize_program_output
+        unavailable = {"available": False, "admissible_as_verified_claims": False}
+        if not isinstance(observed, dict) or not observed.get("execution_refs"):
+            return unavailable | {"reason": "No completed execution is bound to this dossier."}
+        try:
+            stage = next(item for item in self.workflow["stages"] if item.get("id") == stage_id)
+            stage_root = self._experiment_stage_root(stage)
+            run_path = Path(observed["output_path"]).resolve(strict=True)
+            attempt_root = run_path.parent.parent
+            namespace = attempt_root.relative_to(stage_root).parts
+            if namespace[:1] == ("continuations",):
+                if len(namespace) != 4 or re.fullmatch(r"cycle-[1-9][0-9]*", namespace[1]) is None:
+                    raise ValidationError("Executed dossier has a foreign continuation namespace")
+                namespace = namespace[2:]
+            if (run_path.relative_to(attempt_root).as_posix() != "output/run.json"
+                    or namespace != ("attempts", f"attempt-{attempt_number}")):
+                raise ValidationError("Executed dossier has a foreign attempt namespace")
+
+            def read_file(path, digest):
+                path = Path(path).resolve(strict=True)
+                path.relative_to(attempt_root)
+                if (not re.fullmatch(r"[0-9a-f]{64}", digest or "")
+                        or path.stat().st_size > MAX_EXPERIMENT_RESULT_PACKAGE_BYTES):
+                    raise ValidationError("Executed dossier file has an invalid digest or size")
+                body = path.read_bytes()
+                if hashlib.sha256(body).hexdigest() != digest:
+                    raise ValidationError("Executed dossier file differs from its immutable digest")
+                value = json.loads(body)
+                if not isinstance(value, dict):
+                    raise ValidationError("Executed dossier file must contain an object")
+                return value
+
+            run = read_file(run_path, observed.get("output_path_sha256"))
+            refs = observed["execution_refs"]
+            if (not isinstance(refs, list) or not refs or len(set(refs)) != len(refs)
+                    or not all(isinstance(ref, str) for ref in refs)
+                    or run.get("execution_refs") != refs
+                    or run.get("study_id") != observed.get("study_id")
+                    or run.get("research_question") != observed.get("research_question")):
+                raise ValidationError("Executed dossier changes its study or execution references")
+            candidate_sha = run["raw_results_sha256"]
+            if candidate_sha != observed.get("raw_results_sha256"):
+                raise ValidationError("Executed dossier changes its candidate digest")
+            candidate = read_file(run["raw_results"], candidate_sha)
+            if (not isinstance(candidate, dict) or candidate.get("study_id") != run["study_id"]
+                    or hashlib.sha256(canonical_bytes(candidate)).hexdigest() != candidate_sha):
+                raise ValidationError("Executed dossier candidate identity is invalid")
+            with closing(sqlite3.connect(
+                    f"{(attempt_root / 'state/control.sqlite').as_uri()}?mode=ro", uri=True)) as connection:
+                def receipt(ref):
+                    row = connection.execute(
+                        "SELECT body_hash FROM artifacts WHERE artifact_ref=?", (ref,)).fetchone()
+                    if row is None:
+                        raise ValidationError("Executed dossier receipt is outside its child ledger")
+                    return read_file(attempt_root / "objects/sha256" / row[0], row[0])
+                records = [(ref, receipt(ref)) for ref in refs]
+                expected = records[0][1]["input"]
+                if not isinstance(expected, dict) or not isinstance(expected.get("experiment"), dict):
+                    raise ValidationError("Executed dossier frozen experiment must be an object")
+                intent = expected["experiment"]
+                if (intent.get("id") != run["study_id"]
+                        or intent.get("research_question") != run["research_question"]
+                        or candidate.get("revision") != intent.get("revision")):
+                    raise ValidationError("Executed dossier differs from its frozen experiment")
+                execution = review_execution_evidence(
+                    records, expected, candidate, normalize_output=normalize_program_output)
+                verdict_ref = run.get("deterministic_validation_ref")
+                if verdict_ref != observed.get("deterministic_validation_ref"):
+                    raise ValidationError("Executed dossier changes its deterministic validation reference")
+                validated, validator = None, None
+                if verdict_ref is not None:
+                    verdict = receipt(verdict_ref)
+                    validator_ref = verdict["execution_ref"]
+                    validator = receipt(validator_ref)
+                    validation_input = experiment_validation_payload(
+                        intent, expected["configured_input"], candidate, candidate_sha)
+                    validated = captured_execution_evidence(validator_ref, validator, validation_input)
+                    if (verdict.get("candidate_sha256") != candidate_sha
+                            or {key: value for key, value in verdict.items() if key != "execution_ref"}
+                            != validator["document"]):
+                        raise ValidationError("Executed dossier validator verdict differs from its receipt")
+
+            def main_source(ref, result, evidence):
+                command = result["metadata"]["command_identity"]["details"].get("command", [])
+                matches = [source for source in evidence["source_files"] if source["path"] in command]
+                if len(matches) != 1:
+                    raise ValidationError("Executed dossier cannot identify one captured command source")
+                source = matches[0]
+                return self._repair_source_evidence(
+                    source["source"], source_origin=ref, expected_sha256=source["sha256"])
+
+            sources = {"executor": main_source(refs[0], records[0][1], execution["executions"][0])}
+            if validated is not None:
+                sources["validator"] = main_source(validator_ref, validator, validated)
+            if any(record.get("available") is not True for record in sources.values()):
+                raise ValidationError("Executed dossier source exceeds the complete review evidence bound")
+            source_identity = lambda item: sorted((source["sha256"], source["source"])
+                                                 for source in item["source_files"])
+            if any(source_identity(item) != source_identity(execution["executions"][0])
+                   for item in execution["executions"]):
+                raise ValidationError("Executed dossier replay changed its captured sources")
+            result = {key: deepcopy(candidate[key]) for key in (
+                "schema_version", "study_id", "revision", "procedures", "metrics",
+                "findings", "limitations", "analysis", "assets") if key in candidate}
+            result["observations"] = review_observation_table(candidate["observations"])
+            return {"available": True, "admissible_as_verified_claims": False,
+                    "candidate_sha256": candidate_sha, "experiment_intent": deepcopy(intent),
+                    "configured_input_sha256": execution["configured_input_sha256"],
+                    "source_files": sources, "program_output": result,
+                    "executions": [{key: value for key, value in item.items() if key != "source_files"}
+                                   for item in execution["executions"]],
+                    "validator_execution": ({key: value for key, value in validated.items() if key != "source_files"}
+                                            if validated is not None else None),
+                    "validator_verdict": (deepcopy(validator["document"]) if validator is not None else
+                                          {"available": False, "reason": "No validator execution is recorded for this candidate."}),
+                    "evidence_scope": "Captured executed sources and complete result; a scalar recalculation is not an independent physical-field solve."}
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError, StopIteration,
+                sqlite3.Error, ValidationError) as exc:
+            return unavailable | {"reason": str(exc)}
 
     def _experiment_ancestor_stage_id(self, stage):
         """Find the experiment scope that can produce evidence for a later repair."""
