@@ -87,6 +87,69 @@ class BatchTests(unittest.TestCase):
         self.assertTrue(receipt["process_reaped"])
         self.assertEqual(receipt["status"], "completed")
 
+    def exchange_backend(self, *, omit_second_output=False):
+        script = FAKE.replace("for line in sys.stdin:", "turn=0\nfor line in sys.stdin:")
+        script = script.replace("session=request['params']['sessionId']", "turn+=1\n  session=request['params']['sessionId']")
+        script = script.replace("'message-1'", "'message-'+str(turn)")
+        script = script.replace("'turn':1", "'turn':turn")
+        script = script.replace("event('turn/end',{'reason'", "event('turn/end',{'turn':turn,'reason'")
+        script = script.replace("Path('answer.txt').write_text('real file output')",
+            "\n   if turn==1 or not " + repr(omit_second_output) + ":\n    Path('answer.txt').write_text('turn '+str(turn))\n"
+            "   if turn==2:\n"
+            "    event('turn/end',{'turn':1,'reason':{'kind':'max-tokens'}})\n"
+            "   emit({'method':'session.event','params':{'sessionId':'foreign','event':{'type':'assistant/message','data':{'turn':turn,'step':1,'usage':{'inputTokens':900,'outputTokens':900}}}}})")
+        self.script.write_text(script)
+        return self.config()
+
+    def test_controller_exchange_keeps_session_and_archives_immutable_turns(self):
+        seen = []
+        def exchange(files, usage):
+            seen.append((files, usage))
+            if len(seen) == 1:
+                return {"task": "Continue using the controller receipt", "inputs": {"receipt.json": '{"observed":true}'}}
+        result = DshBatchRunner(self.exchange_backend(), root=self.root / "jobs").run(
+            "Write answer.txt", inputs={"spec.json": "original"}, outputs=["answer.txt"], exchange=exchange)
+        job = Path(result["receipt"]).parent
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertEqual(result["usage"], {"model_calls": 2, "input_tokens": 42, "output_tokens": 16})
+        self.assertEqual([row[0]["answer.txt"] for row in seen], [b"turn 1", b"turn 2"])
+        self.assertEqual([row["usage"]["model_calls"] for row in receipt["turns"]], [1, 2])
+        self.assertEqual((job / "turns/0/answer.txt").read_bytes(), b"turn 1")
+        self.assertEqual((job / "turns/1/answer.txt").read_bytes(), b"turn 2")
+        self.assertEqual((job / "input/spec.json").read_text(), "original")
+        self.assertEqual((job / "input/turn-1/receipt.json").read_text(), '{"observed":true}')
+        self.assertEqual(receipt["schema_version"], "dsh-controller-session-receipt-1")
+        self.assertTrue(receipt["process_reaped"])
+        prompts = [json.loads(line) for line in (job / "events.jsonl").read_text().splitlines()
+                   if '"messageId"' in line]
+        self.assertEqual(len(prompts), 2)
+        self.assertNotEqual(receipt["turns"][0]["message_id"], receipt["turns"][1]["message_id"])
+
+    def test_controller_exchange_cannot_accept_prior_turn_output(self):
+        config = self.exchange_backend(omit_second_output=True)
+        with self.assertRaises(DshBatchError) as raised:
+            DshBatchRunner(config, root=self.root / "jobs").run(
+                "Write answer.txt", inputs={"spec.json": "original"}, outputs=["answer.txt"],
+                exchange=lambda files, usage: {"task": "Continue", "inputs": {"feedback.txt": "next"}})
+        receipt = json.loads(Path(raised.exception.receipt).read_text())
+        self.assertIn("contained regular file", receipt["error"])
+        self.assertEqual(len(receipt["turns"]), 1)
+        self.assertEqual(receipt["usage"]["model_calls"], 2)
+        self.assertTrue(receipt["process_reaped"])
+
+    def test_controller_exchange_failure_preserves_paid_turn(self):
+        for continuation in ({"task": "next", "inputs": {"../escape": "bad"}}, "invalid"):
+            with self.subTest(continuation=continuation), self.assertRaises(DshBatchError) as raised:
+                DshBatchRunner(self.exchange_backend(), root=self.root / "jobs").run(
+                    "Write answer.txt", inputs={"spec.json": "original"}, outputs=["answer.txt"],
+                    exchange=lambda files, usage: continuation)
+            receipt = json.loads(Path(raised.exception.receipt).read_text())
+            self.assertEqual(receipt["usage"]["model_calls"], 1)
+            self.assertEqual(len(receipt["turns"]), 1)
+            self.assertTrue(receipt["process_reaped"])
+            self.assertEqual(receipt["status"], "failed")
+            self.assertTrue(receipt["outcome_known"])
+
     def test_missing_and_exhausted_outputs_never_succeed(self):
         for mode in ("missing", "length", "escape"):
             with self.subTest(mode=mode), self.assertRaises(DshBatchError) as raised:

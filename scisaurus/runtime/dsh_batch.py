@@ -140,7 +140,7 @@ class DshBatchRunner:
         self.root = Path(root).resolve()
         self.runtime_read_roots = [str(Path(p).resolve()) for p in runtime_read_roots]
 
-    def run(self, task, *, inputs, seed_files=None, outputs, deadline=None):
+    def run(self, task, *, inputs, seed_files=None, outputs, deadline=None, exchange=None):
         deadline = min(deadline if deadline is not None else math.inf,
                        time.monotonic() + self.config["timeout_seconds"])
         # One DSH session has sequential model steps. Keep its slot until the
@@ -148,7 +148,7 @@ class DshBatchRunner:
         try:
             with model_dispatch_slot(deadline=deadline) as slot:
                 return self._run(task, inputs=inputs, seed_files=seed_files,
-                                 outputs=outputs, deadline=deadline, dispatch_slot=slot)
+                                 outputs=outputs, deadline=deadline, dispatch_slot=slot, exchange=exchange)
         except DshBatchError:
             raise
         except (ValidationError, TimeoutError, OSError) as exc:
@@ -169,7 +169,7 @@ class DshBatchRunner:
                 raise
             raise DshBatchError(str(exc), receipt=receipt, usage=usage) from exc
 
-    def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot):
+    def _run(self, task, *, inputs, seed_files, outputs, deadline, dispatch_slot, exchange=None):
         ensure_run_allowed()
         config = validate_batch_config(self.config)
         verify_batch_runtime(config)
@@ -214,6 +214,11 @@ class DshBatchRunner:
                  "task_sha256": hashlib.sha256(task.encode()).hexdigest(), "outputs": {},
                  "seed_sha256": {name: sha256(work / name) for name in seed_files or {}},
                  "usage": {"model_calls": 0, "input_tokens": 0, "output_tokens": 0}}
+        if exchange is not None:
+            if not callable(exchange):
+                raise ValidationError("batch exchange must be callable")
+            state.update(schema_version="dsh-controller-session-receipt-1", turns=[])
+        frozen_boundaries = [(frozen, bound)]
         def save():
             tmp = receipt.with_suffix(".tmp")
             tmp.write_bytes(canonical_bytes(state))
@@ -253,6 +258,9 @@ class DshBatchRunner:
         received = False
         message_id = None
         pending_events = []
+        prompt_id = 2
+        current_task, current_input = task, frozen
+        completed_turns = set()
         selector = None
         buffers = {"stdout": bytearray()}
         calls_seen = set()
@@ -268,6 +276,8 @@ class DshBatchRunner:
             if payload.get("method") != "session.event":
                 return
             params = payload.get("params", {})
+            if params.get("sessionId") != state["session_id"]:
+                return
             event = params.get("event", {})
             data = event.get("data", {})
             identity = (params.get("sessionId"), data.get("turn"), data.get("step"))
@@ -302,9 +312,22 @@ class DshBatchRunner:
             if event.get("type") == "agent/inbox/spliced":
                 inserted = event.get("data", {}).get("inserted", [])
                 received |= any(item.get("id") == message_id for item in inserted if isinstance(item, dict))
-            if received and event.get("type") == "turn/end":
+            if (received and event.get("type") == "turn/end"
+                    and event.get("data", {}).get("turn") not in completed_turns):
                 finish = event.get("data", {}).get("reason", {}).get("kind")
-            return received and payload.get("method") == "session.status" and params.get("status") == "idle"
+            return (received and finish is not None and payload.get("method") == "session.status"
+                    and params.get("status") == "idle")
+        def read_outputs():
+            for directory, hashes in frozen_boundaries:
+                if {name: sha256(directory / name) for name in hashes} != hashes:
+                    raise RuntimeError("DSH job changed frozen task files")
+            files = {}
+            for name in outputs:
+                path = work / name
+                if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(work):
+                    raise RuntimeError(f"DSH job did not produce a contained regular file: {name}")
+                files[name] = path.read_bytes()
+            return files
         try:
             state.update(status="running", pid=process.pid)
             save()
@@ -345,8 +368,11 @@ class DshBatchRunner:
                                 send(2, "session/prompt", {"sessionId": state["session_id"],
                                     "contentBlocks": [{"type": "text", "text":
                                         f"Immutable task files: {frozen}\nWritable workspace: {work}\n" + task}]})
-                            elif payload.get("id") == 2:
+                            elif payload.get("id") == prompt_id:
                                 message_id = payload["result"]["messageId"]
+                                if exchange is not None and (not isinstance(message_id, str) or not message_id
+                                        or any(row["message_id"] == message_id for row in state["turns"])):
+                                    raise RuntimeError("DSH continuation has no fresh message owner")
                                 for item in pending_events:
                                     done |= owned_event(item)
                                 pending_events.clear()
@@ -357,23 +383,74 @@ class DshBatchRunner:
                                 else:
                                     done |= owned_event(payload)
                             save()
+                    if done and exchange is not None:
+                        if finish != "completed":
+                            raise RuntimeError(f"DSH job ended with {finish!r}; files are not accepted")
+                        files = read_outputs()
+                        turn = len(state["turns"])
+                        archive = job / "turns" / str(turn)
+                        archive.mkdir(parents=True)
+                        write_files(archive, files)
+                        for path in archive.rglob("*"):
+                            if path.is_file():
+                                path.chmod(0o444)
+                        hashes = {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}
+                        state["turns"].append({"message_id": message_id,
+                            "input_directory": str(current_input.relative_to(job)),
+                            "input_sha256": frozen_boundaries[-1][1],
+                            "task_sha256": hashlib.sha256(current_task.encode()).hexdigest(),
+                            "outputs": hashes, "usage": dict(state["usage"]), "finish_reason": finish})
+                        state.update(status="exchanging", outputs=hashes, outcome_known=True)
+                        save()
+                        continuation = exchange(files, dict(state["usage"]))
+                        if continuation is None:
+                            break
+                        if (not isinstance(continuation, dict) or set(continuation) != {"task", "inputs"}
+                                or not isinstance(continuation["task"], str) or not continuation["task"].strip()
+                                or not isinstance(continuation["inputs"], dict) or not continuation["inputs"]):
+                            raise ValidationError("batch exchange requires a task and immutable input files")
+                        for name in continuation["inputs"]:
+                            if (not isinstance(name, str) or not Path(name).parts
+                                    or Path(name).is_absolute() or ".." in Path(name).parts):
+                                raise ValidationError("batch exchange input names must be relative and contained")
+                        current_input = frozen / ("turn-" + str(turn + 1))
+                        current_input.mkdir()
+                        write_files(current_input, continuation["inputs"])
+                        for path in current_input.rglob("*"):
+                            if path.is_file():
+                                path.chmod(0o444)
+                        frozen_boundaries.append((current_input, {
+                            name: sha256(current_input / name) for name in continuation["inputs"]}))
+                        for name in outputs:
+                            (work / name).unlink()
+                        completed_turns.update(identity[1] for identity in calls_seen
+                                               if identity[0] == state["session_id"])
+                        current_task = continuation["task"]
+                        message_id, received, finish, done = None, False, None, False
+                        pending_events.clear()
+                        prompt_id += 1
+                        state.update(status="running", outputs={}, outcome_known=False)
+                        save()
+                        send(prompt_id, "session/prompt", {"sessionId": state["session_id"],
+                            "contentBlocks": [{"type": "text", "text":
+                                f"Immutable task files: {current_input}\nWritable workspace: {work}\n" + current_task}]})
             ensure_run_allowed()
             if finish != "completed":
                 raise RuntimeError(f"DSH job ended with {finish!r}; files are not accepted")
-            if {name: sha256(frozen / name) for name in inputs} != bound:
-                raise RuntimeError("DSH job changed frozen task files")
-            files = {}
+            files = read_outputs()
+            if exchange is not None and {name: hashlib.sha256(data).hexdigest()
+                    for name, data in files.items()} != state["turns"][-1]["outputs"]:
+                raise RuntimeError("DSH final output changed after its completed turn")
             for name in outputs:
-                path = work / name
-                if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(work):
-                    raise RuntimeError(f"DSH job did not produce a contained regular file: {name}")
-                files[name] = path.read_bytes()
                 state["outputs"][name] = hashlib.sha256(files[name]).hexdigest()
             state.update(status="completed", finish_reason=finish)
+            if exchange is not None:
+                state["outcome_known"] = True
             return {"files": files, "receipt": str(receipt), "usage": dict(state["usage"]),
                     "elapsed_seconds": time.monotonic() - start}
         except BaseException as exc:
-            state.update(status="result_unknown", error=f"{type(exc).__name__}: {exc}", finish_reason=finish)
+            state.update(status="failed" if exchange is not None and state.get("outcome_known") is True
+                         else "result_unknown", error=f"{type(exc).__name__}: {exc}", finish_reason=finish)
             raise DshBatchError(str(exc), receipt=receipt, usage=state["usage"]) from exc
         finally:
             # Persist the paid outcome before disposal; disposal failure must
@@ -564,6 +641,9 @@ class DshStructuredProducerClient:
             "scientific validation. The controller validates and admits the deliverable separately. "
             "Your final chat answer is not the deliverable; response.json is.")
 
+    def exchange_for(self, assignment, system):
+        return None
+
     def complete(self, *, system, prompt):
         try:
             assignment = json.loads(prompt)
@@ -579,12 +659,14 @@ class DshStructuredProducerClient:
         for key in ("author_backend",):
             projected.pop(key, None)
         projected["runtime_python"] = self.runtime_python
+        exchange = self.exchange_for(projected, system)
+        options = {"exchange": exchange} if exchange is not None else {}
         result = self.runner.run(
             self.task(projected),
             inputs={"assignment.json": canonical_bytes(projected),
                     "system-contract.txt": (system or "").encode("utf-8")},
             outputs=["response.json"],
-            deadline=time.monotonic() + self.timeout_seconds)
+            deadline=time.monotonic() + self.timeout_seconds, **options)
         try:
             response = json_object(result["files"]["response.json"].decode("utf-8"),
                                    "DSH " + self.deliverable_label + " response")
@@ -607,6 +689,28 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
 
     deliverable_label = "software producer"
 
+    def __init__(self, config, *, root, runtime_python, tool_exchange=None):
+        super().__init__(config, root=root, runtime_python=runtime_python)
+        self.tool_exchange = tool_exchange
+
+    def exchange_for(self, assignment, system):
+        if self.tool_exchange is None:
+            return None
+        def exchange(files, usage):
+            try:
+                response = json_object(files["response.json"].decode("utf-8"), "DSH software producer response")
+            except (ValidationError, ValueError, UnicodeError):
+                return None
+            if set(response) != {"tool_action"}:
+                return None
+            updated = self.tool_exchange(response, assignment, usage)
+            assignment.clear()
+            assignment.update(updated)
+            return {"task": self.task(assignment), "inputs": {
+                "assignment.json": canonical_bytes(assignment),
+                "system-contract.txt": (system or "").encode("utf-8")}}
+        return exchange
+
     def task(self, assignment):
         task = (
             "Read assignment.json and system-contract.txt. You are the scientific software "
@@ -614,7 +718,13 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
             "scientific operations by editing files and running them inside this workspace; "
             "those local runs are diagnostic development evidence and are NEVER controller "
             "receipts. The controller alone executes every declared operation and returns its "
-            "receipt-bound result on the next turn. Export response.json as exactly one strict "
+            "receipt-bound result in a new immutable assignment on the next turn of this same "
+            "session. Retain workspace scripts and session history between controller operations. "
+            "Read the latest immutable assignment path supplied in each prompt. If the next dependency "
+            "is a controller observation, export its tool_action immediately and finish the turn. "
+            "Do not develop local substitutes for runtime metadata, repository inspection or other "
+            "missing controller receipts. Develop scripts when a declared execution operation needs "
+            "them, and reuse the supplied receipts and existing workspace. Export response.json as exactly one strict "
             "JSON object with no prose, markdown, fence, or trailing characters: either "
             "{\"tool_action\": {\"operation\": <name>, \"arguments\": <object>}} to request one "
             "controller operation, or the complete final producer response required by the "

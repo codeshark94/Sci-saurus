@@ -65,6 +65,8 @@ critical physical inputs before executing the affected calculation.
 Before observations exist, implementation repairs return directly to DSH without
 a separate design-review panel or its call reservation. Independent executable
 admission, recalculation and review of observed scientific results remain required.
+Software tool requests share one DSH session and workspace across controller
+responses, retaining scripts, exact tool receipts and paid usage between turns.
 
 The general research and manuscript stage graph remains available for missions
 that require it. It is not a compulsory publication sequence for every design

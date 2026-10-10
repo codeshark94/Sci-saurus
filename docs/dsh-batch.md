@@ -47,6 +47,21 @@ its receipt; it does not fill missing scientific values or rewrite agent results
 A definition repair preserves topic identity and existing literature. A completed
 response-format repair closes separately from any remaining scientific hold.
 
+Scientific software controller operations continue within the same DSH session,
+workspace and dispatch slot. Each completed turn exports either a tool request or
+the final structured selection. The controller executes the declared operation,
+then provides a new read-only assignment containing its bound receipts. Workspace
+scripts and session history survive the exchange; independent work orders and
+validator sessions remain isolated.
+
+Controller sessions use `dsh-controller-session-receipt-1`. Their receipts retain
+each message owner, immutable assignment and task hashes, archived output bytes
+and cumulative paid usage. Previous response files are removed before the next
+turn. Single-turn jobs keep `dsh-batch-receipt-1`. A settled malformed response
+remains a known transport result; an interrupted subsequent turn remains unknown.
+Tool ownership, duplicate-action checks and final selection admission use the
+same controller contracts as ordinary model producers.
+
 ## Foundry integration
 
 Set `author_backend` in `capability-foundry-config-1` configuration to the generated JSON

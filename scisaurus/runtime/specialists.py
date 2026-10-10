@@ -2793,9 +2793,51 @@ class SpecialistDispatcher:
             raise ValidationError("DSH cannot enforce an explicit per-model-call allowance without a provider relay")
         producer_client = DshSoftwareProducerClient if software_tools is not None else DshStructuredProducerClient
         backend_mode = "dsh_software_producer" if software_tools is not None else "dsh_structured_producer"
+        def consume_software_action(parsed, envelope):
+            action = parsed["tool_action"]
+            receipt = software_tools.execute(action)
+            if any(row.get("action") == action and row.get("result") == receipt.get("result")
+                   for row in software_results):
+                raise ValidationError("scientific software action repeated without new input or evidence")
+            software_results.append(receipt)
+            from scisaurus.runtime.software_workbench import project_receipt, selection_reference_contract
+            envelope = deepcopy(envelope)
+            envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
+            if response_contract == "software_selection":
+                envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
+            request = envelope.get("repair_evidence_request")
+            if isinstance(request, dict):
+                request["source_ref_catalog"] = list(dict.fromkeys([
+                    *request.get("source_ref_catalog", []),
+                    *[row["receipt_ref"] for row in software_results if row.get("receipt_ref")]]))
+            emit({"event": "software_tool_completed", "operation": action.get("operation"),
+                  "receipt_ref": receipt.get("receipt_ref"), "status": receipt["outcome"],
+                  "role": assigned_role, "role_id": assignment.get("role_id")})
+            return envelope, receipt
+        def exchange_software_action(parsed, envelope, usage):
+            nonlocal prompt, validation_retries, schema_repair_used, continue_previous_output, previous_text
+            if enforce_costs and output_budget_used + usage.get("output_tokens", 0) >= output_budget:
+                raise ValidationError("specialist response exhausted its cumulative output-token budget")
+            updated, receipt = consume_software_action(parsed, json.loads(prompt))
+            updated.pop("author_backend", None)
+            updated["runtime_python"] = envelope["runtime_python"]
+            updated_prompt = json.dumps(updated, ensure_ascii=False, sort_keys=True)
+            if estimate_input_tokens(system, updated_prompt) > max_input_tokens:
+                raise ValidationError("DSH controller continuation exceeds its assignment input-token limit")
+            prompt = updated_prompt
+            request_input.setdefault("controller_exchanges", []).append({
+                "tool_response": deepcopy(parsed), "tool_result": deepcopy(receipt),
+                "cumulative_backend_usage": deepcopy(usage)})
+            validation_retries = 0
+            schema_repair_used = False
+            repaired_software_contract_errors.clear()
+            continue_previous_output = False
+            previous_text = None
+            return updated
+        producer_options = {"tool_exchange": exchange_software_action} if software_tools is not None else {}
         engineering_client = (producer_client(
             self.software_author_backend, root=str(self.software_workspace) + "/dsh-producer",
-            runtime_python=self.software_author_runtime_python) if dsh_producer else None)
+            runtime_python=self.software_author_runtime_python, **producer_options) if dsh_producer else None)
         max_input_tokens = self.input_limit_for_role(
             model_role, quota.get("max_input_tokens"))
         quota["max_input_tokens"] = max_input_tokens
@@ -3030,35 +3072,15 @@ class SpecialistDispatcher:
                         f"specialist response did not finish normally: {result.finish_reason}")
                 parsed = result.json_object()
                 if software_tools is not None and set(parsed) == {"tool_action"}:
-                    action = parsed["tool_action"]
-                    receipt = software_tools.execute(action)
-                    if any(row.get("action") == action and row.get("result") == receipt.get("result")
-                           for row in software_results):
-                        raise ValidationError("scientific software action repeated without new input or evidence")
-                    software_results.append(receipt)
+                    envelope, receipt = consume_software_action(parsed, json.loads(prompt))
                     request_input["tool_response"] = deepcopy(parsed)
                     request_input["tool_result"] = deepcopy(receipt)
-                    envelope = json.loads(prompt)
-                    from scisaurus.runtime.software_workbench import project_receipt
-                    envelope["software_tool_results"] = [project_receipt(row) for row in software_results]
-                    if response_contract == "software_selection":
-                        from scisaurus.runtime.software_workbench import selection_reference_contract
-                        envelope["scientific_source_reference_contract"] = selection_reference_contract(software_tools, software_results)
-                    request = envelope.get("repair_evidence_request")
-                    if isinstance(request, dict):
-                        request["source_ref_catalog"] = list(dict.fromkeys([
-                            *request.get("source_ref_catalog", []),
-                            *[row["receipt_ref"] for row in software_results if row.get("receipt_ref")],
-                        ]))
                     prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True)
                     validation_retries = 0
                     schema_repair_used = False
                     repaired_software_contract_errors.clear()
                     continue_previous_output = False
                     previous_text = None
-                    emit({"event": "software_tool_completed", "operation": action.get("operation"),
-                          "receipt_ref": receipt.get("receipt_ref"), "status": receipt["outcome"],
-                          "role": assigned_role, "role_id": assignment.get("role_id")})
                     continue
                 if response_contract == "repair_adjudication" and not verifier:
                     original_assignment = json.loads(prompt)
@@ -3120,7 +3142,7 @@ class SpecialistDispatcher:
                     receipt = json.loads(Path(exc.receipt).read_text())
                 except (OSError, ValueError, TypeError):
                     receipt = {}
-                known = receipt.get("status") == "completed"
+                known = receipt.get("status") == "completed" or receipt.get("outcome_known") is True
                 if request_input is not None:
                     request_input.update(backend_receipt=exc.receipt, outcome_known=known,
                                          backend_usage=deepcopy(exc.usage))
