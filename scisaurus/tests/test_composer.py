@@ -12649,6 +12649,65 @@ class ComposerWorkflowTests(unittest.TestCase):
                 (project/"output/run.json").write_text(json.dumps({**checkpoint, "topic_id": "other"}))
                 self.assertIsNone(runner._latest_resumable_survey_project(stage))
 
+            store = ArtifactStore(control := ControlStore(project))
+            store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                body=canonical_bytes({"survey": {"proposed_gap": {"id": "topic-active-literature-hypothesis"},
+                                                "question": "Exact question"}}), media_type="application/json")
+            control.close()
+            (project/"output/run.json").write_text(json.dumps({"status": "blocked", "coverage": {"map_entry_count": 13}}))
+            self.assertEqual(runner._latest_resumable_survey_project(stage), project)
+            runner.context["topic"]["topic"]["research_question"] = "Different question"
+            self.assertIsNone(runner._latest_resumable_survey_project(stage))
+            runner.context["topic"]["topic"]["research_question"] = "Exact question"
+            runner.stage_records[stage["id"]]["attempts"][0]["topic_id"] = "foreign"
+            self.assertIsNone(runner._latest_resumable_survey_project(stage))
+
+    def test_pending_survey_checkpoint_precedes_archived_attempt_without_run_output(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path).resolve()
+            runner = ComposerRunner(self._workflow(root)); self.addCleanup(runner.close)
+            stage = runner.workflow["stages"][0]
+            runner.workflow["stages"].append({**deepcopy(stage), "id": "topic", "kind": "topic_discovery"})
+            runner.context["topic"] = {"topic": {"id": "active", "research_question": "Exact question"}, "topic_cycle": 0}
+            current = root / "current"
+            prior = root / "prior"
+            for project in (prior, current):
+                control = ControlStore(project); store = ArtifactStore(control)
+                store.init_project(principal_note="Survey frontier")
+                store.publish_artifact(logical_id="inputs/run-config", artifact_type="note", author="principal",
+                    body=canonical_bytes({"survey": {"question": "Exact question",
+                        "proposed_gap": {"id": "topic-active-implementation-hypothesis"}}}), media_type="application/json")
+                if project == current:
+                    store.publish_artifact(logical_id="command/progress/current-1", artifact_type="progress_checkpoint",
+                        author="command.controller", media_type="application/json", body=canonical_bytes({
+                            "cumulative_usage": {"actual": {"model_calls": 2}}, "next_action": {"decision": "paused"}}))
+                control.close(); (project/"output").mkdir()
+                task_id = project.name
+                runner.tasks.create(task_id, "production", {}, "command.composer")
+                runner.tasks.transition(task_id, "queued", "command.composer")
+                runner.tasks.start_attempt(task_id, task_id + "-attempt", owner="command.composer", lease_ttl_seconds=60,
+                    payload={"stage_id": stage["id"], "project_dir": str(project)})
+            (prior/"output/run.json").write_text(json.dumps({"status": "blocked"}))
+            snapshot = {"project_dir": str(current), "run_id": "current", "checkpoint": 1, "phase": "paused",
+                        "cumulative_usage": {"model_calls": 2}}
+            progress = current/"output/progress.json"
+            progress.write_text(json.dumps(snapshot))
+            runner.stage_records[stage["id"]] = {"status": "running", "project_dir": str(current),
+                "attempt_id": "current-attempt", "topic_id": "active", "topic_cycle": 0,
+                "attempts": [{"attempt_id": "prior-attempt", "project_dir": str(prior),
+                              "topic_id": "active", "topic_cycle": 0, "state": "failed"}]}
+            runner.context[stage["id"]] = {"project_dir": str(prior)}
+            for status in ("running", "paused", "retrying", "blocked"):
+                runner.stage_records[stage["id"]]["status"] = status
+                self.assertEqual(runner._latest_resumable_survey_project(stage), current)
+            self.assertFalse((current/"output/run.json").exists())
+            progress.write_text(json.dumps({**snapshot, "cumulative_usage": {"model_calls": 0}}))
+            with self.assertRaisesRegex(StateError, "verified producer checkpoint"):
+                runner._latest_resumable_survey_project(stage)
+            progress.write_text(json.dumps(snapshot))
+            runner.stage_records[stage["id"]]["topic_id"] = "foreign"
+            self.assertEqual(runner._latest_resumable_survey_project(stage), prior)
+
     def test_budget_checkpoint_never_opens_a_scientific_continuation(self):
         with tempfile.TemporaryDirectory() as path:
             runner = ComposerRunner(self._workflow(Path(path))); self.addCleanup(runner.close)

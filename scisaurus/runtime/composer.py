@@ -6777,7 +6777,14 @@ class ComposerRunner:
                  attempt.get("topic_cycle"), attempt)
                 for attempt in reversed(attempts)
                 if isinstance(attempt, dict)]
-            pending_attempt = (record.get("status") in {"blocked", "running", "retrying"}
+            if (record.get("status") in {"running", "paused", "retrying", "blocked"}
+                    and isinstance(record.get("attempt_id"), str)
+                    and isinstance(record.get("project_dir"), str)
+                    and not any(item[3].get("attempt_id") == record["attempt_id"]
+                                for item in attempt_candidates)):
+                attempt_candidates.insert(0, (record["project_dir"], record.get("topic_id"),
+                                               record.get("topic_cycle"), record))
+            pending_attempt = (record.get("status") in {"blocked", "paused", "running", "retrying"}
                                and attempt_candidates
                                and attempt_candidates[0][3].get("state") not in {"succeeded", "completed"})
             if attempt_candidates and (pending_attempt
@@ -6841,11 +6848,14 @@ class ComposerRunner:
             if partial:
                 checkpoint = self._survey_partial_checkpoint(resolved)
             if checkpoint is None:
+                if (resolved == preferred_partial and owned_attempt is record
+                        and self._durable_stage_config(resolved) is not None):
+                    raise StateError("current survey attempt has no verified producer checkpoint")
                 continue
             if (isinstance(topic_identity, dict)
                     and not self._survey_checkpoint_matches_topic(checkpoint, topic_identity)):
                 bound_checkpoint = False
-                if (self._survey_checkpoint_topic_id(checkpoint) is None
+                if (self._survey_checkpoint_topic_id(checkpoint, include_nomination=False) is None
                         and (type(checkpoint.get("topic_cycle")) is not int
                              or checkpoint["topic_cycle"] == topic_identity["topic_cycle"])
                         and isinstance(owned_attempt, dict) and isinstance(owned_attempt.get("attempt_id"), str)
@@ -6907,10 +6917,20 @@ class ComposerRunner:
         """Retain captured sources and checked work before aggregate acceptance."""
         root = Path(project_dir)
         output = root / "output" / "run.json"
-        if not output.is_file():
-            return None
         try:
-            payload = json.loads(output.read_text())
+            if output.is_file():
+                payload = json.loads(output.read_text())
+            else:
+                snapshot = json.loads((root / "output" / "progress.json").read_text())
+                if (not isinstance(snapshot, dict)
+                        or not isinstance(snapshot.get("project_dir"), str)
+                        or Path(snapshot["project_dir"]).resolve() != root.resolve()):
+                    return None
+                proof = cls._producer_checkpoint_evidence(root, snapshot)
+                if proof is None:
+                    return None
+                payload = {"status": "paused" if snapshot["phase"] == "paused" else "running",
+                           "producer_checkpoint": proof}
         except (OSError, ValueError):
             return None
         if (not isinstance(payload, dict)
@@ -6924,7 +6944,7 @@ class ComposerRunner:
                 "question": config.get("survey", {}).get("question")}
 
     @staticmethod
-    def _survey_checkpoint_topic_id(checkpoint):
+    def _survey_checkpoint_topic_id(checkpoint, *, include_nomination=True):
         if not isinstance(checkpoint, dict):
             return None
         for key in ("topic_id", "selected_topic_id"):
@@ -6937,6 +6957,8 @@ class ComposerRunner:
                 value = lineage.get("topic_id") or lineage.get("id")
                 if isinstance(value, str) and value:
                     return value
+        if not include_nomination:
+            return None
         nomination = checkpoint.get("nomination")
         nomination_id = nomination.get("id") if isinstance(nomination, dict) else None
         if isinstance(nomination_id, str) and nomination_id.startswith("topic-"):
