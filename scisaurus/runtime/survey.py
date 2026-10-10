@@ -5522,7 +5522,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
     def _retry_retained_survey_admission(self):
         """Retry deterministic admission of an unchanged, paid, passing review."""
         scopes = set((self.resume_session or {}).get("reopened_scopes", []))
-        if "integrated_review" not in scopes or scopes - {"integrated_review", "assessment"}:
+        if not scopes.intersection({"integrated_review", "operations"}) or scopes - {"integrated_review", "operations", "assessment"}:
             return False
         bundle = self.store.head("kb/surveys/current")
         if bundle is None or self.map_record is None:

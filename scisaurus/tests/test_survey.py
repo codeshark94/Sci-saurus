@@ -641,7 +641,7 @@ class TestSurveyRunner(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "Admission interrupted"):
                 runner._accept_survey()
         calls = runner.model_calls_dispatched
-        runner.resume_session = {"reopened_scopes": ["integrated_review"]}
+        runner.resume_session = {"reopened_scopes": ["operations"]}
         runner._accept_survey()
         self.assertEqual(runner.model_calls_dispatched, calls)
         self.assertIsNotNone(runner.survey_ref)
