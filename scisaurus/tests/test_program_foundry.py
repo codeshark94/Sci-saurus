@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -65,6 +66,62 @@ def output_document():
 
 
 class SandboxTests(unittest.TestCase):
+    def test_spawn_manager_uses_private_short_temporary_namespace(self):
+        with tempfile.TemporaryDirectory() as path:
+            workspace = Path(path) / ('nested-' + 'x' * 110)
+            workspace.mkdir()
+            source = workspace / 'manager.py'
+            source.write_text(
+                "import json,multiprocessing as mp,os\n"
+                "if __name__ == '__main__':\n"
+                " mp.set_start_method('spawn')\n"
+                " with mp.Manager() as manager:\n"
+                "  values=manager.dict();values['probe']=7\n"
+                "  print(json.dumps({'value':values['probe'],'temporary':os.environ['TMPDIR'],'address':manager.address}))\n")
+            results = []
+            for _ in range(2):
+                result = run_sandboxed([sys.executable,str(source)],workspace=workspace,timeout_seconds=15)
+                self.assertEqual(result.returncode,0,result.stderr.decode())
+                observed = json.loads(result.stdout)
+                self.assertEqual(observed['value'],7)
+                self.assertLess(len(observed['address'].encode()),104)
+                self.assertTrue(Path(observed['address']).is_relative_to(observed['temporary']))
+                self.assertFalse(Path(observed['temporary']).exists())
+                results.append(observed)
+            self.assertNotEqual(results[0]['temporary'],results[1]['temporary'])
+
+    def test_local_ipc_cannot_connect_to_foreign_unix_socket_or_loopback(self):
+        with tempfile.TemporaryDirectory(prefix='ipc-',dir='/tmp') as path:
+            root = Path(path).resolve()
+            workspace = root / 'workspace'
+            workspace.mkdir()
+            socket_path = str(root / 'foreign.sock')
+            with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as unix, \
+                    socket.socket(socket.AF_INET,socket.SOCK_STREAM) as tcp:
+                unix.bind(socket_path);unix.listen()
+                tcp.bind(('127.0.0.1',0));tcp.listen()
+                source = workspace / 'boundaries.py'
+                source.write_text(
+                    "import socket\n"
+                    f"targets=[(socket.AF_UNIX,{socket_path!r}),(socket.AF_INET,{tcp.getsockname()!r})]\n"
+                    "for family,address in targets:\n"
+                    " with socket.socket(family,socket.SOCK_STREAM) as sock:\n"
+                    "  sock.settimeout(2)\n"
+                    "  try: sock.connect(address)\n"
+                    "  except PermissionError: print('DENIED')\n"
+                    "  else: raise RuntimeError('foreign connection permitted')\n")
+                result = run_sandboxed([sys.executable,str(source)],workspace=workspace,timeout_seconds=15)
+                self.assertEqual(result.returncode,0,result.stderr.decode())
+                self.assertEqual(result.stdout.decode().splitlines(),['DENIED','DENIED'])
+
+    def test_private_temporary_namespace_is_removed_after_timeout(self):
+        with tempfile.TemporaryDirectory() as path:
+            result = run_sandboxed([sys.executable,'-c',
+                "import os,time;print(os.environ['TMPDIR'],flush=True);time.sleep(30)"],
+                workspace=Path(path),timeout_seconds=.5)
+            self.assertTrue(result.timed_out)
+            self.assertFalse(Path(result.stdout.decode().strip()).exists())
+
     def test_profile_accepts_arbitrary_virtual_environment_names_without_broadening_root(self):
         with tempfile.TemporaryDirectory() as path:
             root = Path(path)

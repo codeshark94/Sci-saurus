@@ -4,7 +4,8 @@ The sandbox is the real security boundary for a generative capability.  It
 combines two independent controls:
 
 * a macOS ``sandbox-exec`` profile that denies everything by default and then
-  allows only process execution, reads, writes inside the throwaway workspace,
+  allows only process execution, reads, writes inside the throwaway workspace
+  and its private temporary namespace, local Unix sockets in that namespace,
   and (optionally) network access;
 * POSIX resource limits applied in the child (CPU seconds, address space, file
   size, open files) plus an absolute wall deadline enforced by the parent.
@@ -21,6 +22,7 @@ import selectors
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,9 +44,9 @@ RUNTIME_ENV_KEYS = frozenset({
     "SCI_SOLVER_COMMANDS", "ELMER_HOME", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 })
 
-# Per-run directories forced under the throwaway workspace after any caller or
-# declared-runtime environment has been applied.  A runtime cannot redirect a
-# cache or configuration write into the operator's home directory.
+# Cache/config roots are forced under the throwaway workspace. run_sandboxed
+# replaces TMPDIR with its own short, private temporary namespace; a declared
+# runtime cannot redirect either directory set into the operator's home.
 WORKSPACE_ENV_KEYS = ("HOME", "CFFIXED_USER_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
                       "XDG_DATA_HOME", "TMPDIR", "MPLCONFIGDIR")
 
@@ -215,10 +217,16 @@ def _sandbox_read_paths(command, workspace):
     return sorted(str(path) for path in roots if path.exists()), sorted(str(path) for path in files)
 
 
-def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=()):
+def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=(), temporary_workspace=None):
     """Return a deny-by-default Seatbelt profile for one throwaway workspace."""
     workspace = str(Path(workspace).resolve())
     read_roots, read_files = _sandbox_read_paths(command, workspace)
+    if temporary_workspace is not None:
+        temporary_workspace = Path(temporary_workspace)
+        if not temporary_workspace.is_absolute() or not temporary_workspace.is_dir():
+            raise ValidationError("sandbox temporary workspace must be an existing absolute directory")
+        temporary_workspace = str(temporary_workspace.resolve())
+        read_roots.append(temporary_workspace)
     for value in read_only_paths:
         path = Path(value)
         if not path.is_absolute() or not path.is_dir():
@@ -251,6 +259,11 @@ def sandbox_profile(workspace, command, *, allow_network=False, read_only_paths=
         '  (literal "/dev/stdout")',
         '  (literal "/dev/stderr"))',
     ]
+    if temporary_workspace is not None:
+        lines.extend([
+            f'(allow file-write* (subpath "{temporary_workspace}"))',
+            f'(allow network-bind network-inbound network-outbound (subpath "{temporary_workspace}"))',
+        ])
     if allow_network:
         lines.append("(allow network*)")
     return "\n".join(lines)
@@ -291,19 +304,26 @@ def run_sandboxed(command, *, workspace, input_bytes=b"", timeout_seconds=300.0,
         raise ValidationError("sandbox timeout must be positive")
     if type(max_bytes) is not int or max_bytes <= 0:
         raise ValidationError("sandbox output limit must be a positive integer")
-    process_env = sandbox_environment(workspace, env=env)
-    mode = "sandbox-exec"
-    if SANDBOX_EXEC:
-        command = [SANDBOX_EXEC, "-p", sandbox_profile(
-            workspace, command, allow_network=allow_network, read_only_paths=read_only_paths), *command]
-    else:
-        mode = "rlimits-only"
-    from scisaurus.runtime.run_control import start_process
-    process = start_process(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               cwd=str(workspace), env=process_env, shell=False, bufsize=0,
-                               preexec_fn=_limits(cpu_seconds, address_space_bytes, file_size_bytes))
-    return capture_process(process, input_bytes=input_bytes, timeout_seconds=timeout_seconds,
-                           max_bytes=max_bytes, mode=mode)
+    # AF_UNIX addresses have a small fixed byte limit. Controller-owned short
+    # temporary paths let spawned managers communicate even for deeply nested
+    # project workspaces, without allowing sockets in another run's namespace.
+    with tempfile.TemporaryDirectory(prefix="sci-run-", dir="/tmp") as temporary:
+        temporary_workspace = Path(temporary).resolve()
+        process_env = sandbox_environment(workspace, env=env)
+        process_env["TMPDIR"] = str(temporary_workspace)
+        mode = "sandbox-exec"
+        if SANDBOX_EXEC:
+            command = [SANDBOX_EXEC, "-p", sandbox_profile(
+                workspace, command, allow_network=allow_network, read_only_paths=read_only_paths,
+                temporary_workspace=temporary_workspace), *command]
+        else:
+            mode = "rlimits-only"
+        from scisaurus.runtime.run_control import start_process
+        process = start_process(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   cwd=str(workspace), env=process_env, shell=False, bufsize=0,
+                                   preexec_fn=_limits(cpu_seconds, address_space_bytes, file_size_bytes))
+        return capture_process(process, input_bytes=input_bytes, timeout_seconds=timeout_seconds,
+                               max_bytes=max_bytes, mode=mode)
 
 
 def capture_process(process, *, input_bytes, timeout_seconds, max_bytes, mode, check_permission=None):
