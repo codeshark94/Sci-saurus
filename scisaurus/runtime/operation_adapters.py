@@ -111,7 +111,7 @@ def _process_client(client, project_path, environment_files, label):
     if label == "MCP Fetch":
         allowed.update({"pdf_max_bytes", "result_max_bytes"})
     if label == "Local program":
-        allowed.add("sandbox_required")
+        allowed.update({"sandbox_required", "laboratory"})
     if set(client) - allowed:
         raise ValidationError(f"Unsupported {label} client options")
     cwd = Path(_text(client.get("cwd"), f"{label} cwd"))
@@ -908,6 +908,9 @@ def _inspect_program(profile, result, params, *, representative=True):
           and metadata.get("cwd") == client["cwd"] and metadata.get("command_identity") == identity
           and metadata.get("own_process_group") == client["own_process_group"]
           and metadata.get("sandbox_required") == client.get("sandbox_required", False)
+          and metadata.get("laboratory_execution_sha256") == (
+              sha256_hex(canonical_bytes(client["laboratory"]))
+              if client.get("laboratory") is not None else None)
           and (not client.get("sandbox_required")
                or (metadata.get("sandbox_mode") == "sandbox-exec"
                    and metadata.get("source_dispatch_mode") == "private_read_only_snapshot"
@@ -917,6 +920,15 @@ def _inspect_program(profile, result, params, *, representative=True):
                    and metadata.get("dispatched_command") == programs.source_snapshot_command(
                        client["command"], metadata["source_snapshot_path"]))),
           "A zero exit status is bound to the configured command, executable, environment and working directory; required-sandbox code is bound to its exact captured source bytes")
+    if client.get("laboratory") is not None:
+        from scisaurus.runtime.laboratory import LaboratoryBinding
+        try:
+            current = LaboratoryBinding.from_execution_binding(client["laboratory"]).execution_surface(client["cwd"])
+            matches = current["identities"] == metadata.get("laboratory_runtime_identities")
+        except ValidationError:
+            matches = False
+        check("laboratory-execution", matches,
+              "Executed laboratory runtimes still match the pinned provisioning identities")
     schema_identity = {"protocol_version": metadata.get("protocol_version")}
     check("program-protocol", schema_identity["protocol_version"] == programs.PROTOCOL_VERSION
           and metadata.get("adapter_version") == programs.ADAPTER_VERSION,

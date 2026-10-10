@@ -233,14 +233,15 @@ def _trial_config(experiment):
 
 
 def _program(identifier, runtime_python, source_path, repo_root, requirements, timeout,
-             max_bytes, *, configured_input=None, representative_input=None):
+             max_bytes, *, configured_input=None, representative_input=None, laboratory_execution=None):
     representative_input = ({"readiness_probe": True}
                             if representative_input is None else representative_input)
     return {
         "id": identifier, "adapter": "local_program",
         "client": {"command": [str(runtime_python), str(source_path)], "timeout": timeout,
                    "max_bytes": max_bytes, "cwd": str(repo_root), "env": {},
-                   "own_process_group": False, "sandbox_required": True},
+                   "own_process_group": False, "sandbox_required": True,
+                   **({"laboratory": deepcopy_json(laboratory_execution)} if laboratory_execution else {})},
         "representative": {"input": deepcopy_json(representative_input)},
         "environment_files": [str(requirements), str(source_path)],
         "input": deepcopy_json(configured_input) if configured_input is not None else {},
@@ -248,7 +249,7 @@ def _program(identifier, runtime_python, source_path, repo_root, requirements, t
 
 
 def _experiment(candidate, runtime_python, repo_root, requirements, source_root,
-                configured_input, literature_gate):
+                configured_input, literature_gate, laboratory_execution=None):
     intent = deepcopy_json(candidate["experiment_intent"])
     return {
         **intent,
@@ -256,12 +257,12 @@ def _experiment(candidate, runtime_python, repo_root, requirements, source_root,
         "execution": _program(
             "generated_executor", runtime_python, source_root / "executor.py", repo_root,
             requirements, 900, 60_000_000, configured_input=configured_input,
-            representative_input=candidate["test_vector"]["input"],
+            representative_input=candidate["test_vector"]["input"], laboratory_execution=laboratory_execution,
         ),
         "validation": _program(
             "generated_validator", runtime_python, source_root / "validator.py", repo_root,
             requirements, 300, 5_000_000, configured_input=configured_input,
-            representative_input={"readiness_probe": True},
+            representative_input={"readiness_probe": True}, laboratory_execution=laboratory_execution,
         ),
     }
 
@@ -300,7 +301,7 @@ def _verify_entry(root, entry):
     admission_path = revision_dir / "admission.json"
     candidate = _load_json(candidate_path, "candidate")
     admission = _load_json(admission_path, "admission")
-    validate_program_candidate(candidate)
+    validate_program_candidate(candidate, laboratory_execution=experiment["execution"]["client"].get("laboratory"))
     _validate_validator_authorship(admission, candidate["validator_source"])
     if (_digest(candidate) != entry["candidate_record_sha256"]
             or admission.get("schema_version") != ADMISSION_SCHEMA
@@ -325,6 +326,11 @@ def _verify_entry(root, entry):
         raise ValidationError("registered executor readiness input differs from its admitted test vector")
     if experiment["validation"]["representative"] != {"input": {"readiness_probe": True}}:
         raise ValidationError("registered validator readiness handshake is invalid")
+    for section in ("execution", "validation"):
+        binding = experiment[section]["client"].get("laboratory")
+        digest = _digest(binding) if binding is not None else None
+        if admission.get("laboratory_execution_sha256") != digest:
+            raise ValidationError("registered laboratory differs from its admitted execution environment")
     validate_experiment_config(_trial_config(deepcopy_json(experiment)), require_literature_gate=False)
     return descriptor
 
@@ -368,12 +374,12 @@ def _recover_transaction(root, index):
 
 
 def register_capability(root, candidate, admission, *, runtime_python, repo_root,
-                        literature_gate=None, requirements_file=None):
+                        literature_gate=None, requirements_file=None, laboratory_execution=None):
     """Pin an admitted candidate into the registry without partial visibility."""
     from scisaurus.runtime.program_gates import ADMISSION_SCHEMA
     from scisaurus.runtime.program_admission import validate_program_candidate
 
-    validate_program_candidate(candidate)
+    validate_program_candidate(candidate, laboratory_execution=laboratory_execution)
     if not isinstance(admission, dict) or admission.get("schema_version") != ADMISSION_SCHEMA:
         raise ValidationError("capability registration requires an admission record")
     _validate_validator_authorship(admission, candidate["validator_source"])
@@ -398,6 +404,12 @@ def register_capability(root, candidate, admission, *, runtime_python, repo_root
     if not requirements.is_file():
         raise ValidationError("capability requirements file must exist")
 
+    if laboratory_execution is not None:
+        from scisaurus.runtime.laboratory import LaboratoryBinding
+        LaboratoryBinding.from_execution_binding(laboratory_execution)
+        if admission.get("laboratory_execution_sha256") != _digest(laboratory_execution):
+            raise ValidationError("admission does not bind the registered laboratory execution environment")
+
     root = Path(root).resolve()
     capabilities_root = root / "capabilities"
     index_path = capabilities_root / "index.json"
@@ -421,12 +433,12 @@ def register_capability(root, candidate, admission, *, runtime_python, repo_root
             configured_input = _registered_configured_input(candidate)
             trial_experiment = _experiment(
                 candidate, runtime_python, repo_root, requirements, temporary_dir,
-                configured_input, literature_gate,
+                configured_input, literature_gate, laboratory_execution,
             )
             validate_experiment_config(_trial_config(trial_experiment), require_literature_gate=False)
             experiment = _experiment(
                 candidate, runtime_python, repo_root, requirements, final_dir,
-                configured_input, literature_gate,
+                configured_input, literature_gate, laboratory_execution,
             )
             descriptor = {
                 "schema_version": DESCRIPTOR_SCHEMA,

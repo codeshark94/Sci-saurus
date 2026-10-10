@@ -36,7 +36,8 @@ import time
 from scisaurus.core.errors import ValidationError
 from scisaurus.core.schema import canonical_bytes
 from scisaurus.runtime.program_sandbox import (
-    RUNTIME_ENV_KEYS, SandboxResult, run_sandboxed, sandbox_environment, sandbox_status,
+    RUNTIME_ENV_KEYS, WORKSPACE_ENV_KEYS, DEFAULT_ADDRESS_SPACE, DEFAULT_CPU_SECONDS, DEFAULT_FILE_SIZE,
+    SandboxResult, run_sandboxed, sandbox_environment, sandbox_status,
 )
 
 LABORATORY_SCHEMA_VERSION = "metamaterial-laboratory-1"
@@ -1174,6 +1175,52 @@ def verify_laboratory(laboratory, attestation, *, runner=None, root=None, deadli
             "verified_labels": [label for label in declared if label in attestation.get("verified_labels", [])]}
 
 
+def observe_host_resources(workspace, *, timeout_seconds=15.0):
+    """Observe host capacity without interpreting installed tools as readiness."""
+    import subprocess
+    resources = {"cpu":{"logical_count":os.cpu_count(),"physical_count":None,"load_average":list(os.getloadavg())},
+                 "memory":{"total_bytes":None,"reclaimable_available_bytes":None},"accelerators":[],"diagnostics":[]}
+    def probe(command):
+        try:
+            result=subprocess.run(command,capture_output=True,text=True,timeout=timeout_seconds,env={"PATH":"/usr/bin:/bin"})
+            if result.returncode:
+                resources["diagnostics"].append({"command":command,"returncode":result.returncode,"stderr":result.stderr})
+                return None
+            return result.stdout
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            resources["diagnostics"].append({"command":command,"error":str(exc)})
+            return None
+    if platform.system()=="Darwin":
+        for name,section,key in (("hw.memsize","memory","total_bytes"),("hw.physicalcpu","cpu","physical_count")):
+            value=probe(["/usr/sbin/sysctl","-n",name])
+            if value and value.strip().isdecimal(): resources[section][key]=int(value)
+        value=probe(["/usr/bin/vm_stat"])
+        if value:
+            page=re.search(r"page size of (\d+) bytes",value)
+            rows={name:int(count) for name,count in re.findall(r"(Pages [a-z ]+):\s+(\d+)\.",value)}
+            if page and all(name in rows for name in ("Pages free","Pages inactive","Pages speculative")):
+                resources["memory"].update(reclaimable_available_bytes=int(page[1])*sum(rows[name] for name in ("Pages free","Pages inactive","Pages speculative")),
+                    available_semantics="free plus inactive plus speculative pages; reclaimable estimate, not reserved memory")
+        value=probe(["/usr/sbin/system_profiler","SPDisplaysDataType","-json"])
+        if value:
+            try:
+                for row in json.loads(value).get("SPDisplaysDataType",[]):
+                    resources["accelerators"].append({"model":row.get("sppci_model",row.get("_name")),"cores":row.get("sppci_cores"),
+                        "memory":row.get("spdisplays_vram"),"metal_support":row.get("spdisplays_mtlgpufamilysupport",row.get("spdisplays_metal")),
+                        "scientific_runtime_readiness":"not_probed"})
+            except (ValueError,TypeError) as exc: resources["diagnostics"].append({"probe":"GPU inventory","error":str(exc)})
+    elif platform.system()=="Linux":
+        try:
+            rows={name:int(count)*1024 for name,count in re.findall(r"^(\w+):\s+(\d+) kB",Path("/proc/meminfo").read_text(),re.M)}
+            resources["memory"].update(total_bytes=rows.get("MemTotal"),reclaimable_available_bytes=rows.get("MemAvailable"),available_semantics="kernel MemAvailable estimate, not reserved memory")
+            resources["cpu"]["affinity_count"]=len(os.sched_getaffinity(0))
+        except (OSError,AttributeError,ValueError) as exc: resources["diagnostics"].append({"probe":"host resources","error":str(exc)})
+    disk = shutil.disk_usage(workspace)
+    resources["storage"] = {"total_bytes": disk.total, "free_bytes": disk.free, "used_bytes": disk.used}
+    resources["observed_at"] = time.time()
+    return resources
+
+
 class LaboratoryBinding:
     """A validated laboratory plus its operator attestation for one project."""
 
@@ -1202,6 +1249,84 @@ class LaboratoryBinding:
 
     def context(self):
         return laboratory_context(self.laboratory, attestation=self.attestation)
+
+    def execution_binding(self):
+        """Pin controller-owned runtime authority independently of scientific input."""
+        return {"schema_version": "laboratory-execution-binding-1",
+                "runtime_labels": list(getattr(self, "execution_labels",
+                    [r["label"] for r in self.laboratory["runtimes"]])),
+                "configuration": deepcopy(self.laboratory),
+                "attestation": deepcopy(self.attestation)}
+
+    @classmethod
+    def from_execution_binding(cls, value):
+        _object(value, {"schema_version", "configuration", "attestation", "runtime_labels"}, set(),
+                "laboratory execution binding")
+        if value["schema_version"] != "laboratory-execution-binding-1":
+            raise ValidationError("unsupported laboratory execution binding")
+        binding = cls(value["configuration"], value["attestation"])
+        if binding.attestation.get("config_sha256") != binding.identity:
+            raise ValidationError("laboratory execution attestation belongs to another configuration")
+        return binding.for_execution(value["runtime_labels"])
+
+    def for_execution(self, labels):
+        if (not isinstance(labels, list)
+                or any(not isinstance(label, str) for label in labels)
+                or len(set(labels)) != len(labels)):
+            raise ValidationError("laboratory execution runtime labels must be unique strings")
+        for label in labels:
+            self.runtime(label)
+        binding = LaboratoryBinding(self.laboratory, self.attestation)
+        binding.execution_labels = sorted(labels)
+        return binding
+
+    def execution_surface(self, workspace):
+        """Resolve attested native interpreters for authoring and isolated replay.
+
+        Container execution retains its controller-owned Workbench boundary;
+        a native script is never given a Docker socket or an unverified runtime.
+        """
+        runtimes, roots, identities = {}, [], {}
+        for runtime in self.laboratory["runtimes"]:
+            label = runtime["label"]
+            if label not in getattr(self, "execution_labels", [label]):
+                continue
+            record = self.attested(label) or {}
+            if runtime["kind"] == "container" or record.get("verified") is not True:
+                continue
+            if record.get("probe", {}).get("mode") != "sandbox-exec":
+                continue
+            fingerprint = self.runtime_fingerprint(label)
+            if fingerprint.get("matches_attestation") is not True:
+                raise ValidationError(f"laboratory runtime {label!r} drifted before execution")
+            roots.extend(runtime_read_roots(runtime))
+            identities[label] = fingerprint
+            runtimes[label] = {
+                "executable": runtime["executable"],
+                "environment": {key: value for key, value in resolve_runtime_environment(runtime, workspace).items()
+                                if key not in WORKSPACE_ENV_KEYS},
+                "declared_resource_limits": deepcopy(runtime.get("resource_limits") or {}),
+                "replay_resource_limits": {"address_space_bytes": DEFAULT_ADDRESS_SPACE,
+                                           "cpu_seconds": DEFAULT_CPU_SECONDS,
+                                           "file_size_bytes": DEFAULT_FILE_SIZE},
+            }
+        return {"environment": {"SCI_LABORATORY_RUNTIMES": json.dumps(runtimes, sort_keys=True)},
+                "read_only_paths": tuple(dict.fromkeys(roots)),
+                "identities": identities}
+
+    def authoring_context(self, workspace):
+        surface = self.execution_surface(workspace)
+        return {"laboratory": self.context(), "runtime_identities": surface["identities"],
+                "host_resources": observe_host_resources(workspace),
+                "execution": {
+                    "replay_resource_limits": {"address_space_bytes": DEFAULT_ADDRESS_SPACE,
+                                               "cpu_seconds": DEFAULT_CPU_SECONDS,
+                                               "file_size_bytes": DEFAULT_FILE_SIZE},
+                    "runtime_access": "json.loads(os.environ['SCI_LABORATORY_RUNTIMES']) maps attested native runtime labels to executable and environment. Invoke a workspace script with subprocess argument lists using that executable, env={**os.environ, **runtime['environment']}, cwd in the workspace, finite timeout and captured stdout/stderr. Runtime environment may contain SCI_SOLVER_COMMANDS for native solver commands. Keep launch and solver imports under a __main__ guard for spawn-based dependencies; retain the controller-inherited private TMPDIR and workspace cache variables.",
+                    "implementation": "Write geometry, solver configuration, invocation and result-processing scripts. Use the established solver for physical calculations; do not reconstruct its numerical solver or substitute calibration outputs for new designs. Retain exact solver source, inputs, commands, raw outputs and failures for every calculation.",
+                    "containers": "Container runtimes require controller SoftwareWorkbench scientific_run; native author/replay scripts cannot launch containers directly.",
+                    "resources": "Capacity is an observation, not a reservation. Native children share the outer finite watchdog, CPU, memory and file limits. Use declared runtime limits and current available resources when choosing a small pilot; no model calls from executors.",
+                }}
 
     def feasibility(self):
         """Return the sealed runtime-label contract used for topic admission."""

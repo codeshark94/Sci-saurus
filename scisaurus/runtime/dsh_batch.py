@@ -135,10 +135,12 @@ def terminate_tree(process):
 class DshBatchRunner:
     """One fresh session per work order, with controller-owned receipts."""
 
-    def __init__(self, config, *, root, runtime_read_roots=()):
+    def __init__(self, config, *, root, runtime_read_roots=(), laboratory=None):
         self.config = validate_batch_config(config)
         self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
         self.runtime_read_roots = [str(Path(p).resolve()) for p in runtime_read_roots]
+        self.laboratory = laboratory
 
     def run(self, task, *, inputs, seed_files=None, outputs, deadline=None, exchange=None):
         deadline = min(deadline if deadline is not None else math.inf,
@@ -234,8 +236,10 @@ class DshBatchRunner:
                "DSH_SESSION_ROOT": str(work / ".sessions"),
                "DSH_CORDIS_CONFIG": config["composition"], "DSH_MAX_TOKENS_AS_SUCCESS": "false",
                config["auth_env"]: credential}
+        surface = (self.laboratory.execution_surface(work) if self.laboratory else {})
+        env.update(surface.get("environment", {}))
         profile = sandbox_profile(work, config["command"], allow_network=True,
-            read_only_paths=[str(frozen), *config["read_roots"], *self.runtime_read_roots])
+            read_only_paths=[str(frozen), *config["read_roots"], *self.runtime_read_roots, *surface.get("read_only_paths", ())])
         # DSH supervises detached shell groups. It must be able to inspect
         # processes and signal members of its own inherited Seatbelt domain.
         profile += "\n(allow process-info*)\n(allow signal (target same-sandbox))\n"
@@ -503,15 +507,16 @@ class DshBatchRunner:
 class DshAuthorClient:
     """Import source files into the existing independent admission pipeline."""
 
-    def __init__(self, config, *, root, runtime_python):
+    def __init__(self, config, *, root, runtime_python, laboratory=None):
         self.config = validate_batch_config(config)
         self.model = config["model"]
         self.timeout_seconds = config["timeout_seconds"]
         self.max_output_tokens = config["max_output_tokens"]
         self.base_assignment = None
+        self.laboratory = laboratory
         self.runtime_python = str(Path(runtime_python).absolute())
         self.runner = DshBatchRunner(config, root=root,
-            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)])
+            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)], laboratory=laboratory)
 
     def complete(self, *, system, prompt):
         assignment = json.loads(prompt)
@@ -553,6 +558,11 @@ class DshAuthorClient:
         base.pop("author_backend", None)
         base.pop("response_contract", None)
         base["runtime_python"] = self.runtime_python
+        inputs = {"assignment.json": canonical_bytes(projected),
+                  "execution-contract.json": canonical_bytes(base)}
+        if self.laboratory is not None:
+            inputs["laboratory.json"] = canonical_bytes(
+                self.laboratory.authoring_context(self.runner.root))
         task = ("Read assignment.json and execution-contract.json and implement the stated scientific task. "
                 "The current assignment contains current repair evidence; execution-contract.json contains "
                 "the full frozen configured_input, pinned runtime and output schemas. Work by editing files, "
@@ -565,8 +575,13 @@ class DshAuthorClient:
                 "The executor uses the supplied stdin/stdout and analysis contracts and the declared pinned "
                 "runtime. Do not patch output observations to pass checks. Your final chat answer is not the "
                 "deliverable; the two files are. Experimental admission is performed independently by the controller.")
-        result = self.runner.run(task, inputs={"assignment.json": canonical_bytes(projected),
-                                               "execution-contract.json": canonical_bytes(base)},
+        if self.laboratory is not None:
+            task += (" Read laboratory.json before implementation. It lists the attested installed solvers, "
+                     "current host capacity and exact SCI_LABORATORY_RUNTIMES invocation interface. "
+                     "The generic runtime is an orchestration host. Invoke established solvers with their "
+                     "declared interpreters; do not rebuild their physics solvers in numpy or relabel old "
+                     "calibration outputs as a new design. Use the same interface in exported executor.py.")
+        result = self.runner.run(task, inputs=inputs,
             seed_files=seed, outputs=["executor.py", "intent.json"],
             deadline=time.monotonic() + self.timeout_seconds)
         try:
@@ -748,15 +763,16 @@ class DshSoftwareProducerClient(DshStructuredProducerClient):
 class DshValidatorClient:
     """A fresh blinded engineering session for the separately authored validator."""
 
-    def __init__(self, config, *, root, runtime_python):
+    def __init__(self, config, *, root, runtime_python, laboratory=None):
         self.config = validate_batch_config(config)
         self.model = config["model"]
         self.timeout_seconds = config["timeout_seconds"]
         self.max_output_tokens = config["max_output_tokens"]
         self.deadline = None
+        self.laboratory = laboratory
         self.runtime_python = str(Path(runtime_python).absolute())
         self.runner = DshBatchRunner(config, root=root,
-            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)])
+            runtime_read_roots=[str(Path(runtime_python).absolute().parent.parent)], laboratory=laboratory)
 
     def complete(self, *, system, prompt):
         assignment = json.loads(prompt)
@@ -785,7 +801,11 @@ class DshValidatorClient:
                 "Do not search for the producer implementation or fabricate observations. Do not change "
                 "scientific inputs, estimands, tolerances or gates to force agreement. Preserve local commands "
                 "and check outputs in the workspace. The exported file, rather than final chat text, is the deliverable.")
-        result = self.runner.run(task, inputs={"assignment.json": canonical_bytes(assignment)},
+        inputs = {"assignment.json": canonical_bytes(assignment)}
+        if self.laboratory is not None:
+            inputs["laboratory.json"] = canonical_bytes(self.laboratory.authoring_context(self.runner.root))
+            task += " Read laboratory.json for the shared attested runtime invocation interface and host limits. It contains no producer source or computed results."
+        result = self.runner.run(task, inputs=inputs,
             seed_files=seed, outputs=["validator.py"], deadline=self.deadline)
         try:
             source = result["files"]["validator.py"].decode()

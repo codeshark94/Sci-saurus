@@ -98,9 +98,9 @@ def validate_validator_readiness(result):
 
 
 def admit_program_candidate(candidate, *, execute, validate, readiness=None, review=None,
-                            replay_runs=3):
+                            replay_runs=3, laboratory_execution=None):
     """Run every admission gate and return an immutable admission record."""
-    validate_program_candidate(candidate)
+    validate_program_candidate(candidate, laboratory_execution=laboratory_execution)
     if type(replay_runs) is not int or not 3 <= replay_runs <= 8:
         raise ValidationError("admission replay_runs must be an integer between three and eight")
     payload = canonical_bytes(candidate["test_vector"]["input"])
@@ -197,6 +197,8 @@ def admit_program_candidate(candidate, *, execute, validate, readiness=None, rev
         "executor_source_sha256": hashlib.sha256(candidate["executor_source"].encode()).hexdigest(),
         "validator_source_sha256": hashlib.sha256(candidate["validator_source"].encode()).hexdigest(),
         "runtime": candidate["runtime"],
+        **({"laboratory_execution_sha256": hashlib.sha256(canonical_bytes(laboratory_execution)).hexdigest()}
+           if laboratory_execution is not None else {}),
         "replay_runs": replay_runs,
         "output_sha256": digests[0],
         "independent_recalculation": {"decision": verdict.get("decision"),

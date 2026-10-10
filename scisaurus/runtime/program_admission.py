@@ -104,7 +104,7 @@ def is_main_entry_guard(node):
     )
 
 
-def scan_program_source(source, name):
+def scan_program_source(source, name, *, laboratory_execution=None):
     """Static admission gate for one program source.  Returns the module roots."""
     _text(source, f"{name} source")
     try:
@@ -144,10 +144,17 @@ def scan_program_source(source, name):
                 pair = (func.value.id, func.attr)
                 if pair in FORBIDDEN_ATTRIBUTES:
                     raise ValidationError(f"{name} source calls the forbidden attribute {'.'.join(pair)}")
-    forbidden = sorted(roots & FORBIDDEN_IMPORT_ROOTS)
+    permitted = set(ALLOWED_IMPORTS)
+    forbidden_roots = set(FORBIDDEN_IMPORT_ROOTS)
+    if laboratory_execution is not None:
+        from scisaurus.runtime.laboratory import LaboratoryBinding
+        LaboratoryBinding.from_execution_binding(laboratory_execution)
+        permitted.add("subprocess")
+        forbidden_roots.remove("subprocess")
+    forbidden = sorted(roots & forbidden_roots)
     if forbidden:
         raise ValidationError(f"{name} source imports forbidden modules: {forbidden}")
-    unknown = sorted(roots - ALLOWED_IMPORTS)
+    unknown = sorted(roots - permitted)
     if unknown:
         raise ValidationError(f"{name} source imports modules outside the pinned allowlist: {unknown}")
     return roots
@@ -358,7 +365,7 @@ def format_recovery_intent_constraints(intent, required, *, configured_input, ev
     return constraints, diagnostics
 
 
-def validate_program_candidate(value):
+def validate_program_candidate(value, *, laboratory_execution=None):
     """Validate one model-proposed program candidate before any execution."""
     if not isinstance(value, dict) or set(value) != CANDIDATE_FIELDS:
         raise ValidationError(f"program candidate requires exactly {sorted(CANDIDATE_FIELDS)}")
@@ -372,8 +379,8 @@ def validate_program_candidate(value):
         raise ValidationError("program candidate study_id must match its experiment_intent id")
     if value["revision"] != value["experiment_intent"]["revision"]:
         raise ValidationError("program candidate revision must match its experiment_intent revision")
-    scan_program_source(value["executor_source"], "program executor")
-    scan_program_source(value["validator_source"], "program validator")
+    scan_program_source(value["executor_source"], "program executor", laboratory_execution=laboratory_execution)
+    scan_program_source(value["validator_source"], "program validator", laboratory_execution=laboratory_execution)
     if value["executor_source"].strip() == value["validator_source"].strip():
         raise ValidationError("program executor and validator sources must be independently authored")
     _validate_runtime(value["runtime"])

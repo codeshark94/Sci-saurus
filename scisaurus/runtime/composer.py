@@ -14641,10 +14641,11 @@ class ComposerRunner:
         strategy = evidence["selection"]["strategy"]
         if strategy == "reuse":
             execution_contract = (
-                "Reuse the exact acquired software computations as source-bound inputs. "
+                "Use the selected established software mechanisms and retained computations as source-bound controls. "
                 "Do not replace the package mechanism with copied or invented equations. "
-                "New scientific parameters require a new controller-recorded software computation, "
-                "not relabelled old outputs.")
+                "New designs and scientific parameters require fresh solver execution through the controller-bound "
+                "laboratory runtime interface in the authored executor. Retain source, input, command and "
+                "complete raw outputs; do not relabel old controls as new observations.")
         elif strategy == "custom_model":
             execution_contract = (
                 "Implement the admitted source-bound mathematical specification as a custom model. "
@@ -15875,6 +15876,13 @@ class ComposerRunner:
                     "capability foundry has no model-call budget left in the experiment stage",
                     limit=0, observed=0, usage={})
             foundry_usage_before = deepcopy(self.foundry_usage)
+            execution_laboratory = getattr(self, "laboratory_binding", None)
+            if execution_laboratory is not None and software_assessment is not None:
+                runtime_labels = sorted({row["result"]["runtime"]
+                    for row in software_assessment["evidence"]["selected_operations"]
+                    if row["action"]["operation"] == "run" and row["result"].get("runtime")})
+                if runtime_labels:
+                    execution_laboratory = execution_laboratory.for_execution(runtime_labels)
             foundry = CapabilityFoundry(
                 model,
                 runtime_python=configured["runtime_python"],
@@ -15888,6 +15896,7 @@ class ComposerRunner:
                 timeout_seconds=configured["timeout_seconds"],
                 model_timeout_seconds=configured_model_timeout,
                 author_backend=configured.get("author_backend"),
+                laboratory=execution_laboratory,
             )
             foundry_input = {}
             if software_assessment is not None:

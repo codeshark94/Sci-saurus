@@ -105,7 +105,7 @@ class LocalProgramClient:
     process in the worker's group; standalone callers may explicitly own a group.
     """
     def __init__(self, command, *, timeout, max_bytes, cwd, env, own_process_group=False,
-                 sandbox_required=False):
+                 sandbox_required=False, laboratory=None):
         if (not isinstance(command, list) or not command
                 or any(not isinstance(arg, str) or "\0" in arg for arg in command)
                 or not Path(command[0]).is_absolute() or not Path(command[0]).is_file()
@@ -139,6 +139,14 @@ class LocalProgramClient:
         self.command, self.timeout, self.max_bytes = list(command), timeout, max_bytes
         self.cwd, self.env, self.own_process_group = cwd, dict(env), own_process_group
         self.sandbox_required = sandbox_required
+        self.laboratory = None
+        self.laboratory_sha256 = None
+        if laboratory is not None:
+            if not sandbox_required:
+                raise ValueError("laboratory local programs require sandbox_required")
+            from scisaurus.runtime.laboratory import LaboratoryBinding
+            self.laboratory = LaboratoryBinding.from_execution_binding(laboratory)
+            self.laboratory_sha256 = sha256_hex(canonical_bytes(laboratory))
 
     def run(self, input):
         from scisaurus.runtime.run_control import ensure_run_allowed, start_process
@@ -156,6 +164,7 @@ class LocalProgramClient:
                                "command": self.command, "cwd": self.cwd, "command_identity": identity,
                                "own_process_group": self.own_process_group, "process_returncode": None,
                                "sandbox_required": self.sandbox_required, "sandbox_mode": None,
+                               **({"laboratory_execution_sha256": self.laboratory_sha256} if self.laboratory else {}),
                                "input_bytes_written": 0, "capture_truncated": False,
                                "capture_incomplete": False}}
         if self.sandbox_required:
@@ -263,10 +272,16 @@ class LocalProgramClient:
             command = source_snapshot_command(self.command, snapshot)
             result["metadata"].update(source_dispatch_mode="private_read_only_snapshot",
                                       source_snapshot_path=str(snapshot), dispatched_command=command)
+            surface = self.laboratory.execution_surface(self.cwd) if self.laboratory else {}
             sandbox = run_sandboxed(
                 command, workspace=Path(self.cwd), input_bytes=stdin,
-                timeout_seconds=self.timeout, max_bytes=self.max_bytes, env=self.env,
+                timeout_seconds=self.timeout, max_bytes=self.max_bytes,
+                env={**self.env, **surface.get("environment", {})},
+                read_only_paths=surface.get("read_only_paths", ()),
             )
+        if self.laboratory is not None:
+            self.laboratory.execution_surface(self.cwd)
+            result["metadata"]["laboratory_runtime_identities"] = surface["identities"]
         stdout, stderr = sandbox.stdout, sandbox.stderr
         result["metadata"].update(
             sandbox_mode=sandbox.mode,

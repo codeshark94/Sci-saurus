@@ -22,6 +22,41 @@ the existing producer/reviewer binding checks.
 | Evidence obligations (analytic probes first, convergence, conservation, robustness, equal-constraint comparison, contribution vs closest prior work) | The actual probe, comparison, observation and limitations |
 | Controller-verified provisioning facts | Scientific interpretation and admission |
 
+## Authoring and execution interface
+
+The controller carries one sealed laboratory execution binding from the accepted
+software selection into the program author, separately commissioned validator,
+Foundry preview, deterministic replay and registered program client. Scientific
+inputs remain separate from this operational binding. Every native dispatch
+rechecks the executable, package inventory, module contents, declared environment
+and read roots against the provisioning attestation; changed installations stop
+execution. Registered descriptors bind the same environment digest as admission.
+
+DSH author and validator jobs receive an immutable `laboratory.json` with the full
+laboratory inventory, supported physics families, runtime limitations and current
+host CPU, memory, accelerator and filesystem capacity observations. Capacity is
+not a reservation. The active native execution labels derive from the selected
+controller-owned solver computations. Other installed tools remain visible in the
+inventory; they require selection and execution through their supported boundary.
+
+`SCI_LABORATORY_RUNTIMES` supplies the authorized native runtime labels, interpreter
+paths and runtime environments. An experiment executor is an orchestration script:
+it writes geometry and solver configuration, invokes an established solver with
+argument lists and a finite timeout, captures all source/input/stdout/stderr, and
+processes the observations. It does not reconstruct that solver's numerical
+implementation or reuse calibration values as observations for a new design.
+Child scripts using spawn-based packages put solver imports and launch code under
+a main guard and inherit the controller's private temporary and cache directories.
+The generic experiment Python hosts orchestration; its package list does not
+replace the declared solver environments.
+
+Only laboratory-bound program admission allows the subprocess module. Other
+candidates retain the existing import restrictions. All generated programs retain
+the deny-by-default sandbox, no-network policy, finite watchdog and resource limits.
+The execution context distinguishes declared runtime limits from the preview/replay
+limits inherited by native children. Container runtimes use controller-owned
+SoftwareWorkbench `scientific_run`, not direct Docker access from a native script.
+
 ## Concept-led design iterations
 
 Laboratory missions propose useful physical design concepts before implementation literature,

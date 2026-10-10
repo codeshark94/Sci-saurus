@@ -2367,7 +2367,7 @@ class CapabilityFoundry:
                  requirements_file, runtime_packages, max_attempts=4, timeout_seconds=900.0,
                  model_timeout_seconds=None, reviewer_client=None, validator_client=None,
                  author_max_output_tokens=32768, reviewer_max_output_tokens=32768,
-                 author_backend=None):
+                 author_backend=None, laboratory=None):
         self.model_config = deepcopy_config(model_config)
         self.runtime_python = Path(runtime_python)
         self.workspace_root = Path(workspace_root)
@@ -2383,13 +2383,15 @@ class CapabilityFoundry:
         self.deadline = None
         self.reviewer_client = reviewer_client
         self.validator_client = validator_client
+        self.laboratory = laboratory
         self.author_backend = None
         if author_backend is not None:
             from scisaurus.runtime.dsh_batch import validate_batch_config, DshValidatorClient
             self.author_backend = validate_batch_config(author_backend)
             if self.validator_client is None:
                 self.validator_client = DshValidatorClient(self.author_backend,
-                    root=self.workspace_root / "dsh-validator-jobs", runtime_python=self.runtime_python)
+                    root=self.workspace_root / "dsh-validator-jobs", runtime_python=self.runtime_python,
+                    laboratory=self.laboratory)
         if type(max_attempts) is not int or not 1 <= max_attempts <= 12:
             raise ValidationError("foundry max_attempts must be an integer between 1 and 12")
         if (type(timeout_seconds) not in (int, float)
@@ -2410,6 +2412,18 @@ class CapabilityFoundry:
             raise ValidationError(
                 "capability foundry requires the deny-by-default sandbox-exec boundary")
         self.workspace_root.mkdir(parents=True, exist_ok=True)
+
+    def _laboratory_execution(self):
+        return self.laboratory.execution_binding() if self.laboratory else None
+
+    def _program_system(self, system):
+        if self.laboratory is None:
+            return system
+        return system.replace("network, subprocesses, eval/exec", "network, eval/exec") + (
+            " The controller-bound laboratory permits subprocess for invoking declared established "
+            "solvers through SCI_LABORATORY_RUNTIMES. Write solver configuration and orchestration "
+            "scripts, not replacement numerical solvers. Retain complete child source/input/stdout/stderr "
+            "and use finite timeouts. Network and undeclared runtimes remain forbidden.")
 
     def _model_config_for_role(self, role, output_limit, *, model_config=None):
         """Allocate a route's context ceiling to the requested output budget."""
@@ -2519,8 +2533,14 @@ class CapabilityFoundry:
         workdir.mkdir(parents=True, exist_ok=True)
         program = workdir / "program.py"
         program.write_text(source)
-        return run_sandboxed([str(self.runtime_python), str(program)], workspace=workdir,
-                             input_bytes=payload, timeout_seconds=timeout, max_bytes=60_000_000)
+        surface = self.laboratory.execution_surface(workdir) if self.laboratory else {}
+        result = run_sandboxed([str(self.runtime_python), str(program)], workspace=workdir,
+                             input_bytes=payload, timeout_seconds=timeout, max_bytes=60_000_000,
+                             env=surface.get("environment"),
+                             read_only_paths=surface.get("read_only_paths", ()))
+        if self.laboratory is not None:
+            self.laboratory.execution_surface(workdir)
+        return result
 
     def generate(self, brief, *, test_input=None, required_intent=None, client=None,
                  work_cache=None, on_progress=None, deadline=None,
@@ -2577,7 +2597,7 @@ class CapabilityFoundry:
                 raise ValidationError("DSH batch cannot bypass an explicit per-call allowance; an admission-aware provider relay is required")
             from scisaurus.runtime.dsh_batch import DshAuthorClient
             client = DshAuthorClient(self.author_backend, root=self.workspace_root / "dsh-jobs",
-                                     runtime_python=self.runtime_python)
+                                     runtime_python=self.runtime_python, laboratory=self.laboratory)
         elif client is None:
             author_route_configs = self._format_model_routes(author_role, self.author_max_output_tokens)
             client = ModelClient(**_artifact_generation_config(author_route_configs[0]))
@@ -2585,6 +2605,10 @@ class CapabilityFoundry:
         runtime = self._runtime()
         base_prompt = candidate_prompt(brief, self.runtime_packages, configured_input,
             required_intent=required_intent, runtime_version=runtime["python"])
+        if self.laboratory is not None:
+            base_prompt["execution_environment"]["laboratory"] = self.laboratory.context()
+            base_prompt["execution_environment"]["laboratory_execution_sha256"] = hashlib.sha256(
+                canonical_bytes(self.laboratory.execution_binding())).hexdigest()
         if self.author_backend is not None:
             base_prompt["author_backend"] = {
                 "schema_version": self.author_backend["schema_version"],
@@ -2621,7 +2645,7 @@ class CapabilityFoundry:
                          "program_admission.py", "program_gates.py", "program_sandbox.py", "measurement_contract.py", "study_evidence.py", "dsh_batch.py"):
                 contract.update((Path(__file__).parent / name).read_bytes())
             key = work_cache.key(scope="experiment-capability", role="research.experiment-author",
-                system=SYSTEM, prompt={"assignment": base_prompt,
+                system=self._program_system(SYSTEM), prompt={"assignment": base_prompt,
                     "validation_contract": contract.hexdigest(),
                     "repair_provenance": repair_provenance,
                     **({"resume_work_ref": resume_work_ref} if resume_work_ref is not None else {})},
@@ -2896,6 +2920,8 @@ class CapabilityFoundry:
                     for identity, authored in prior.get("validator_authorship", {}).items():
                         assignment = authored.get("assignment", {}) if isinstance(authored, dict) else {}
                         if (isinstance(authored, dict)
+                                and (prior.get("assignment", {}).get("execution_environment", {}).get("laboratory_execution_sha256")
+                                     == base_prompt.get("execution_environment", {}).get("laboratory_execution_sha256"))
                                 and authored.get("status") in {"repair_required", "response_received", "calling",
                                                              "result_unknown", "provider_rate_limited"}
                                 and (authored.get("candidate_sha256") == _authored_candidate_sha256(
@@ -4323,6 +4349,11 @@ class CapabilityFoundry:
                 "runtime": runtime,
                 "permitted_modules": ["json", "math", "statistics", "hashlib", "pathlib", "sys", "itertools", "functools", "random", "collections", "dataclasses", "typing", "decimal", "fractions", "re", "time", "os", "numpy", "matplotlib"],
             }
+            if self.laboratory is not None:
+                assignment["laboratory_execution"] = {
+                    "laboratory": self.laboratory.context(),
+                    "binding_sha256": hashlib.sha256(canonical_bytes(self._laboratory_execution())).hexdigest()}
+                assignment["permitted_modules"].append("subprocess")
             if validator_repair_review is not None:
                 assignment["methods_repair_review"] = validator_repair_review
                 assignment["instructions"] += (
@@ -4522,7 +4553,7 @@ class CapabilityFoundry:
                             finally:
                                 validator_client.output_format = original_format
                         else:
-                            response = validator_client.complete(system=AUTHOR_CONTINUATION_SYSTEM if continuing else VALIDATOR_AUTHOR_SYSTEM, prompt=request["prompt"])
+                            response = validator_client.complete(system=AUTHOR_CONTINUATION_SYSTEM if continuing else self._program_system(VALIDATOR_AUTHOR_SYSTEM), prompt=request["prompt"])
                     except ModelCallError as exc:
                         if record_provider_rate_limit(request, exc, phase="validator_author_rate_limited", retry_state=retained):
                             retained["attempts"] = attempts_before
@@ -4600,7 +4631,7 @@ class CapabilityFoundry:
                         provenance["continuation_chain_sha256"] = hashlib.sha256(canonical_bytes(retained["continuation"])).hexdigest()
                     retained["provenance"] = provenance
                     phase = "source_static_scan"
-                    scan_program_source(source, "independent program validator")
+                    scan_program_source(source, "independent program validator", laboratory_execution=self._laboratory_execution())
                     phase = "validator_readiness"
                     probe = execute_recorded(source, canonical_bytes(
                         validator_readiness_contract()["stdin"]), "validator_readiness")
@@ -4960,7 +4991,7 @@ class CapabilityFoundry:
                 state["status"] = "calling"
                 save("calling")
                 try:
-                    result = client.complete(system=SYSTEM, prompt=prompt)
+                    result = client.complete(system=self._program_system(SYSTEM), prompt=prompt)
                 except ModelCallError as exc:
                     if record_provider_rate_limit(
                             request, exc, phase="author_rate_limited",
@@ -5175,7 +5206,7 @@ class CapabilityFoundry:
                     if differences:
                         raise ScientificDefinitionError(
                             "program author changed a required scientific intent field: " + json.dumps(differences))
-                scan_program_source(executor, "program executor")
+                scan_program_source(executor, "program executor", laboratory_execution=self._laboratory_execution())
                 candidate_fingerprint = hashlib.sha256(canonical_bytes(attempt_value)).hexdigest()
                 failed_candidates = state.setdefault("failed_candidates", {})
                 if candidate_fingerprint in failed_candidates:
@@ -5222,7 +5253,7 @@ class CapabilityFoundry:
                     "test_vector": {"input": payload_value, "expected_output_sha256": digest},
                     "experiment_intent": attempt_value["experiment_intent"],
                 }
-                validate_program_candidate(candidate_value)
+                validate_program_candidate(candidate_value, laboratory_execution=self._laboratory_execution())
                 save("sandbox_validation")
                 admission = admit_program_candidate(
                     candidate_value,
@@ -5231,7 +5262,7 @@ class CapabilityFoundry:
                         src, self._validator_input(data, attempt_value["experiment_intent"]),
                         "validator_recalculation"),
                     readiness=lambda: validator_probe,
-                    review=review_program)
+                    review=review_program, laboratory_execution=self._laboratory_execution())
                 if isinstance(repair_provenance, dict):
                     # The provenance is controller-owned and records which
                     # model-led repair panel authorised this new candidate.
@@ -5243,10 +5274,13 @@ class CapabilityFoundry:
                 admission["validator_authorship"] = validator_authorship
                 if deadline is not None and time.monotonic() >= deadline:
                     raise CapabilityDeadlineError("capability admission reached its mission deadline")
+                laboratory_execution = (self.laboratory.execution_binding() if self.laboratory else None)
+                if laboratory_execution is not None:
+                    admission["laboratory_execution_sha256"] = hashlib.sha256(canonical_bytes(laboratory_execution)).hexdigest()
                 registration = register_capability(
                     self.registry_root, candidate_value, admission,
                     runtime_python=self.runtime_python, repo_root=self.repo_root,
-                    requirements_file=self.requirements_file)
+                    requirements_file=self.requirements_file, laboratory_execution=laboratory_execution)
                 outcome = {"status": "registered", "attempts": attempt + 1, "admission": admission,
                         "registration": registration, "candidate": candidate_value}
                 state.update(status="succeeded", outcome=outcome, last_attempt=attempt_value,

@@ -808,46 +808,8 @@ class SoftwareWorkbench:
                     "readiness": "runtimes_probed_dependencies_not_yet_assessed"}
 
     def _host_resources(self):
-        """Observe host capacity without interpreting installed tools as readiness."""
-        import subprocess
-        resources = {"cpu":{"logical_count":os.cpu_count(),"physical_count":None,"load_average":list(os.getloadavg())},
-                     "memory":{"total_bytes":None,"reclaimable_available_bytes":None},"accelerators":[],"diagnostics":[]}
-        def probe(command):
-            try:
-                result=subprocess.run(command,capture_output=True,text=True,timeout=min(15,self._remaining()),env={"PATH":"/usr/bin:/bin"})
-                if result.returncode:
-                    resources["diagnostics"].append({"command":command,"returncode":result.returncode,"stderr":result.stderr})
-                    return None
-                return result.stdout
-            except (OSError,subprocess.TimeoutExpired) as exc:
-                resources["diagnostics"].append({"command":command,"error":str(exc)})
-                return None
-        if platform.system()=="Darwin":
-            for name,section,key in (("hw.memsize","memory","total_bytes"),("hw.physicalcpu","cpu","physical_count")):
-                value=probe(["/usr/sbin/sysctl","-n",name])
-                if value and value.strip().isdecimal(): resources[section][key]=int(value)
-            value=probe(["/usr/bin/vm_stat"])
-            if value:
-                page=re.search(r"page size of (\d+) bytes",value)
-                rows={name:int(count) for name,count in re.findall(r"(Pages [a-z ]+):\s+(\d+)\.",value)}
-                if page and all(name in rows for name in ("Pages free","Pages inactive","Pages speculative")):
-                    resources["memory"].update(reclaimable_available_bytes=int(page[1])*sum(rows[name] for name in ("Pages free","Pages inactive","Pages speculative")),
-                        available_semantics="free plus inactive plus speculative pages; reclaimable estimate, not reserved memory")
-            value=probe(["/usr/sbin/system_profiler","SPDisplaysDataType","-json"])
-            if value:
-                try:
-                    for row in json.loads(value).get("SPDisplaysDataType",[]):
-                        resources["accelerators"].append({"model":row.get("sppci_model",row.get("_name")),"cores":row.get("sppci_cores"),
-                            "memory":row.get("spdisplays_vram"),"metal_support":row.get("spdisplays_mtlgpufamilysupport",row.get("spdisplays_metal")),
-                            "scientific_runtime_readiness":"not_probed"})
-                except (ValueError,TypeError) as exc: resources["diagnostics"].append({"probe":"GPU inventory","error":str(exc)})
-        elif platform.system()=="Linux":
-            try:
-                rows={name:int(count)*1024 for name,count in re.findall(r"^(\w+):\s+(\d+) kB",Path("/proc/meminfo").read_text(),re.M)}
-                resources["memory"].update(total_bytes=rows.get("MemTotal"),reclaimable_available_bytes=rows.get("MemAvailable"),available_semantics="kernel MemAvailable estimate, not reserved memory")
-                resources["cpu"]["affinity_count"]=len(os.sched_getaffinity(0))
-            except (OSError,AttributeError,ValueError) as exc: resources["diagnostics"].append({"probe":"host resources","error":str(exc)})
-        return resources
+        from scisaurus.runtime.laboratory import observe_host_resources
+        return observe_host_resources(self.root, timeout_seconds=min(15, self._remaining()))
 
     def _search(self, args, _key):
         _fields(args, {"query"}, {"page"})
