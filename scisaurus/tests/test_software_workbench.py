@@ -515,7 +515,11 @@ class SoftwareWorkbenchTests(unittest.TestCase):
             prompt = json.loads(build_verifier_prompt({"id":"software","kind":"experiment"},
                 {"repair_verification_scope":"scientific_software_fitness"},
                 [{"response":{"software_selection":{"strategy":"reuse"}}}], {"software_assessment":evidence}, max_input_tokens=limit))
-            self.assertEqual(prompt["chief_result"]["software_assessment"], evidence)
+            from scisaurus.runtime.software_workbench import software_assessment_prompt
+            self.assertEqual(prompt["chief_result"]["software_assessment"],
+                             {**evidence, "request": software_assessment_prompt(evidence["request"])})
+            self.assertEqual(prompt["chief_result"]["software_assessment_sha256"],
+                             hashlib.sha256(canonical_bytes(evidence)).hexdigest())
             self.assertEqual(prompt["specialist_reports"][0]["response"]["software_selection"], {"strategy":"reuse"})
             self.assertEqual(prompt["verifier_contract"]["review_subject"]["path"], "chief_result.software_assessment")
 
@@ -559,6 +563,9 @@ class SoftwareWorkbenchTests(unittest.TestCase):
     def test_controller_reviewer_contract_failure_keeps_response_ownership(self):
         self._controller_assessment(failure_mode="reviewer_contract")
 
+    def test_controller_reviewer_empty_generation_is_resource_fence(self):
+        self._controller_assessment(failure_mode="reviewer_capacity")
+
     def test_controller_producer_format_recovery_reuses_discovery_and_repairs_output(self):
         self._controller_assessment(failure_mode="producer_contract", recover=True)
 
@@ -599,6 +606,9 @@ class SoftwareWorkbenchTests(unittest.TestCase):
                 evidence = prompt["chief_result"]["software_assessment"]
                 self.assertEqual(evidence["request"]["topic"], topic["topic"])
                 self.assertEqual(evidence["selection"]["strategy"], "reuse")
+                if failure_mode == "reviewer_capacity":
+                    return ModelResult("", "fixture", {"model_calls": 1, "input_tokens": 10,
+                        "output_tokens": 4096}, .001, "length", 1)
                 response = {"decision":"accept","rationale":"fixture evidence is consistent","critical_findings":[],"repair_scope":[]}
                 if failure_mode == "reviewer_contract":
                     response["decision"] = "unsupported_verdict"
@@ -652,6 +662,20 @@ class SoftwareWorkbenchTests(unittest.TestCase):
             if failure_mode:
                 from scisaurus.runtime.model_work import ModelWorkBlocked
                 from scisaurus.runtime.failure_recovery import classify_failure
+                if failure_mode == "reviewer_capacity":
+                    from scisaurus.core.errors import QuotaExceededError
+                    with self.assertRaises(QuotaExceededError) as caught:
+                        runner._assess_scientific_software(stage, {}, topic)
+                    error = caught.exception
+                    self.assertEqual(classify_failure("experiment", error, error.stage_result), "resource_fence")
+                    self.assertFalse(runner._should_run_failure_specialist_review(error, stage))
+                    self.assertEqual(len(reviewer_inputs), 1)
+                    self.assertEqual(error.usage, error.repair_panel_usage)
+                    before = client.return_value.complete.call_count
+                    with self.assertRaises(QuotaExceededError):
+                        runner._assess_scientific_software(stage, {}, topic)
+                    self.assertEqual(client.return_value.complete.call_count, before)
+                    return
                 with self.assertRaises(ModelWorkBlocked) as caught:
                     runner._assess_scientific_software(stage, {}, topic)
                 error = caught.exception

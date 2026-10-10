@@ -14223,6 +14223,26 @@ class ComposerRunner:
                        for key in ("id", "research_question"))):
             raise ValidationError("Methods evidence action changes its immutable original source scope")
 
+    def _retained_specialist_generation_fence(self, stage, descriptor, report):
+        failure = report.get("failure", {})
+        if failure.get("generation_capacity") is None:
+            return None
+        error = ModelCallError.from_failure(report.get("error") or "generation exhausted", failure)
+        if report.get("status") != "failed":
+            raise StateError("generation capacity fence requires its failed paid execution")
+        role_id, role = report.get("role_id"), report.get("model_role")
+        quota = (self._software_producer_quota(stage) if role_id == "methodologist"
+                 else self.departments._resolve_assignment("methods", role_id)["quota"])
+        dispatcher = SpecialistDispatcher(self._specialist_model_config(stage, descriptor))
+        contract = error.generation_capacity.get("capacity_contract_sha256")
+        if not isinstance(contract, str) or re.fullmatch(r"[0-9a-f]{64}", contract) is None:
+            raise StateError("generation fence has no bound capacity contract")
+        if dispatcher.generation_capacity_contract(role, quota) != contract:
+            return None
+        error.usage = {}
+        error.repair_panel_usage = {}
+        return error
+
     def _run_capability_repair_evidence(self, stage, descriptor, packet, retained, prior_review):
         """Produce and independently review an immutable Methods evidence dependency."""
         lead = next((item for item in retained.get("reports", [])
@@ -14302,6 +14322,20 @@ class ComposerRunner:
                     or producer_body.get("report", {}).get("response", {}).get("evidence_note") != note.get("document")
                     or (verifier_body and verifier_body.get("chief_result", {}).get("repair_evidence_note") != note)):
                 raise ValidationError("Methods evidence receipt loses its exact note/review dependency")
+            for ref, body, is_verifier in ((receipt["producer_execution_ref"], producer_body, False),
+                    (receipt.get("verifier_execution_ref"), verifier_body, True)):
+                if not body.get("report", {}).get("failure", {}).get("generation_capacity"):
+                    continue
+                if receipt.get("status") != "blocked":
+                    raise StateError("Methods generation failure cannot certify evidence admission")
+                _, _, owned, _, _ = self._owned_repair_evidence_execution(
+                    ref, receipt["ledger"]["assignment_plan_ref"], verifier=is_verifier)
+                if owned != body:
+                    raise StateError("Methods generation fence changed its owned execution")
+                fenced = self._retained_specialist_generation_fence(stage, descriptor, body["report"])
+                if fenced is not None:
+                    return {**receipt, "artifact_ref": previous["artifact_ref"], "note": note,
+                            "request": request, "dispatch_usage": {}}
             if receipt.get("status") == "accepted" and (verifier_report.get("status") != "succeeded"
                     or verdict.get("decision") != "accept" or verdict.get("blocking_findings")
                     or verdict.get("critical_findings") or verdict.get("required_revisions")):
@@ -14811,6 +14845,22 @@ class ComposerRunner:
                     or execution.get("input_ref", {}).get("digest") != hashlib.sha256(canonical_bytes(prior_identity)).hexdigest()):
                 raise ValidationError("software response recovery belongs to another assignment")
             failure = report.get("failure", {})
+            capacity_report = report
+            if not failure.get("generation_capacity") and prior.get("verifier_execution_ref"):
+                _, _, capacity_execution = self._read_verified_artifact_json(prior["verifier_execution_ref"])
+                if (capacity_execution.get("chief_result", {}).get("software_assessment") != prior["evidence"]
+                        or any(capacity_execution.get(key) != execution.get(key)
+                               for key in ("project_id", "stage_id", "attempt_number"))):
+                    raise ValidationError("software capacity fence lost its exact producer evidence")
+                capacity_report = capacity_execution.get("report", {})
+            capacity_failure = capacity_report.get("failure", {})
+            if capacity_failure.get("generation_capacity") is not None:
+                capacity_error = self._retained_specialist_generation_fence(stage, descriptor, capacity_report)
+                if capacity_error is not None:
+                    capacity_error.stage_result = {"kind": "experiment", "status": "blocked", "error": str(capacity_error),
+                        "failure": deepcopy(capacity_failure),
+                        "scientific_software_assessment": {**prior, "artifact_ref": failed["artifact_ref"]}}
+                    raise capacity_error
             if report.get("status") == "failed" and failure.get("kind") == "output_contract":
                 if isinstance(report.get("partial_response"), str) and report["partial_response"].strip():
                     from scisaurus.runtime.specialists import retained_software_response_failure_identity
@@ -14831,7 +14881,8 @@ class ComposerRunner:
                             or verifier_execution.get("attempt_number") != execution.get("attempt_number")):
                         raise ValidationError("software reviewer recovery lost its producer evidence")
                     if (verifier_report.get("status") == "failed"
-                            and verifier_report.get("failure", {}).get("kind") == "output_contract"):
+                            and (verifier_report.get("failure", {}).get("kind") == "output_contract"
+                                 or verifier_report.get("failure", {}).get("generation_capacity") is not None)):
                         workbench = SoftwareWorkbench(self.root / "scientific-software", deadline=time.monotonic() + self._stage_remaining(stage),
                                                       evidence_refs=[row["source_ref"] for row in evidence_catalog],
                                                       laboratory=getattr(self, "laboratory_binding", None))
@@ -14946,7 +14997,7 @@ class ComposerRunner:
         self._checkpoint(f"{stage['id']}:scientific_software_assessment", force=True)
         if not accepted:
             failure = next((row for row in [produced, verifier] if isinstance(row, dict) and isinstance(row.get("failure"), dict)), None)
-            if failure and failure.get("error_type") == "ModelCallError":
+            if failure and failure.get("failure", {}).get("kind") == "model_call":
                 error = ModelCallError.from_failure(failure.get("error") or "software assessment unavailable", {**failure["failure"], "usage": {}})
             elif failure and failure.get("failure", {}).get("kind") == "output_contract":
                 error = ModelWorkBlocked(failure.get("error") or "scientific software assessment response violates its contract",
@@ -14966,6 +15017,8 @@ class ComposerRunner:
                                   "scientific_software_assessment": {**receipt, "artifact_ref": record["artifact_ref"]}}
             if getattr(error, "failure_class", None) == "model_contract":
                 error.stage_result["failure"] = {**deepcopy(failure["failure"]), "failure_class": "model_contract"}
+            elif isinstance(error, ModelCallError):
+                error.stage_result["failure"] = deepcopy(failure["failure"])
             error.capability_failure_evidence = deepcopy(error.stage_result["scientific_software_assessment"])
             raise error
         return {**receipt, "artifact_ref": record["artifact_ref"], "dispatch_usage": usage}
@@ -23118,6 +23171,11 @@ class ComposerRunner:
             # later stage attempt can silently rediscover a model route or
             # discard the paid usage already recorded on the receipt.
             if value.get("dsh_backend_terminal") is True:
+                return True
+            if isinstance(value.get("failure", {}).get("generation_capacity"), dict):
+                # Capacity belongs to the exact paid prompt and route contract;
+                # a transport resume does not create another generation attempt.
+                ModelCallError.from_failure(value.get("error") or "generation capacity exhausted", value["failure"])
                 return True
             if _report_has_model_call_failure(value):
                 return False

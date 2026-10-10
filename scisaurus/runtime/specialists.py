@@ -28,6 +28,7 @@ from scisaurus.runtime.execution_policy import enforce_model_cost_limits
 from scisaurus.runtime.departments import ROLE_OUTPUT_TOKENS_PER_CALL
 from scisaurus.runtime.models import (
     ModelCallError,
+    ModelGenerationCapacityError,
     ModelClient,
     MODEL_CONTINUATION_INSTRUCTION,
     admit_model_provider_call,
@@ -1165,6 +1166,12 @@ def _verifier_chief_result(result, *, detail="full"):
     if isinstance(result.get("software_assessment"), dict):
         output["software_assessment"] = _preserve_response_value(result["software_assessment"])
         output["software_assessment_sha256"] = hashlib.sha256(canonical_bytes(output["software_assessment"])).hexdigest()
+        if isinstance(output["software_assessment"].get("request"), dict):
+            from scisaurus.runtime.software_workbench import software_assessment_prompt
+            output["software_assessment"]["request"] = software_assessment_prompt(
+                output["software_assessment"]["request"])
+        output["software_assessment_projection_sha256"] = hashlib.sha256(
+            canonical_bytes(output["software_assessment"])).hexdigest()
     if "deferred_obligations" in result:
         output["deferred_obligations"] = _preserve_response_value(result["deferred_obligations"])
     for key in _VERIFIER_SCALAR_KEYS:
@@ -1373,7 +1380,8 @@ def _verifier_body(stage, stage_packet, specialist_reports, chief_result, *, det
             body["verifier_contract"]["stage_acceptance_contract"] = _preserve_response_value(scoped)
         body["verifier_contract"].update({
             "acceptance_target": target,
-            "review_subject": {"path": "chief_result.software_assessment", "sha256": body["chief_result"]["software_assessment_sha256"]},
+            "review_subject": {"path": "chief_result.software_assessment", "sha256": body["chief_result"]["software_assessment_projection_sha256"],
+                               "source_sha256": body["chief_result"]["software_assessment_sha256"]},
             "phase_boundary": "This verdict approves or holds software selection only. The unchanged result_admission_contract remains mandatory after implementation; pending experiment observations, executor repair and independent recalculation cannot establish or invalidate this selection by their absence alone. Work orders remain execution obligations, not claims of completed work. Reuse requires actual upstream reproduction now; custom_model requires source-bound justification rather than a claimed nonexistent upstream reproduction. Hold unsupported scientific fitness or fabricated provenance; do not certify experimental success through a selection verdict.",
             "software_review_rule": "Check the admitted question and scope, observed host CPU/RAM/storage/accelerators, requested versus observed sandbox limits and per-process scope, actual runtime compatibility and measured example/computation durations, actual license, selected pinned source and dependencies, upstream documented example and precision, actual computation source/input/output/errors, units and calibration conventions. Generic benchmark throughput or an installed command alone does not establish solver capacity. Check that the adapter really invokes the acquired software, not a replacement formula or fabricated output. Custom modelling requires an actual search and source-bound mathematical specification explaining rejected established candidates. Installation, example agreement and computation are operational evidence, not experimental or publication admission. Hold missing mechanisms, ungrounded units, mismatched source/output provenance or unavailable prerequisites; preserve valid negative results and stated limitations."})
     if (stage_packet.get("repair_panel") is True
@@ -2352,6 +2360,19 @@ class SpecialistDispatcher:
             identity["producer_delegation_revision"] = "dsh-structured-production-1"
         return identity
 
+    def generation_capacity_contract(self, role, quota):
+        """Fingerprint generation settings without transport time or payment state."""
+        fields = ("protocol", "model", "base_url", "reasoning_effort", "output_format",
+                  "max_output_tokens", "max_input_tokens", "context_window_tokens",
+                  "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty")
+        routes = []
+        for route_id, _pool, route in self._routes(role, include_fallbacks=True):
+            effective = self._effective_route(route, role)
+            routes.append({"route_id": route_id, "config": {key: effective.get(key) for key in fields}})
+        output_quota = ({key: quota.get(key) for key in ("max_output_tokens_per_call", "max_output_tokens")}
+                        if enforce_model_cost_limits() else {})
+        return hashlib.sha256(canonical_bytes({"routes": routes, "output_quota": output_quota})).hexdigest()
+
     def _ensure_provider_pools(self):
         routes_by_role = self.model_config.get("role_routes", {})
         if not isinstance(routes_by_role, dict):
@@ -3122,6 +3143,7 @@ class SpecialistDispatcher:
                 request_inputs.append(request_input)
                 result = client.complete(**call_kwargs)
                 request_input["request_attempts"] = result.request_attempts
+                request_input["response_metadata"] = deepcopy(result.response_metadata or {})
                 if dsh_producer:
                     request_input["backend"] = dict(result.response_metadata or {})
                 if not dsh_producer:
@@ -3129,6 +3151,22 @@ class SpecialistDispatcher:
                 response_received = True
                 last_model_failure = None
                 response_text = result.text
+                if result.finish_reason == "length" and not result.text.strip():
+                    error = ModelGenerationCapacityError(
+                        "Model generation exhausted output capacity without an answer; "
+                        "the assignment or execution capacity must change before another call",
+                        generation_capacity={
+                            "finish_reason": result.finish_reason, "answer_chars": 0,
+                            "limit": config["max_output_tokens"],
+                            "observed": result.usage.get("output_tokens", 0),
+                            "input_sha256": request_input["input_sha256"],
+                            "response_sha256": hashlib.sha256(result.text.encode("utf-8")).hexdigest(),
+                            "generation_config": deepcopy(request_input["generation_config"]),
+                            "capacity_contract_sha256": self.generation_capacity_contract(model_role, quota),
+                            "response_metadata": deepcopy(request_input["response_metadata"]),
+                        }, attempts=result.request_attempts, elapsed_seconds=result.elapsed_seconds)
+                    error.usage = deepcopy(result.usage)
+                    raise error
                 if continuation_prefix is not None:
                     result = type(result)(
                         continuation_prefix + result.text, result.model,

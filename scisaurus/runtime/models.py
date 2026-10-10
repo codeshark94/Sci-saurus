@@ -1507,6 +1507,15 @@ class ModelCallError(RuntimeError):
     @staticmethod
     def from_failure(message, failure):
         """Reconstruct the same typed fence without parsing its message."""
+        if failure.get("generation_capacity") is not None:
+            if failure.get("kind") != "model_call" or failure.get("outcome_known") is not True:
+                raise ValidationError("generation capacity requires a known paid model result")
+            error = ModelGenerationCapacityError(message,
+                generation_capacity=failure["generation_capacity"],
+                attempts=failure.get("attempts", 0),
+                elapsed_seconds=failure.get("elapsed_seconds"))
+            error.usage = dict(failure.get("usage", {}))
+            return error
         admission = failure.get("budget_admission")
         error_type = ModelBudgetExceededError if admission is not None else ModelCallError
         error = error_type(message, outcome_known=failure.get("outcome_known", False),
@@ -1517,6 +1526,34 @@ class ModelCallError(RuntimeError):
             **({"budget_admission": admission} if admission is not None else {}))
         error.usage = dict(failure.get("usage", {}))
         return error
+
+
+class ModelGenerationCapacityError(ModelCallError, QuotaExceededError):
+    """A paid generation exhausted its output capacity without an answer."""
+
+    def __init__(self, message, *, generation_capacity, attempts, elapsed_seconds=None):
+        proof = generation_capacity
+        if (not isinstance(proof, dict)
+                or proof.get("finish_reason") != "length"
+                or type(proof.get("answer_chars")) is not int or proof["answer_chars"] != 0
+                or type(attempts) is not int or attempts < 1
+                or type(proof.get("limit")) is not int or proof["limit"] < 1
+                or type(proof.get("observed")) is not int or proof["observed"] < 0
+                or any(not isinstance(proof.get(key), str)
+                       or re.fullmatch(r"[0-9a-f]{64}", proof[key]) is None
+                       for key in ("input_sha256", "response_sha256"))):
+            raise ValidationError("invalid paid generation-capacity fence")
+        ModelCallError.__init__(self, message, outcome_known=True, attempts=attempts,
+                                elapsed_seconds=elapsed_seconds)
+        self.generation_capacity = deepcopy(proof)
+        self.dimension = "generation_output_tokens"
+        self.limit, self.observed = proof["limit"], proof["observed"]
+        self.usage = {}
+        self.diagnostics = [deepcopy(proof)]
+
+    def failure_details(self):
+        return {**super().failure_details(),
+                "generation_capacity": deepcopy(self.generation_capacity)}
 
 
 class ModelBudgetExceededError(ModelCallError, QuotaExceededError):
