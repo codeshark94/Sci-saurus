@@ -43,7 +43,7 @@ from scisaurus.runtime.survey_config import validate_survey_config, search_query
 from scisaurus.runtime.survey_records import (
     FOLLOW_UP_COMPLETION_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
     FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT, FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT,
-    validate_follow_up_completion,
+    validate_follow_up_completion, follow_up_response_contract,
     follow_up_completion_basis, follow_up_completion_context, replay_follow_up_response,
     MAP_FIELDS, SURVEY_CHECKS, GAP_CHECKS, CRITIQUE_DISPOSITIONS, normalize_check_envelope,
     BODY_SECTION_MARKERS, authoritative_source, has_section_heading as _has_section_heading,
@@ -1019,12 +1019,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             "phase": "survey_follow_up", "question": self.score["question"],
             "completion_contract": FOLLOW_UP_COMPLETION_CONTRACT,
             "completion_review_contract": FOLLOW_UP_COMPLETION_REVIEW_CONTRACT,
-            "response_contract": {
-                "envelope": {"orders": "one disposition for the assigned order"},
-                "required_order_fields": ["id", "status", "rationale", "evidence", "query_refs",
-                                          "limitation", "next_action", "completion"],
-                "completion": {"outcome": ["met", "unmet"], "rationale": "exact acceptance evaluation"},
-            },
+            "response_contract": follow_up_response_contract(),
             "survey_ref": self.survey_ref, "assessment_ref": self.assessment_ref,
             "assessment": {key: self._body(self.store.get(self.assessment_ref)).get(key)
                            for key in ("state", "rationale", "checks")},
@@ -1035,13 +1030,16 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
                          for ref, row in zip(self.query_refs, self.search_log)
                          if ref in self._follow_up_query_refs()],
             "instructions": (
-                "Return {orders:[{id,status,rationale,evidence:[{work_id,source_ref,quote}],query_refs,limitation,next_action,"
+                "Return {orders:[{id,status,rationale,evidence:[{evidence_id:ID}],query_refs,limitation,next_action,"
                 "completion:{outcome:met|unmet,rationale:string}}]}. "
                 "Account for each assigned order exactly once against its success condition. "
+                "status is exactly resolved, limited or unresolved; unavailable is an input limitation, never a status. "
+                "Prefer evidence:[{evidence_id:ID}] from evidence_catalog; exact source bytes and offsets are attached "
+                "deterministically. If an essential passage is absent from the catalog, quote only its exact displayed source text. "
                 "completion evaluates that exact success condition separately from scientific evidence status. "
                 "Honor its alternatives and scope: if it explicitly permits recording an input as unavailable, "
                 "a source-backed availability record can meet that operation while the scientific input remains "
-                "unresolved. An unavailable outcome is a scoped ledger finding recorded by this disposition "
+                "unresolved. Recording an unavailable input is a scoped ledger finding recorded by this disposition "
                 "from the retained acquisition failures, source availability, inventory and bounded searches. "
                 "Identify each missing requested input explicitly in limitation and completion.rationale; "
                 "no paper must itself declare that an uncaptured value is unavailable. This record describes "
@@ -1088,6 +1086,7 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             for chars in (12000, 6000, 3000, 1000, 300):
                 scoped["sources"] = self._project_assessment_sources(
                     sources, full_text_chars=chars, abstract_chars=min(chars, 2000), unverified_chars=0)
+                scoped["evidence_catalog"] = self._follow_up_repair_catalog(scoped)
                 if limit is None or estimate_input_tokens(SYSTEM, json.dumps(scoped, ensure_ascii=False)) <= limit:
                     break
             else:
@@ -1878,7 +1877,10 @@ class SurveyRunner(LiteratureTree, ExecutionRuntime):
             # returning the required object.
             assignment = self._compact_gap_repair_assignment(assignment)
         elif assignment.get("phase") == "survey_follow_up":
-            assignment["evidence_catalog"] = self._follow_up_repair_catalog(assignment)
+            assignment["response_contract"] = follow_up_response_contract()
+            repair["response_contract"] = deepcopy(assignment["response_contract"])
+            if "evidence_catalog" not in assignment:
+                assignment["evidence_catalog"] = self._follow_up_repair_catalog(assignment)
             assignment["sources"] = [
                 {key: value for key, value in source.items() if key != "text"}
                 for source in assignment["sources"]]

@@ -120,6 +120,15 @@ preserved on resume. `max_full_texts` also bounds implementation source attempts
 Deferred acquisition and incomplete pagination remain visible in coverage;
 these workload limits do not establish relevance, novelty or scientific validity.
 
+Follow-up dispositions share one response contract across initial dispatch,
+bounded correction and local validation. Scientific status is `resolved`,
+`limited` or `unresolved`; inaccessible inputs remain explicit limitations and
+do not create a fourth status. The initial packet includes selectable evidence
+IDs bound to exact captured spans inside its displayed source windows. Corrections
+retain that dispatched catalog, and the context reservation includes its cost.
+Operation completion is independently assessed against the original obligation;
+source availability and schema validity do not establish experimental readiness.
+
 Default model routes and specialist per-call allowances support 32,768 output
 tokens. Topic field repairs and maturity reviews use the configured route's
 capacity. Foundry authoring, independent validation, and review share this

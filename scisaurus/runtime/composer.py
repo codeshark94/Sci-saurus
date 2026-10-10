@@ -10189,7 +10189,7 @@ class ComposerRunner:
             "parent_evidence": parent_evidence,
             "review_owner_evidence": review_owner_evidence,
             "preserve_research_question": owner_repair,
-            "reason": "The literature and admission review did not support the current question as a sufficient journal study.",
+            "reason": "The current independent review retains unresolved topic obligations.",
             "work_orders": [{key: item.get(key) for key in (
                 "id", "kind", "objective", "why", "success_condition", "evidence_needed")}
                             for item in requests],

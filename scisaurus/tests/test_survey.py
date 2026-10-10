@@ -2484,6 +2484,7 @@ class TestSurveyRunner(unittest.TestCase):
                                        "max_output_tokens": 8192})
         map_ref = runner._record("kb/map/context-fixture", "note",
             {"entries": [], "entry_refs": []}, "research.cataloger")["artifact_ref"]
+        runner.map_record = runner.store.get(map_ref)
         coverage_ref = runner._record("kb/coverage/context-fixture", "note",
             {"abstentions": []}, "research.cataloger")["artifact_ref"]
         runner.survey_ref = runner._record("kb/surveys/current", "note",
@@ -2506,6 +2507,8 @@ class TestSurveyRunner(unittest.TestCase):
         self.assertEqual(captured[0]["work_orders"], [self.follow_up_order()])
         self.assertEqual(captured[0]["response_contract"]["required_order_fields"],
                          ["id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action", "completion"])
+        self.assertEqual(captured[0]["response_contract"]["status"], ["resolved", "limited", "unresolved"])
+        self.assertIn("evidence_catalog", captured[0])
         self.assertIn("no paper must itself declare", captured[0]["instructions"])
         self.assertEqual(runner.source_docs, original)
 

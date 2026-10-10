@@ -13,6 +13,7 @@ from scisaurus.runtime.survey_records import (
     validate_map,
     validate_survey_review,
     validate_follow_up_result,
+    follow_up_response_contract,
     normalize_survey_review_envelope, survey_review_response_contract,
     survey_review_assignment_identity, SURVEY_QUOTE_LOCATION_INSTRUCTION,
 )
@@ -62,6 +63,56 @@ def assessment(state="refuted_by_prior_work"):
 
 
 class TestSurveyEvidence(unittest.TestCase):
+    def test_follow_up_dispatch_and_validator_share_status_and_field_contract(self):
+        contract = follow_up_response_contract()
+        row = {"id": "one", "status": "unresolved", "rationale": "Capture unavailable.", "evidence": [],
+               "query_refs": [], "limitation": "Access denied.", "next_action": "Retain the missing input.",
+               "completion": {"outcome": "unmet", "rationale": "Required capture is absent."}}
+        self.assertEqual(set(row), set(contract["required_order_fields"]))
+        self.assertEqual(contract["status"], ["resolved", "limited", "unresolved"])
+        for status in contract["status"]:
+            candidate = {**row, "status": status}
+            if status == "resolved":
+                from scisaurus.core.source_spans import bind
+                candidate["evidence"] = bind([proof()], SOURCES)
+            if status == "limited":
+                candidate["query_refs"] = ["artifact:query@1"]
+            windows = {ref: {"start": 0, "end": len(source["text"])} for ref, source in SOURCES.items()}
+            validate_follow_up_result({"orders": [candidate]}, [{"id": "one"}], SOURCES,
+                                      ["artifact:query@1"], windows=windows, require_completion=True)
+        for status in ("unavailable", "unknown", "partial"):
+            with self.subTest(status=status), self.assertRaises(ModelContractError):
+                validate_follow_up_result({"orders": [{**row, "status": status}]}, [{"id": "one"}],
+                                          {}, [], windows={}, require_completion=True)
+        contract["status"].append("unavailable")
+        self.assertNotIn("unavailable", follow_up_response_contract()["status"])
+
+    def test_follow_up_repair_preserves_dispatched_catalog_and_exposes_enums(self):
+        from unittest.mock import Mock
+        from scisaurus.core.source_spans import index_evidence
+        from scisaurus.runtime.survey import SurveyRunner
+        runner = object.__new__(SurveyRunner)
+        runner.score, runner.work_orders = {}, []
+        runner._map_input_limit = lambda actor: None
+        runner._follow_up_repair_catalog = Mock(side_effect=AssertionError("catalog changed"))
+        _, catalog = index_evidence({"evidence": [proof()]}, SOURCES)
+        assignment = {"phase": "survey_follow_up", "instructions": "Preserve the exact operation.",
+                      "response_contract": follow_up_response_contract(), "evidence_catalog": catalog,
+                      "sources": [{"source_ref": ref, "text": source["text"],
+                                   "window": {"start": 0, "end": len(source["text"])}}
+                                  for ref, source in SOURCES.items()]}
+        original = deepcopy(assignment)
+        repaired = runner._repair_assignment(
+            {"actor": "methods.evidence-verifier", "assignment": assignment},
+            {"error": "invalid status", "finish_reason": "stop",
+             "previous_response": {"orders": [{"id": "one", "status": "unavailable"}]}})
+        self.assertEqual(assignment, original)
+        self.assertEqual(repaired["evidence_catalog"], catalog)
+        self.assertEqual(repaired["response_contract"], follow_up_response_contract())
+        self.assertEqual(repaired["validation_feedback"]["response_contract"], repaired["response_contract"])
+        self.assertEqual(repaired["validation_feedback"]["previous_dispositions"][0]["status"], "unavailable")
+        self.assertTrue(all("text" not in source for source in repaired["sources"]))
+
     def test_review_check_rejection_identifies_unexpected_nested_findings(self):
         value = {"checks": required_checks(SURVEY_CHECKS), "rationale": "Inspect the exact claims."}
         value["checks"][1]["findings"] = []

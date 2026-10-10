@@ -16,12 +16,38 @@ FOLLOW_UP_COMPLETION_CONTRACT = "survey-operation-completion-1"
 FOLLOW_UP_COMPLETION_REVIEW_CONTRACT = "survey-operation-acceptance-3"
 FOLLOW_UP_COMPLETION_REVIEW_EVIDENCE_CONTRACT = "survey-operation-acceptance-2"
 FOLLOW_UP_COMPLETION_REVIEW_LEGACY_CONTRACT = "survey-operation-acceptance-1"
+FOLLOW_UP_STATUSES = ("resolved", "limited", "unresolved")
+FOLLOW_UP_REQUIRED_FIELDS = ("id", "status", "rationale", "evidence", "query_refs",
+                             "limitation", "next_action", "completion")
+
+
+def follow_up_response_contract():
+    """Share disposition semantics between dispatch, repair and validation."""
+    return {
+        "envelope": {"orders": "one disposition for the assigned order"},
+        "required_order_fields": list(FOLLOW_UP_REQUIRED_FIELDS),
+        "optional_order_fields": ["record_evidence"],
+        "additional_fields": False,
+        "status": list(FOLLOW_UP_STATUSES),
+        "evidence": {
+            "preferred": {"evidence_id": "exact ID from evidence_catalog"},
+            "additional_passage": {"work_id": "owning work", "source_ref": "displayed source reference",
+                                   "quote": "exact unique substring of its displayed source window"},
+        },
+        "completion": {"outcome": ["met", "unmet"], "rationale": "exact acceptance evaluation"},
+        "conditional_requirements": {
+            "resolved": "Captured evidence supports fulfillment; inventory membership alone is insufficient.",
+            "limited": "Recorded targeted query_refs and a nonempty limitation are required.",
+            "unresolved": "Use when fulfillment or a bounded targeted-search disposition is unsupported.",
+            "unavailable_inputs": "Record unavailable inputs in limitation and completion.rationale; unavailable is not a status."
+        },
+    }
 
 MAP_FIELDS = ("problem", "approach", "finding", "limitations")
 SURVEY_CHECKS = ("coverage-accounting", "source-fidelity", "map-support")
 GAP_CHECKS = ("closest-prior-work", "scope-comparability", "counterevidence", "full-text-support")
 REVIEW_CHECK_FIELDS = frozenset({"check_id", "outcome", "method", "result"})
-SURVEY_RESPONSE_CONTRACT_REVISION = "survey-independent-batch-settlement-17"
+SURVEY_RESPONSE_CONTRACT_REVISION = "survey-follow-up-response-contract-18"
 CURRENT_MAP_REVIEW_PROTOCOL = "literature-current-map-review-3"
 CURRENT_MAP_REVIEW_PROTOCOLS = frozenset({
     "literature-current-map-review-2", CURRENT_MAP_REVIEW_PROTOCOL,
@@ -744,7 +770,7 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
         raise ModelContractError("survey follow-up must account for every work order")
     expected, seen = {order["id"] for order in work_orders}, set()
     for row in rows:
-        response_exact(row, {"id", "status", "rationale", "evidence", "query_refs", "limitation", "next_action"}
+        response_exact(row, set(FOLLOW_UP_REQUIRED_FIELDS) - {"completion"}
                        | ({"record_evidence"} if "record_evidence" in row else set())
                        | ({"completion"} if require_completion or "completion" in row else set()),
               "survey follow-up disposition")
@@ -753,7 +779,7 @@ def validate_follow_up_result(value, work_orders, sources, query_refs, *, window
         if row["id"] not in expected or row["id"] in seen:
             raise ModelContractError("survey follow-up has an unassigned or duplicate order")
         seen.add(row["id"])
-        if row["status"] not in {"resolved", "limited", "unresolved"}:
+        if row["status"] not in FOLLOW_UP_STATUSES:
             raise ModelContractError("survey follow-up status must be resolved, limited or unresolved")
         for field in ("rationale", "next_action"):
             response_text(row[field], f"survey follow-up {field}")
