@@ -22,6 +22,19 @@ class ScientificSurfaceTests(unittest.TestCase):
         self.assertIn("available literature was insufficient to determine whether", projected)
         self.assertNotEqual(projected, text)
 
+    def test_scientific_frozen_states_and_fixed_comparators_are_not_operations(self):
+        examples = ["Frozen random placements define the comparator ensemble.",
+                    "A frozen phonon calculation estimates the force constants.",
+                    "Frozen-in flux changes the magnetic response.",
+                    "The frozen disorder ensemble is held constant across designs."]
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(validate_scientific_surface(text)["surface"]["class"], "scientific")
+                self.assertEqual(project_internal_language(text), text)
+        for text in ("The frozen checkpoint was reused.", "The frozen checkpoints were reused.",
+                     "The frozen artifacts were reused.", "The frozen assignment was reused."):
+            self.assertEqual(classify_surface_text(text)["class"], "operational")
+
     def test_editorial_audit_catches_repeated_numeric_fact(self):
         text = "The log loss changed by 0.10. The log loss changed by 0.10. The log loss changed by 0.10."
         audit = editorial_audit(text, max_numeric_repetitions=2)

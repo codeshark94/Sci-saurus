@@ -19,7 +19,7 @@ from scisaurus.core.errors import ValidationError
 CONTROL_PATTERNS = (
     ("finite_by_specification", re.compile(r"\bfinite\s+by\s+specification\b", re.I)),
     ("protocol_bound", re.compile(r"\bprotocol[- ]bound\b", re.I)),
-    ("frozen", re.compile(r"\bfrozen\b", re.I)),
+    ("frozen", re.compile(r"\bfrozen\s+(?:artifacts?|checkpoints?|workflows?|assignments?|configured[_ ]inputs?)\b", re.I)),
     ("insufficient_evidence_enum", re.compile(r"\binsufficient_evidence\b", re.I)),
     ("retained_alternatives", re.compile(r"\bretained\s+alternatives?\b", re.I)),
     ("accepted_artifact", re.compile(r"\baccepted\s+artifact\b", re.I)),
@@ -37,7 +37,6 @@ PUBLIC_TRANSLATIONS = {
     "finite by specification": "under the prespecified design",
     "protocol-bound": "specific to this dataset and model design",
     "protocol bound": "specific to this dataset and model design",
-    "frozen": "prespecified",
     "insufficient_evidence": "available literature was insufficient to determine whether",
     "retained alternatives": "comparators reserved for a separate analysis",
     "retained alternative": "a comparator reserved for a separate analysis",
